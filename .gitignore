@@ -1,0 +1,10 @@
+__pycache__/
+bb_graphrag_venv/
+dset_papers/
+images/
+ms2/
+narrativeqa/
+qasper/
+qmsum/
+quality/
+squality/
