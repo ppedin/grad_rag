@@ -8,3 +8,8 @@ qasper/
 qmsum/
 quality/
 squality/
+graphs/
+
+# Test files
+test_*.py
+verify_graph.py
