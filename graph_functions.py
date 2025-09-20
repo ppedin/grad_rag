@@ -784,3 +784,138 @@ def find_hub_nodes(uri="bolt://localhost:7687", user="", password=""):
 
     finally:
         driver.close()
+
+
+def generate_graph_description(uri="bolt://localhost:7687", user="", password=""):
+    """
+    Generate a discursive description of the graph with entity and relationship type frequencies.
+
+    Args:
+        uri (str): Memgraph connection URI
+        user (str): Username for Memgraph connection
+        password (str): Password for Memgraph connection
+
+    Returns:
+        dict: Result containing the graph description and statistics
+    """
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    try:
+        with driver.session() as session:
+            # Get node type frequencies
+            node_query = """
+            MATCH (n)
+            UNWIND labels(n) as label
+            RETURN label, count(*) as frequency
+            ORDER BY frequency DESC, label ASC
+            """
+            node_result = session.run(node_query)
+
+            # Get relationship type frequencies
+            rel_query = """
+            MATCH ()-[r]->()
+            RETURN type(r) as rel_type, count(*) as frequency
+            ORDER BY frequency DESC, rel_type ASC
+            """
+            rel_result = session.run(rel_query)
+
+            # Get total counts
+            total_nodes_query = "MATCH (n) RETURN count(n) as total_nodes"
+            total_rels_query = "MATCH ()-[r]->() RETURN count(r) as total_relationships"
+
+            total_nodes = session.run(total_nodes_query).single()["total_nodes"]
+            total_rels = session.run(total_rels_query).single()["total_relationships"]
+
+            # Process node types
+            node_types = []
+            for record in node_result:
+                node_types.append({
+                    "type": record["label"],
+                    "frequency": record["frequency"]
+                })
+
+            # Process relationship types
+            rel_types = []
+            for record in rel_result:
+                rel_types.append({
+                    "type": record["rel_type"],
+                    "frequency": record["frequency"]
+                })
+
+            # Generate discursive description
+            description_parts = []
+
+            # Opening statement
+            description_parts.append(f"This graph contains {total_nodes} nodes and {total_rels} relationships.")
+
+            # Entity types description
+            if node_types:
+                entity_descriptions = []
+                for node_type in node_types:
+                    count = node_type["frequency"]
+                    type_name = node_type["type"]
+                    if count == 1:
+                        entity_descriptions.append(f'{count} "{type_name}"')
+                    else:
+                        entity_descriptions.append(f'{count} "{type_name}"s')
+
+                if len(entity_descriptions) == 1:
+                    description_parts.append(f"The entities consist of {entity_descriptions[0]}.")
+                elif len(entity_descriptions) == 2:
+                    description_parts.append(f"The entities consist of {entity_descriptions[0]} and {entity_descriptions[1]}.")
+                else:
+                    last_entity = entity_descriptions.pop()
+                    description_parts.append(f"The entities consist of {', '.join(entity_descriptions)}, and {last_entity}.")
+
+            # Relationship types description
+            if rel_types:
+                rel_descriptions = []
+                for rel_type in rel_types:
+                    count = rel_type["frequency"]
+                    type_name = rel_type["type"].replace("_", " ").lower()
+                    if count == 1:
+                        rel_descriptions.append(f'1 "{type_name}" relationship')
+                    else:
+                        rel_descriptions.append(f'{count} "{type_name}" relationships')
+
+                if len(rel_descriptions) == 1:
+                    description_parts.append(f"The relationships include {rel_descriptions[0]}.")
+                elif len(rel_descriptions) == 2:
+                    description_parts.append(f"The relationships include {rel_descriptions[0]} and {rel_descriptions[1]}.")
+                else:
+                    last_rel = rel_descriptions.pop()
+                    description_parts.append(f"The relationships include {', '.join(rel_descriptions)}, and {last_rel}.")
+
+            # Most common types
+            if node_types:
+                most_common_entity = node_types[0]
+                description_parts.append(f'The most common entity type is "{most_common_entity["type"]}" with {most_common_entity["frequency"]} instances.')
+
+            if rel_types:
+                most_common_rel = rel_types[0]
+                rel_name = most_common_rel['type'].replace("_", " ").lower()
+                description_parts.append(f'The most frequent relationship type is "{rel_name}" with {most_common_rel["frequency"]} occurrences.')
+
+            # Combine into final description
+            full_description = " ".join(description_parts)
+
+            return {
+                "status": "success",
+                "message": f"Generated description for graph with {total_nodes} nodes and {total_rels} relationships",
+                "description": full_description,
+                "statistics": {
+                    "total_nodes": total_nodes,
+                    "total_relationships": total_rels,
+                    "entity_types": node_types,
+                    "relationship_types": rel_types
+                }
+            }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to generate graph description: {str(e)}"
+        }
+
+    finally:
+        driver.close()
