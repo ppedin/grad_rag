@@ -9,7 +9,13 @@ qmsum/
 quality/
 squality/
 graphs/
+agent_logs/
+agent_states/
+generated_graphs/
+
 
 # Test files
 test_*.py
 verify_graph.py
+llm_keys.py
+demo_*

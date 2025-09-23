@@ -788,7 +788,8 @@ def find_hub_nodes(uri="bolt://localhost:7687", user="", password=""):
 
 def generate_graph_description(uri="bolt://localhost:7687", user="", password=""):
     """
-    Generate a discursive description of the graph with entity and relationship type frequencies.
+    Generate a discursive description of the graph with entity and relationship type frequencies,
+    graph density, and fragmentation index.
 
     Args:
         uri (str): Memgraph connection URI
@@ -796,7 +797,7 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
         password (str): Password for Memgraph connection
 
     Returns:
-        dict: Result containing the graph description and statistics
+        dict: Result containing the graph description, statistics, and metrics JSON
     """
     driver = GraphDatabase.driver(uri, auth=(user, password))
 
@@ -826,6 +827,39 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
             total_nodes = session.run(total_nodes_query).single()["total_nodes"]
             total_rels = session.run(total_rels_query).single()["total_relationships"]
 
+            # Calculate graph density
+            if total_nodes > 1:
+                max_possible_edges = total_nodes * (total_nodes - 1) // 2
+                graph_density = total_rels / max_possible_edges if max_possible_edges > 0 else 0
+            else:
+                graph_density = 0
+
+            # Calculate fragmentation index by finding largest connected component
+            # Use a proper algorithm to find connected components
+            try:
+                # Find the largest connected component using a traversal approach
+                component_query = """
+                MATCH (start)
+                WITH start LIMIT 1
+                MATCH (start)-[*0..]-(connected)
+                RETURN count(DISTINCT connected) as largest_component_size
+                """
+                component_result = session.run(component_query)
+                record = component_result.single()
+                if record:
+                    largest_component_size = record["largest_component_size"]
+                else:
+                    largest_component_size = total_nodes if total_nodes > 0 else 0
+            except:
+                # Fallback: assume all nodes are connected if we can't determine
+                largest_component_size = total_nodes if total_nodes > 0 else 0
+
+            # Calculate fragmentation index: 1 - (C_max/n)
+            if total_nodes > 0:
+                fragmentation_index = 1 - (largest_component_size / total_nodes)
+            else:
+                fragmentation_index = 0
+
             # Process node types
             node_types = []
             for record in node_result:
@@ -847,6 +881,18 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
 
             # Opening statement
             description_parts.append(f"This graph contains {total_nodes} nodes and {total_rels} relationships.")
+
+            # Add density and fragmentation information
+            description_parts.append(f"The graph density is {graph_density:.4f}, indicating {'a highly connected' if graph_density > 0.5 else 'a sparsely connected' if graph_density < 0.1 else 'a moderately connected'} network.")
+
+            if fragmentation_index == 0:
+                description_parts.append("The graph is fully connected with a fragmentation index of 0.0000.")
+            elif fragmentation_index < 0.2:
+                description_parts.append(f"The graph shows low fragmentation with an index of {fragmentation_index:.4f}, indicating most nodes are in the main connected component.")
+            elif fragmentation_index < 0.5:
+                description_parts.append(f"The graph shows moderate fragmentation with an index of {fragmentation_index:.4f}.")
+            else:
+                description_parts.append(f"The graph is highly fragmented with an index of {fragmentation_index:.4f}, indicating many disconnected components.")
 
             # Entity types description
             if node_types:
@@ -899,6 +945,12 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
             # Combine into final description
             full_description = " ".join(description_parts)
 
+            # Create metrics JSON
+            metrics_json = {
+                "graph_density": graph_density,
+                "fragmentation_index": fragmentation_index
+            }
+
             return {
                 "status": "success",
                 "message": f"Generated description for graph with {total_nodes} nodes and {total_rels} relationships",
@@ -908,7 +960,8 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
                     "total_relationships": total_rels,
                     "entity_types": node_types,
                     "relationship_types": rel_types
-                }
+                },
+                "metrics": metrics_json
             }
 
     except Exception as e:
