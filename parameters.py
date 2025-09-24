@@ -87,6 +87,9 @@ Use the following critique:
 {}
 
 Provide the reasoning that led to your response.
+
+Pay attention to symbols included in the entity/relationship type names: make sure to include them in your search for matching to succeed. 
+Also, pay attention to symbols included in the functions names. 
 """
 
 

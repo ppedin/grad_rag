@@ -35,6 +35,8 @@ class HyperparametersGraphStartMessage(BaseModel):
     qa_pair: Dict[str, Any]
     batch_id: int
     repetition: int
+    dataset: str
+    setting: str
 
 class GraphStartMessage(BaseModel):
     batch_id: int
@@ -80,6 +82,8 @@ class AnswerGenerationStartMessage(BaseModel):
     retrieved_context: str
     batch_id: int
     repetition: int
+    dataset: str
+    setting: str
 
 class AnswerGenerationReadyMessage(BaseModel):
     qa_pair_id: str
@@ -105,6 +109,8 @@ class ResponseEvaluationReadyMessage(BaseModel):
 class BackwardPassStartMessage(BaseModel):
     batch_id: int
     repetition: int
+    dataset: str
+    setting: str
     all_qa_results: List[Dict[str, Any]]
 
 class BackwardPassReadyMessage(BaseModel):
@@ -168,7 +174,9 @@ class BatchOrchestratorAgent(RoutedAgent):
                     qa_pair_id=qa_pair_id,
                     qa_pair=qa_pair,
                     batch_id=message.batch_id,
-                    repetition=message.repetition
+                    repetition=message.repetition,
+                    dataset=self.current_dataset,
+                    setting=self.current_setting
                 )
 
                 self.logger.info(f"Sending HyperparametersGraphStart for QA pair {qa_pair_id}")
@@ -283,6 +291,12 @@ class BatchOrchestratorAgent(RoutedAgent):
         batch_info = current_state.get("batch_information", {})
         qa_pairs = batch_info.get("qa_pairs", [])
 
+        # Store retrieved context for backward pass critiques
+        retrieved_contexts = current_state.get("retrieved_contexts", [])
+        retrieved_contexts.append(retrieval_response.retrieved_context)
+        current_state["retrieved_contexts"] = retrieved_contexts
+        self.shared_state.save_state(current_state, retrieval_response.dataset, retrieval_response.setting, retrieval_response.batch_id)
+
         # Process each QA pair for answer generation
         for qa_pair in qa_pairs:
             qa_pair_id = qa_pair.get("question_id", f"qa_{len(qa_pairs)}")
@@ -294,7 +308,9 @@ class BatchOrchestratorAgent(RoutedAgent):
                 question=question,
                 retrieved_context=retrieval_response.retrieved_context,
                 batch_id=retrieval_response.batch_id,
-                repetition=retrieval_response.repetition
+                repetition=retrieval_response.repetition,
+                dataset=retrieval_response.dataset,
+                setting=retrieval_response.setting
             )
 
             self.logger.info(f"Sending AnswerGenerationStart for QA pair {qa_pair_id}")
@@ -344,11 +360,11 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {answer_response.qa_pair_id}")
 
         # Save ROUGE score to shared state
-        current_state = self.shared_state.load_state("dataset", "train", answer_response.batch_id)
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, answer_response.batch_id)
         rouge_scores_list = current_state.get("rouge_scores", [])
         rouge_scores_list.append(rouge_score)
         current_state["rouge_scores"] = rouge_scores_list
-        self.shared_state.save_state(current_state, "dataset", "train", answer_response.batch_id)
+        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, answer_response.batch_id)
 
         # Send ResponseEvaluationStart message
         eval_start_msg = ResponseEvaluationStartMessage(
@@ -382,11 +398,11 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.logger.info(f"Processing evaluation response for QA pair {eval_response.qa_pair_id}")
 
         # Add to shared state
-        current_state = self.shared_state.load_state("dataset", "train", eval_response.batch_id)
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, eval_response.batch_id)
         response_evaluations = current_state.get("response_evaluations", [])
         response_evaluations.append(eval_response.evaluation_result)
         current_state["response_evaluations"] = response_evaluations
-        self.shared_state.save_state(current_state, "dataset", "train", eval_response.batch_id)
+        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, eval_response.batch_id)
 
         # Mark QA pair as completed
         self.completed_qa_pairs[eval_response.qa_pair_id] = eval_response.evaluation_result
@@ -409,7 +425,15 @@ class BatchOrchestratorAgent(RoutedAgent):
             return
 
         # Load current shared state to pass to GraphBuilderAgent
-        current_state = self.shared_state.load_state("dataset", "train", message.batch_id)
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, message.batch_id)
+
+        # Store RAG hyperparameters for backward pass critiques
+        rag_hyperparams = {
+            "chunk_size": message.chunk_size,
+            "chunk_size_confidence": 0.85  # Mock confidence score
+        }
+        current_state["rag_hyperparameters"] = rag_hyperparams
+        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, message.batch_id)
 
         # Send GraphStart message with chunk_size
         graph_start_msg = GraphStartMessage(
@@ -442,6 +466,10 @@ class BatchOrchestratorAgent(RoutedAgent):
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
         batch_info = current_state.get("batch_information", {})
         qa_pairs = batch_info.get("qa_pairs", [])
+
+        # Store graph description for backward pass critiques
+        current_state["graph_description"] = message.graph_description
+        self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
         # Process each QA pair for retrieval
         for qa_pair in qa_pairs:
@@ -493,7 +521,9 @@ class BatchOrchestratorAgent(RoutedAgent):
                 question=question,
                 retrieved_context=message.retrieved_context,
                 batch_id=message.batch_id,
-                repetition=message.repetition
+                repetition=message.repetition,
+                dataset=message.dataset,
+                setting=message.setting
             )
 
             self.logger.info(f"Sending AnswerGenerationStart for QA pair {qa_pair_id}")
@@ -542,11 +572,11 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {message.qa_pair_id}")
 
         # Save ROUGE score to shared state
-        current_state = self.shared_state.load_state("dataset", "train", message.batch_id)
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, message.batch_id)
         rouge_scores_list = current_state.get("rouge_scores", [])
         rouge_scores_list.append(rouge_score)
         current_state["rouge_scores"] = rouge_scores_list
-        self.shared_state.save_state(current_state, "dataset", "train", message.batch_id)
+        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, message.batch_id)
 
         # Send ResponseEvaluationStart message
         eval_start_msg = ResponseEvaluationStartMessage(
@@ -579,11 +609,11 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.logger.info(f"Received ResponseEvaluationReady for QA pair {message.qa_pair_id}")
 
         # Add to shared state
-        current_state = self.shared_state.load_state("dataset", "train", message.batch_id)
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, message.batch_id)
         response_evaluations = current_state.get("response_evaluations", [])
         response_evaluations.append(message.evaluation_result)
         current_state["response_evaluations"] = response_evaluations
-        self.shared_state.save_state(current_state, "dataset", "train", message.batch_id)
+        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, message.batch_id)
 
         # Mark QA pair as completed
         self.completed_qa_pairs[message.qa_pair_id] = message.evaluation_result
@@ -621,6 +651,8 @@ class BatchOrchestratorAgent(RoutedAgent):
         backward_pass_msg = BackwardPassStartMessage(
             batch_id=batch_id,
             repetition=repetition,
+            dataset=self.current_dataset,
+            setting=self.current_setting,
             all_qa_results=all_qa_results
         )
 
@@ -659,6 +691,14 @@ class BatchOrchestratorAgent(RoutedAgent):
 
     # Simulation methods for testing
     async def _simulate_graph_ready(self, graph_start: GraphStartMessage, ctx: MessageContext) -> None:
+        # Store simulation data in shared state for backward pass critiques
+        current_state = self.shared_state.load_state(graph_start.dataset, graph_start.setting, graph_start.batch_id)
+
+        # Store mock graph builder prompt (simulating what GraphBuilderAgent would store)
+        current_state["graph_builder_prompt"] = "Mock graph builder prompt for entity and relationship extraction"
+
+        self.shared_state.save_state(current_state, graph_start.dataset, graph_start.setting, graph_start.batch_id)
+
         graph_ready_msg = GraphReadyMessage(
             batch_id=graph_start.batch_id,
             repetition=graph_start.repetition,
@@ -670,6 +710,20 @@ class BatchOrchestratorAgent(RoutedAgent):
         await self.handle_graph_ready(graph_ready_msg, ctx)
 
     async def _simulate_retrieval_ready(self, retrieval_start: GraphRetrievalStartMessage, ctx: MessageContext) -> None:
+        # Store simulation data in shared state for backward pass critiques
+        current_state = self.shared_state.load_state(retrieval_start.dataset, retrieval_start.setting, retrieval_start.batch_id)
+
+        # Store mock retrieval prompt and plans (simulating what GraphRetrievalPlannerAgent would store)
+        current_state["retrieval_prompt"] = "Mock retrieval prompt template for graph queries"
+        current_state["retrieval_plans"] = ["Mock retrieval plan 1", "Mock retrieval plan 2"]
+
+        # Store mock retrieved contexts for backward pass
+        retrieved_contexts = current_state.get("retrieved_contexts", [])
+        retrieved_contexts.append("Mock retrieved context from graph")
+        current_state["retrieved_contexts"] = retrieved_contexts
+
+        self.shared_state.save_state(current_state, retrieval_start.dataset, retrieval_start.setting, retrieval_start.batch_id)
+
         retrieval_ready_msg = GraphRetrievalReadyMessage(
             batch_id=retrieval_start.batch_id,
             repetition=retrieval_start.repetition,
@@ -763,7 +817,7 @@ class HyperparametersGraphAgent(RoutedAgent):
 
         try:
             # Load shared state to get critique
-            current_state = self.shared_state.load_state("dataset", "train", message.batch_id)
+            current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
             critique = current_state.get("hyperparameters_graph_agent_critique", "")
 
             # Extract text and question from QA pair
@@ -804,7 +858,7 @@ class HyperparametersGraphAgent(RoutedAgent):
             rag_hyperparams["chunk_size_confidence"] = hyperparams_response.confidence_score
             current_state["rag_hyperparameters"] = rag_hyperparams
 
-            self.shared_state.save_state(current_state, "dataset", "train", message.batch_id)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Return HyperparametersGraphReady message
             ready_msg = HyperparametersGraphReadyMessage(
@@ -866,6 +920,7 @@ class GraphBuilderAgent(RoutedAgent):
         )
 
         self.base_prompt_graph_builder = base_prompt_graph_builder
+        
 
     @message_handler
     async def handle_graph_start(self, message: GraphStartMessage, ctx: MessageContext) -> GraphReadyMessage:
@@ -919,7 +974,7 @@ class GraphBuilderAgent(RoutedAgent):
         graph_json = self._convert_to_memgraph_format(all_entities, all_relationships, all_triplets)
         # Save to dedicated graphs folder
         import os
-        graphs_dir = "generated_graphs"
+        graphs_dir = "graphs"
         os.makedirs(graphs_dir, exist_ok=True)
         graph_filename = os.path.join(graphs_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_graph.json")
 
@@ -932,9 +987,25 @@ class GraphBuilderAgent(RoutedAgent):
 
         # Load graph into Memgraph server
         try:
-            from graph_functions import load_graph_from_json_flexible
-            load_graph_from_json_flexible(graph_filename)
-            self.logger.info(f"Loaded graph into Memgraph server")
+            from graph_functions import load_graph_from_json_flexible, clear_graph
+            import os
+
+            # Clear existing graph to free up memory
+            self.logger.info("Clearing existing graph from Memgraph to free memory")
+            clear_result = clear_graph()
+            if clear_result.get("status") == "success":
+                self.logger.info(f"Graph cleared successfully: {clear_result.get('message')}")
+            else:
+                self.logger.warning(f"Failed to clear graph: {clear_result.get('message')}")
+
+            # Use the filename relative to the mounted volume
+            graph_file_basename = os.path.basename(graph_filename)
+            load_result = load_graph_from_json_flexible(graph_file_basename)
+
+            if load_result.get("status") == "success":
+                self.logger.info(f"Successfully loaded graph {graph_file_basename} into Memgraph server")
+            else:
+                self.logger.error(f"Failed to load graph: {load_result.get('message')}")
         except Exception as e:
             self.logger.error(f"Error loading graph into Memgraph: {e}")
 
@@ -1021,42 +1092,56 @@ class GraphBuilderAgent(RoutedAgent):
 
         return graph_response.entities, graph_response.relationships, graph_response.triplets
 
-    def _convert_to_memgraph_format(self, entities, relationships, triplets) -> Dict[str, Any]:
-        """Convert extracted data to Memgraph JSON format."""
-        memgraph_nodes = []
-        memgraph_relationships = []
+    def _convert_to_memgraph_format(self, entities, relationships, triplets) -> List[Dict[str, Any]]:
+        """Convert extracted data to Memgraph import_util.json() format."""
+        memgraph_items = []
+        node_id_counter = 1000  # Start with high numbers to avoid conflicts
+
+        # Track node names to IDs for relationship creation
+        name_to_id = {}
 
         # Convert entities to nodes
         for entity in entities:
+            node_id = node_id_counter
+            node_id_counter += 1
+
             node = {
-                "id": entity.name,
+                "id": node_id,
                 "labels": [entity.type],
                 "properties": {
                     "name": entity.name,
                     "type": entity.type
-                }
+                },
+                "type": "node"
             }
-            memgraph_nodes.append(node)
+            memgraph_items.append(node)
+            name_to_id[entity.name] = node_id
 
         # Convert relationships to edges
+        rel_id_counter = 2000  # Start with high numbers to avoid conflicts
         for relationship in relationships:
-            edge = {
-                "id": len(memgraph_relationships),
-                "start": relationship.source_entity,
-                "end": relationship.target_entity,
-                "label": relationship.relationship_type,
-                "properties": {
-                    "description": relationship.description,
-                    "evidence": relationship.evidence,
-                    "type": relationship.relationship_type
-                }
-            }
-            memgraph_relationships.append(edge)
+            # Get node IDs for start and end nodes
+            start_id = name_to_id.get(relationship.source_entity)
+            end_id = name_to_id.get(relationship.target_entity)
 
-        return {
-            "nodes": memgraph_nodes,
-            "relationships": memgraph_relationships
-        }
+            # Only create relationship if both nodes exist
+            if start_id is not None and end_id is not None:
+                edge = {
+                    "id": rel_id_counter,
+                    "start": start_id,
+                    "end": end_id,
+                    "label": relationship.relationship_type,
+                    "properties": {
+                        "description": relationship.description,
+                        "evidence": relationship.evidence,
+                        "type": relationship.relationship_type
+                    },
+                    "type": "relationship"
+                }
+                memgraph_items.append(edge)
+                rel_id_counter += 1
+
+        return memgraph_items
 
     async def close(self) -> None:
         """Close the model client."""
@@ -1094,14 +1179,29 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
 
         # Ensure the correct graph is loaded in Memgraph
         import os
-        graphs_dir = "generated_graphs"
+        graphs_dir = "graphs"
         graph_filename = os.path.join(graphs_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_graph.json")
 
         if os.path.exists(graph_filename):
             try:
-                from graph_functions import load_graph_from_json_flexible
-                load_graph_from_json_flexible(os.path.basename(graph_filename))
-                self.logger.info(f"Loaded correct graph {graph_filename} into Memgraph for retrieval")
+                from graph_functions import load_graph_from_json_flexible, clear_graph
+
+                # Clear existing graph to ensure we have the correct one loaded
+                self.logger.info("Clearing existing graph from Memgraph before loading correct graph")
+                clear_result = clear_graph()
+                if clear_result.get("status") == "success":
+                    self.logger.info(f"Graph cleared successfully: {clear_result.get('message')}")
+                else:
+                    self.logger.warning(f"Failed to clear graph: {clear_result.get('message')}")
+
+                # Use the filename relative to the mounted volume
+                graph_file_basename = os.path.basename(graph_filename)
+                load_result = load_graph_from_json_flexible(graph_file_basename)
+
+                if load_result.get("status") == "success":
+                    self.logger.info(f"Successfully loaded correct graph {graph_file_basename} into Memgraph for retrieval")
+                else:
+                    self.logger.error(f"Failed to load graph: {load_result.get('message')}")
             except Exception as e:
                 self.logger.error(f"Error loading graph {graph_filename}: {e}")
         else:
@@ -1271,7 +1371,7 @@ class AnswerGeneratorAgent(RoutedAgent):
         self.logger.info(f"AnswerGeneratorAgent processing QA pair {message.qa_pair_id}")
 
         # Load shared state to get critique
-        current_state = self.shared_state.load_state("dataset", "train", message.batch_id)
+        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
         critique = current_state.get("answer_generation_critique", "")
 
         # Prepare prompt with question, retrieved context, and critique
@@ -1308,7 +1408,7 @@ class AnswerGeneratorAgent(RoutedAgent):
             conversations.append(conversation_entry)
             current_state["conversations_answer_generation"] = conversations
 
-            self.shared_state.save_state(current_state, "dataset", "train", message.batch_id)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Send AnswerGenerationReady message
             answer_ready_msg = AnswerGenerationReadyMessage(
@@ -1490,33 +1590,40 @@ class BackwardPassAgent(RoutedAgent):
         """Handle BackwardPassStart message and perform complete backward pass critique generation."""
         self.logger.info(f"BackwardPassAgent processing backward pass for batch {message.batch_id}")
 
-        # Load shared state
-        current_state = self.shared_state.load_state("dataset", "train", message.batch_id)
+        # Load shared state with correct dataset and setting parameters
+        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
 
         try:
             # Step 1: Generate answer generation critique
             await self._generate_answer_generation_critique(current_state, ctx)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Step 2: Generate retrieved content critique
             await self._generate_retrieved_content_critique(current_state, ctx)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Step 3: Generate retrieval plan critique
             await self._generate_retrieval_plan_critique(current_state, ctx)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Step 4: Generate retrieval planning prompt critique
             await self._generate_retrieval_planning_prompt_critique(current_state, ctx)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Step 5: Generate graph critique
             await self._generate_graph_critique(current_state, ctx)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Step 6: Generate graph builder critique
             await self._generate_graph_builder_critique(current_state, ctx)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Step 7: Generate hyperparameters critique
             await self._generate_hyperparameters_critique(current_state, ctx)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-            # Save final state
-            self.shared_state.save_state(current_state, "dataset", "train", message.batch_id)
+            # Final save to ensure everything is persisted
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Send BackwardPassReady message
             backward_ready_msg = BackwardPassReadyMessage(
@@ -1620,6 +1727,9 @@ class BackwardPassAgent(RoutedAgent):
 
         retrieval_plans = current_state.get("retrieval_plans", [])
         retrieved_contexts = current_state.get("retrieved_contexts", [])
+
+        self.logger.info(f"Retrieval plans: {retrieval_plans}")
+        self.logger.info(f"Retrieved contexts: {retrieved_contexts}")
 
         if not retrieval_plans or not retrieved_contexts:
             self.logger.warning("Missing retrieval plans or contexts for critique")
@@ -1731,6 +1841,8 @@ class BackwardPassAgent(RoutedAgent):
         critique = await self._call_llm(prompt_content, ctx)
         current_state["graph_builder_agent_critique"] = critique
 
+        self.logger.info(f"Graph builder agent critique: {critique}")
+
         self.logger.info("Graph builder critique generated and saved")
 
     async def _generate_hyperparameters_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
@@ -1756,6 +1868,7 @@ class BackwardPassAgent(RoutedAgent):
 
         critique = await self._call_llm(prompt_content, ctx)
         current_state["hyperparameters_graph_agent_critique"] = critique
+        self.logger.info(f"hyperparameters graph agent critique: {critique}")
 
         self.logger.info("Hyperparameters critique generated and saved")
 

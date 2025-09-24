@@ -202,8 +202,7 @@ def load_graph_from_json(json_filename, uri="bolt://localhost:7687", user="", pa
 
 def load_graph_from_json_flexible(json_filename, uri="bolt://localhost:7687", user="", password=""):
     """
-    Load a graph into Memgraph from a JSON file using the json_util.load_from_path() procedure.
-    This version has no requirements about the formatting of data inside the JSON file.
+    Load a graph into Memgraph from a JSON file using the import_util.json() procedure.
     The JSON file must be accessible via the mounted volume at /usr/lib/memgraph/import/.
 
     Args:
@@ -222,25 +221,73 @@ def load_graph_from_json_flexible(json_filename, uri="bolt://localhost:7687", us
             # Construct the full path in the Memgraph container
             file_path = f"/usr/lib/memgraph/import/{json_filename}"
 
-            # Use the json_util.load_from_path() procedure to load the graph
-            query = "CALL json_util.load_from_path($file_path) YIELD objects"
+            # Use the import_util.json() procedure to load the graph
+            query = "CALL import_util.json($file_path)"
             result = session.run(query, file_path=file_path)
 
-            # Collect and return results
-            records = []
-            for record in result:
-                records.append(dict(record))
+            # Check the result
+            records = list(result)
+
+            # Verify nodes were actually created
+            node_count_result = session.run("MATCH (n) RETURN count(n) as count")
+            node_count = node_count_result.single()["count"]
+
+            rel_count_result = session.run("MATCH ()-[r]-() RETURN count(r) as count")
+            rel_count = rel_count_result.single()["count"]
 
             return {
                 "status": "success",
-                "message": f"Graph loaded successfully from {json_filename}",
-                "records": records
+                "message": f"Graph loaded successfully from {json_filename}. {node_count} nodes and {rel_count} relationships imported.",
+                "nodes_imported": node_count,
+                "relationships_imported": rel_count
             }
 
     except Exception as e:
         return {
             "status": "error",
             "message": f"Failed to load graph: {str(e)}"
+        }
+
+    finally:
+        driver.close()
+
+
+def clear_graph(uri="bolt://localhost:7687", user="", password=""):
+    """
+    Clear all nodes and relationships from the Memgraph database.
+
+    Args:
+        uri (str): Memgraph connection URI
+        user (str): Username for Memgraph connection
+        password (str): Password for Memgraph connection
+
+    Returns:
+        dict: Result of the clear operation
+    """
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    try:
+        with driver.session() as session:
+            # Delete all relationships first
+            session.run("MATCH ()-[r]-() DELETE r")
+
+            # Then delete all nodes
+            session.run("MATCH (n) DELETE n")
+
+            # Get count to verify clearing
+            result = session.run("MATCH (n) RETURN count(n) as node_count")
+            node_count = result.single()["node_count"]
+
+            return {
+                "status": "success",
+                "message": f"Graph cleared successfully. Remaining nodes: {node_count}",
+                "nodes_remaining": node_count
+            }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to clear graph: {str(e)}"
         }
 
     finally:
