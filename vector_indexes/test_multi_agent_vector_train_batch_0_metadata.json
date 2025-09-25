@@ -1,0 +1,16 @@
+[
+  {
+    "chunk_id": 0,
+    "text": "Second Secretary Magnan took his green-lined cape and orange-feathered beret from the clothes tree. \"I'm off now, Retief,\" he said. \"I hope you'll manage the administrative routine during my absence without any unfortunate incidents.\" \"That seems a modest enough hope,\" Retief said. \"I'll try to live up to it.\" \"I don't appreciate frivolity with reference to this Division,\" Magnan said testily. \"When I first came here, the Manpower Utilization Directorate, Division of Libraries and Education was a shambles. I fancy I've made MUDDLE what it is today. Frankly, I question the wisdom of placing you in charge of such a sensitive desk, even for two weeks. But remember. Yours is purely a rubber-stamp function.\" The buzzer sounded. Retief punched a button. \"What is it, Miss Furkle?\" \"That\u2014bucolic person from Lovenbroy is here again.\" On the small desk screen, Miss Furkle's meaty features were compressed in disapproval. A tall broad man with bronze skin and gray hair, wearing tight trousers of heavy cloth, a loose shirt open at the neck and a short jacket, stepped into the room. He had a bundle under his arm. He paused at sight of Retief, looked him over momentarily, then advanced and held out his hand. \"What can I do for you?\" Retief said. \"You work for this Culture bunch, do you? I'm Hank Arapoulous. I'm a farmer. What I wanted to see you about was\u2014our wine crop is just about ready. We start picking in another two, three months. The Bacchus vines are an unusual crop, only mature every twelve",
+    "batch_id": 0,
+    "dataset": "test_multi_agent_vector",
+    "setting": "train"
+  },
+  {
+    "chunk_id": 1,
+    "text": "years. We need harvest hands. Picking Bacchus grapes isn't a job you can turn over to machinery. We've got a bumper crop\u2014and we're short-handed.\" \"You say it's time now for the wine crop?\" \"That's right. Our wine crop is our big money crop. We make enough to keep us going. But this year we need extra hands or we'll lose everything to Croanie. They hold the mortgage on half our grape acreage.\"",
+    "batch_id": 0,
+    "dataset": "test_multi_agent_vector",
+    "setting": "train"
+  }
+]

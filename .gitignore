@@ -19,3 +19,4 @@ test_*.py
 verify_graph.py
 llm_keys.py
 demo_*
+validate_*

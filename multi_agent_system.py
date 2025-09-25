@@ -954,21 +954,38 @@ class GraphBuilderAgent(RoutedAgent):
         all_relationships = []
         all_triplets = []
 
-        # Process each chunk
-        for i, chunk in enumerate(chunks):
-            self.logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+        # Process all chunks asynchronously for better time efficiency
+        self.logger.info(f"Starting concurrent processing of {len(chunks)} chunks")
 
+        # Create tasks for all chunks
+        async def process_chunk_with_index(i: int, chunk: str) -> tuple:
+            """Wrapper to process chunk with index for logging and error handling."""
             try:
-                # Call LLM to extract entities and relationships
+                self.logger.info(f"Processing chunk {i+1}/{len(chunks)}")
                 entities, relationships, triplets = await self._process_chunk(chunk, critique, ctx)
-
-                all_entities.extend(entities)
-                all_relationships.extend(relationships)
-                all_triplets.extend(triplets)
-
+                self.logger.info(f"Completed chunk {i+1}/{len(chunks)}")
+                return entities, relationships, triplets
             except Exception as e:
                 self.logger.error(f"Error processing chunk {i+1}: {e}")
-                continue
+                return [], [], []  # Return empty results for failed chunks
+
+        # Execute all chunk processing tasks concurrently
+        import asyncio
+        tasks = [process_chunk_with_index(i, chunk) for i, chunk in enumerate(chunks)]
+        chunk_results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        # Aggregate results from all chunks
+        for entities, relationships, triplets in chunk_results:
+            all_entities.extend(entities)
+            all_relationships.extend(relationships)
+            all_triplets.extend(triplets)
+
+        self.logger.info(f"Completed concurrent processing of all {len(chunks)} chunks")
+
+        # Perform entity resolution to merge similar entities
+        all_entities, all_relationships, all_triplets = self._resolve_entities(
+            all_entities, all_relationships, all_triplets
+        )
 
         # Convert to memgraph JSON format and save to file
         graph_json = self._convert_to_memgraph_format(all_entities, all_relationships, all_triplets)
@@ -1050,21 +1067,20 @@ class GraphBuilderAgent(RoutedAgent):
         return graph_ready_msg
 
     def _split_text_into_chunks(self, text: str, chunk_size: int) -> List[str]:
-        """Split text into chunks of approximately chunk_size characters."""
+        """Split text into chunks of approximately chunk_size tokens."""
         chunks = []
         words = text.split()
         current_chunk = []
-        current_size = 0
+        current_token_count = 0
 
         for word in words:
-            word_size = len(word) + 1  # +1 for space
-            if current_size + word_size > chunk_size and current_chunk:
+            if current_token_count + 1 > chunk_size and current_chunk:
                 chunks.append(" ".join(current_chunk))
                 current_chunk = [word]
-                current_size = word_size
+                current_token_count = 1
             else:
                 current_chunk.append(word)
-                current_size += word_size
+                current_token_count += 1
 
         if current_chunk:
             chunks.append(" ".join(current_chunk))
@@ -1142,6 +1158,163 @@ class GraphBuilderAgent(RoutedAgent):
                 rel_id_counter += 1
 
         return memgraph_items
+
+    def _compute_string_similarity(self, str1: str, str2: str) -> float:
+        """
+        Compute string similarity between two strings using normalized edit distance.
+        Returns a score between 0.0 (completely different) and 1.0 (identical).
+        """
+        # Handle edge cases
+        if str1 == str2:
+            return 1.0
+        if not str1 or not str2:
+            return 0.0
+
+        # Normalize strings: lowercase and strip whitespace
+        s1 = str1.lower().strip()
+        s2 = str2.lower().strip()
+
+        if s1 == s2:
+            return 1.0
+
+        # Compute Levenshtein distance
+        def levenshtein_distance(s1: str, s2: str) -> int:
+            if len(s1) < len(s2):
+                return levenshtein_distance(s2, s1)
+            if len(s2) == 0:
+                return len(s1)
+
+            previous_row = list(range(len(s2) + 1))
+            for i, c1 in enumerate(s1):
+                current_row = [i + 1]
+                for j, c2 in enumerate(s2):
+                    insertions = previous_row[j + 1] + 1
+                    deletions = current_row[j] + 1
+                    substitutions = previous_row[j] + (c1 != c2)
+                    current_row.append(min(insertions, deletions, substitutions))
+                previous_row = current_row
+            return previous_row[-1]
+
+        distance = levenshtein_distance(s1, s2)
+        max_len = max(len(s1), len(s2))
+
+        # Normalize to similarity score (0.0 to 1.0)
+        similarity = 1.0 - (distance / max_len) if max_len > 0 else 0.0
+
+        # Additional bonus for partial matches (substring containment)
+        if s1 in s2 or s2 in s1:
+            substring_bonus = 0.1
+            similarity = min(1.0, similarity + substring_bonus)
+
+        return similarity
+
+    def _resolve_entities(self, entities: List, relationships: List, triplets: List) -> tuple:
+        """
+        Perform entity resolution by merging nodes that refer to the same entity.
+        Returns updated entities, relationships, and triplets.
+        """
+        if not entities:
+            return entities, relationships, triplets
+
+        self.logger.info(f"Starting entity resolution on {len(entities)} entities")
+
+        # Similarity threshold - entities with similarity >= this will be merged
+        SIMILARITY_THRESHOLD = 0.85  # High threshold to avoid false positives
+
+        # Group entities by similarity
+        entity_clusters = []
+        processed_indices = set()
+
+        for i, entity1 in enumerate(entities):
+            if i in processed_indices:
+                continue
+
+            # Start a new cluster with this entity
+            cluster = [entity1]
+            cluster_indices = [i]
+            processed_indices.add(i)
+
+            # Find all entities similar to entity1
+            for j, entity2 in enumerate(entities[i+1:], start=i+1):
+                if j in processed_indices:
+                    continue
+
+                similarity = self._compute_string_similarity(entity1.name, entity2.name)
+
+                if similarity >= SIMILARITY_THRESHOLD:
+                    self.logger.info(f"Merging entities: '{entity1.name}' and '{entity2.name}' (similarity: {similarity:.3f})")
+                    cluster.append(entity2)
+                    cluster_indices.append(j)
+                    processed_indices.add(j)
+
+            entity_clusters.append((cluster, cluster_indices))
+
+        # Create merged entities
+        merged_entities = []
+        entity_name_mapping = {}  # Maps old entity names to new canonical names
+
+        for cluster, indices in entity_clusters:
+            if len(cluster) == 1:
+                # No merging needed
+                merged_entities.append(cluster[0])
+                entity_name_mapping[cluster[0].name] = cluster[0].name
+            else:
+                # Merge entities in this cluster
+                primary_entity = cluster[0]  # Use first entity as primary
+
+                # Collect all names for mapping
+                for entity in cluster:
+                    entity_name_mapping[entity.name] = primary_entity.name
+
+                merged_entities.append(primary_entity)
+
+        # Update relationships to use canonical entity names
+        updated_relationships = []
+        for rel in relationships:
+            # Map source and target entities to their canonical names
+            canonical_source = entity_name_mapping.get(rel.source_entity, rel.source_entity)
+            canonical_target = entity_name_mapping.get(rel.target_entity, rel.target_entity)
+
+            # Skip self-relationships that might have been created by merging
+            if canonical_source == canonical_target:
+                continue
+
+            # Create updated relationship
+            updated_rel = type(rel)(
+                source_entity=canonical_source,
+                target_entity=canonical_target,
+                relationship_type=rel.relationship_type,
+                description=rel.description,
+                evidence=rel.evidence
+            )
+            updated_relationships.append(updated_rel)
+
+        # Update triplets similarly
+        updated_triplets = []
+        for triplet in triplets:
+            # Triplet has subject, predicate, object attributes
+            canonical_subject = entity_name_mapping.get(triplet.subject, triplet.subject)
+            canonical_object = entity_name_mapping.get(triplet.object, triplet.object)
+
+            # Skip self-relationships
+            if canonical_subject == canonical_object:
+                continue
+
+            # Create updated triplet
+            updated_triplet = type(triplet)(
+                subject=canonical_subject,
+                predicate=triplet.predicate,
+                object=canonical_object
+            )
+            updated_triplets.append(updated_triplet)
+
+        entities_before = len(entities)
+        entities_after = len(merged_entities)
+        entities_merged = entities_before - entities_after
+
+        self.logger.info(f"Entity resolution completed: {entities_before} → {entities_after} entities ({entities_merged} merged)")
+
+        return merged_entities, updated_relationships, updated_triplets
 
     async def close(self) -> None:
         """Close the model client."""
@@ -1469,8 +1642,9 @@ class ResponseEvaluatorAgent(RoutedAgent):
         # Prepare gold responses (join multiple answers if available)
         gold_response = " | ".join(message.gold_answers) if message.gold_answers else "No gold response available"
 
-        # Prepare prompt with generated response, gold response, and ROUGE score
+        # Prepare prompt with query, generated response, gold response, and ROUGE score
         prompt_content = self.response_evaluator_prompt.format(
+            message.original_query,
             message.generated_answer,
             gold_response,
             message.rouge_score
