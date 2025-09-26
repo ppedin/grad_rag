@@ -3,15 +3,15 @@ from typing import List, Union, Literal
 
 
 base_prompt_hyperparameters_graph = """
-Your goal is to define the hyperparameters for a Graph RAG architecture. 
+Your goal is to define the hyperparameters for a Graph RAG architecture.
 You have to define a good chunk size. The chunk size must be in tokens. The chunk size must be only one (no variable chunk sizes).
-The system will split the input text based on the chunk size. For each split, an LLM will be used to extract a graph (the graphs will then be merged). So, the chunk size determines the length of the text that must be processed by an LLM. 
+The system will split the input text based on the chunk size. For each split, an LLM will be used to extract a graph (the graphs will then be merged). So, the chunk size determines the length of the text that must be processed by an LLM.
 
-Please, suggest an appropriate chunk size. 
-Use the following critique: 
-{}
+Text to analyze: {text}
 
-Provide the reasoning that led to your response. 
+Question: {question}
+
+Please, suggest an appropriate chunk size and provide the reasoning that led to your response.
 """
 
 base_prompt_hyperparameters_vector = """
@@ -36,18 +36,15 @@ class HyperparametersGraphResponse(BaseModel):
     chunk_size: int
 
 base_prompt_graph_builder = """
-You will be given a text. Your goal is to identify entities in the text and all the relationships among the identified entities. 
-For each entity and relationship, you will include its type in the response. 
-The relationships must be among the extracted entities. For each relationship, include a description (why you think the two entities are related to each other), and the evidence from the text that supports this. 
-Provide a list of triplets in your answer. 
+You will be given a text. Your goal is to identify entities in the text and all the relationships among the identified entities.
+For each entity and relationship, you will include its type in the response.
+The relationships must be among the extracted entities. For each relationship, include a description (why you think the two entities are related to each other), and the evidence from the text that supports this.
+Provide a list of triplets in your answer.
 
 Text:
 {}
 
-Use the following critique: 
-{}
-
-Provide the reasoning that led to your response. 
+Provide the reasoning that led to your response.
 """
 
 
@@ -98,12 +95,9 @@ The subgraphs you retrieved so far are the following:
 
 Choose one of the functions and specify the arguments.
 
-Use the following critique:
-{}
-
 Provide the reasoning that led to your response.
 
-Pay attention to symbols included in the entity/relationship type names: make sure to include them in your search for matching to succeed. 
+Pay attention to symbols included in the entity/relationship type names: make sure to include them in your search for matching to succeed.
 Also, pay attention to symbols included in the functions names. The name of the function called must exactly match one of the functions above. 
 """
 
@@ -172,19 +166,16 @@ class VectorRetrievalPlannerResponse(BaseModel):
     reasoning: str
 
 base_prompt_answer_generator_graph = """
-You will be given a query and the information retrieved from a graph. 
-Your goal is to use the retrieved context to answer the query. 
+You will be given a query and the information retrieved from a graph.
+Your goal is to use the retrieved context to answer the query.
 
 This is the query:
 {}
 
-This is the information: 
+This is the information:
 {}
 
-Provide an answer to the query. 
-
-Use the following critique: 
-{}
+Provide an answer to the query.
 """
 
 base_prompt_answer_generator_vector = """
@@ -411,12 +402,89 @@ Here are the queries, the retrieval prompts, and the retrieval plans generated b
 Based on these contents, provide a detailed critique of how the chunk size can be improved. 
 """
 
+answer_generation_prompt_optimizer = """
+You are optimizing a system prompt for answer generation in a GraphRAG system.
+
+The current critique of the answer generation process is:
+{}
+
+Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better generate answers from retrieved graph information. The system prompt should incorporate the feedback to improve answer quality, relevance, and coherence.
+
+Provide only the optimized system prompt without additional commentary.
+"""
+
+retrieval_planner_prompt_optimizer = """
+You are optimizing a system prompt for retrieval planning in a GraphRAG system.
+
+The current critique of the retrieval planning process is:
+{}
+
+Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better plan graph retrieval strategies. The system prompt should incorporate the feedback to improve retrieval strategy, function selection, and information gathering.
+
+Provide only the optimized system prompt without additional commentary.
+"""
+
+graph_builder_prompt_optimizer = """
+You are optimizing a system prompt for graph construction in a GraphRAG system.
+
+The current critique of the graph building process is:
+{}
+
+Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better extract entities and relationships from text. The system prompt should incorporate the feedback to improve entity recognition, relationship extraction, and graph structure.
+
+Provide only the optimized system prompt without additional commentary.
+"""
+
+hyperparameters_graph_agent_prompt_optimizer = """
+You are optimizing a system prompt for hyperparameter selection in a GraphRAG system.
+
+The current critique of the hyperparameter selection process is:
+{}
+
+Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better determine optimal chunk sizes for graph construction. The system prompt should incorporate the feedback to improve hyperparameter reasoning and selection.
+
+Provide only the optimized system prompt without additional commentary.
+"""
+
+answer_generation_prompt_optimizer_vector = """
+You are optimizing a system prompt for answer generation in a vector RAG system.
+
+The current critique of the answer generation process is:
+{}
+
+Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better generate answers from retrieved vector information. The system prompt should incorporate the feedback to improve answer quality, relevance, and coherence.
+
+Provide only the optimized system prompt without additional commentary.
+"""
+
+retrieval_planner_prompt_optimizer_vector = """
+You are optimizing a system prompt for retrieval planning in a vector RAG system.
+
+The current critique of the retrieval planning process is:
+{}
+
+Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better plan vector retrieval strategies. The system prompt should incorporate the feedback to improve query refinement, search strategy, and information gathering.
+
+Provide only the optimized system prompt without additional commentary.
+"""
+
+hyperparameters_vector_agent_prompt_optimizer = """
+You are optimizing a system prompt for hyperparameter selection in a vector RAG system.
+
+The current critique of the hyperparameter selection process is:
+{}
+
+Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better determine optimal chunk sizes for vector construction. The system prompt should incorporate the feedback to improve hyperparameter reasoning and selection.
+
+Provide only the optimized system prompt without additional commentary.
+"""
+
 prompt_optimizer_prompt = """
 Your goal is to optimize a prompt. The prompt is used for: {}
 
 Below are the criticisms on the prompt:
 {}
 
-Incorporate the criticism, and produce a new prompt. 
+Incorporate the criticism, and produce a new prompt.
 """
 

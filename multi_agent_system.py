@@ -10,6 +10,8 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 from pydantic import BaseModel
 
+from logging_utils import LoggingUtils, log_agent_action, log_batch_progress, log_qa_processing, log_critique_result
+
 from autogen_core import (
     AgentId, MessageContext, RoutedAgent, message_handler,
     SingleThreadedAgentRuntime, TRACE_LOGGER_NAME
@@ -788,25 +790,8 @@ class HyperparametersGraphAgent(RoutedAgent):
         )
 
         # Base prompt for hyperparameters determination
-        self.base_prompt_hyperparameters_graph = """
-        You are an expert in graph-based retrieval-augmented generation (GraphRAG) systems.
-        Your task is to determine optimal hyperparameters for graph construction based on the input text and any previous critiques.
-
-        Consider the following factors when determining the chunk_size:
-        1. Text complexity and length
-        2. Entity density and relationship complexity
-        3. Previous performance feedback from critiques
-        4. Balance between granularity and context preservation
-
-        Previous critique (if any): {critique}
-
-        Text to analyze: {text}
-
-        Question: {question}
-
-        Provide your reasoning and determine an optimal chunk_size (between 100 and 2000 characters).
-        Also provide a confidence score (0.0 to 1.0) for your recommendation.
-        """
+        from parameters import base_prompt_hyperparameters_graph
+        self.base_prompt_hyperparameters_graph = base_prompt_hyperparameters_graph
 
     @message_handler
     async def handle_hyperparameters_graph_start(
@@ -816,9 +801,9 @@ class HyperparametersGraphAgent(RoutedAgent):
         self.logger.info(f"HyperparametersGraphAgent processing QA pair {message.qa_pair_id}")
 
         try:
-            # Load shared state to get critique
+            # Load shared state to get learned system prompt
             current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-            critique = current_state.get("hyperparameters_graph_agent_critique", "")
+            learned_system_prompt = current_state.get("learned_prompt_hyperparameters_graph", "")
 
             # Extract text and question from QA pair
             qa_pair = message.qa_pair
@@ -826,18 +811,17 @@ class HyperparametersGraphAgent(RoutedAgent):
 
             # Get document text from current state (assuming it's available)
             batch_info = current_state.get("batch_information", {})
-            document_text = batch_info.get("document_text", "")[:1000]  # Limit for prompt
+            document_text = current_state.get("full_document_text", batch_info.get("document_text", ""))[:1000]  # Limit for prompt
 
-            # Prepare prompt
+            # Prepare base prompt (without critique)
             prompt_content = self.base_prompt_hyperparameters_graph.format(
-                critique=critique or "No previous critique available.",
                 text=document_text,
                 question=question
             )
 
-            # Call LLM with structured output
-            system_message = SystemMessage(content=prompt_content)
-            user_message = UserMessage(content="Please analyze and provide hyperparameters.", source="system")
+            # Call LLM with structured output using learned system prompt
+            system_message = SystemMessage(content=learned_system_prompt)
+            user_message = UserMessage(content=prompt_content, source="user")
 
             response = await self.model_client.create(
                 [system_message, user_message],
@@ -848,8 +832,10 @@ class HyperparametersGraphAgent(RoutedAgent):
             assert isinstance(response.content, str)
             hyperparams_response = HyperparametersGraphResponse.model_validate_json(response.content)
 
-            self.logger.info(f"LLM recommended chunk_size: {hyperparams_response.chunk_size} "
-                           f"(confidence: {hyperparams_response.confidence_score:.2f})")
+            log_agent_action(self.logger, "HyperparametersGraph", "LLM recommendation",
+                            chunk_size=hyperparams_response.chunk_size,
+                            confidence=f"{hyperparams_response.confidence_score:.2f}",
+                            reasoning=hyperparams_response.reasoning)
 
             # Save chunk_size to shared state
             rag_hyperparams = current_state.get("rag_hyperparameters", {})
@@ -930,24 +916,23 @@ class GraphBuilderAgent(RoutedAgent):
         # Load shared state
         current_state = message.shared_state
         batch_info = current_state.get("batch_information", {})
-        corpus = batch_info.get("document_text", "")
+        corpus = current_state.get("full_document_text", batch_info.get("document_text", ""))
 
         if not corpus:
             self.logger.error("No document text found in batch information")
             return
 
-        # Get critique from shared state
-        critique = current_state.get("graph_builder_agent_critique", "")
+        # Get learned system prompt from shared state
+        learned_system_prompt = current_state.get("learned_prompt_graph_builder", "")
 
         # Split corpus into chunks
         chunks = self._split_text_into_chunks(corpus, message.chunk_size)
         self.logger.info(f"Split corpus into {len(chunks)} chunks")
 
         # Save prompt template (without text chunk) to shared state
-        # The base_prompt has two {} placeholders: first for text chunk, second for critique
-        # Format the critique first, then replace the text placeholder
-        prompt_with_critique = self.base_prompt_graph_builder.format("{TEXT_CHUNK}", critique or "No critique available.")
-        current_state["graph_builder_prompt"] = prompt_with_critique
+        # The base_prompt now has only one {} placeholder for the text chunk
+        prompt_without_critique = self.base_prompt_graph_builder.format("{TEXT_CHUNK}")
+        current_state["graph_builder_prompt"] = prompt_without_critique
 
         # Initialize graph data structure
         all_entities = []
@@ -962,7 +947,7 @@ class GraphBuilderAgent(RoutedAgent):
             """Wrapper to process chunk with index for logging and error handling."""
             try:
                 self.logger.info(f"Processing chunk {i+1}/{len(chunks)}")
-                entities, relationships, triplets = await self._process_chunk(chunk, critique, ctx)
+                entities, relationships, triplets = await self._process_chunk(chunk, learned_system_prompt, ctx)
                 self.logger.info(f"Completed chunk {i+1}/{len(chunks)}")
                 return entities, relationships, triplets
             except Exception as e:
@@ -997,7 +982,7 @@ class GraphBuilderAgent(RoutedAgent):
 
         try:
             with open(graph_filename, 'w', encoding='utf-8') as f:
-                json.dump(graph_json, f, indent=2)
+                json.dump(graph_json, f, indent=2, ensure_ascii=False)
             self.logger.info(f"Saved graph to {graph_filename}")
         except Exception as e:
             self.logger.error(f"Error saving graph file: {e}")
@@ -1087,14 +1072,14 @@ class GraphBuilderAgent(RoutedAgent):
 
         return chunks
 
-    async def _process_chunk(self, chunk: str, critique: str, ctx: MessageContext) -> tuple:
+    async def _process_chunk(self, chunk: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
         """Process a text chunk to extract entities and relationships."""
-        # Prepare prompt
-        prompt_content = self.base_prompt_graph_builder.format(chunk, critique or "No critique available.")
+        # Prepare base prompt (without critique)
+        prompt_content = self.base_prompt_graph_builder.format(chunk)
 
-        # Call LLM with structured output
-        system_message = SystemMessage(content=prompt_content)
-        user_message = UserMessage(content="Please extract entities and relationships.", source="system")
+        # Call LLM with structured output using learned system prompt
+        system_message = SystemMessage(content=learned_system_prompt)
+        user_message = UserMessage(content=prompt_content, source="user")
 
         response = await self.model_client.create(
             [system_message, user_message],
@@ -1382,14 +1367,14 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
 
         # Load shared state
         current_state = message.shared_state
-        critique = current_state.get("retrieval_planner_agent_critique", "")
+        learned_system_prompt = current_state.get("learned_prompt_graph_retrieval_planner", "")
 
         # Get graph description from shared state
         graph_description = current_state.get("graph_description", "")
 
-        # Create retrieval prompt template and save to shared state
+        # Create retrieval prompt template and save to shared state (without critique)
         prompt_template = self.base_prompt_graph_retrieval_planner.format(
-            message.query, graph_description, "{RETRIEVED_CONTEXT}", critique or "No critique available."
+            message.query, graph_description, "{RETRIEVED_CONTEXT}"
         )
         current_state["retrieval_prompt"] = prompt_template
 
@@ -1402,14 +1387,14 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
             self.logger.info(f"Retrieval iteration {iteration + 1}/{message.k_iterations}")
 
             try:
-                # Prepare prompt with current context
+                # Prepare prompt with current context (without critique)
                 prompt_content = self.base_prompt_graph_retrieval_planner.format(
-                    message.query, graph_description, retrieved_context, critique or "No critique available."
+                    message.query, graph_description, retrieved_context
                 )
 
-                # Call LLM to get next retrieval step
-                system_message = SystemMessage(content=prompt_content)
-                user_message = UserMessage(content="Please plan the next retrieval step.", source="system")
+                # Call LLM to get next retrieval step using learned system prompt
+                system_message = SystemMessage(content=learned_system_prompt)
+                user_message = UserMessage(content=prompt_content, source="user")
 
                 response = await self.model_client.create(
                     [system_message, user_message],
@@ -1489,9 +1474,9 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 graph_string = result.get("graph_string", "")
                 if graph_string:
                     return graph_string
-                return json.dumps(result, indent=2)
+                return json.dumps(result, indent=2, ensure_ascii=False)
             elif isinstance(result, list):
-                return json.dumps(result, indent=2)
+                return json.dumps(result, indent=2, ensure_ascii=False)
             else:
                 return str(result)
 
@@ -1543,19 +1528,19 @@ class AnswerGeneratorAgent(RoutedAgent):
         """Handle AnswerGenerationStart message and generate answer using LLM."""
         self.logger.info(f"AnswerGeneratorAgent processing QA pair {message.qa_pair_id}")
 
-        # Load shared state to get critique
+        # Load shared state to get learned system prompt
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-        critique = current_state.get("answer_generation_critique", "")
+        learned_system_prompt = current_state.get("learned_prompt_answer_generator_graph", "")
 
-        # Prepare prompt with question, retrieved context, and critique
+        # Prepare prompt with question and retrieved context (without critique)
         prompt_content = self.base_prompt_answer_generator_graph.format(
-            message.question, message.retrieved_context, critique or "No critique available."
+            message.question, message.retrieved_context
         )
 
         try:
-            # Call LLM for answer generation
-            system_message = SystemMessage(content=prompt_content)
-            user_message = UserMessage(content="Please generate an answer based on the retrieved context.", source="system")
+            # Call LLM for answer generation using learned system prompt
+            system_message = SystemMessage(content=learned_system_prompt)
+            user_message = UserMessage(content=prompt_content, source="user")
 
             response = await self.model_client.create(
                 [system_message, user_message],
@@ -1565,7 +1550,7 @@ class AnswerGeneratorAgent(RoutedAgent):
             # Get generated answer
             generated_answer = response.content if isinstance(response.content, str) else str(response.content)
 
-            self.logger.info(f"Generated answer for QA pair {message.qa_pair_id}: {generated_answer[:100]}...")
+            log_qa_processing(self.logger, message.qa_pair_id, "Generated answer", generated_answer)
 
             # Store conversation in shared state
             conversation_entry = {
@@ -1573,8 +1558,7 @@ class AnswerGeneratorAgent(RoutedAgent):
                 "question": message.question,
                 "retrieved_context": message.retrieved_context,
                 "prompt": prompt_content,
-                "generated_answer": generated_answer,
-                "critique": critique
+                "generated_answer": generated_answer
             }
 
             conversations = current_state.get("conversations_answer_generation", [])
@@ -1663,7 +1647,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
             # Get evaluation result
             evaluation_result = response.content if isinstance(response.content, str) else str(response.content)
 
-            self.logger.info(f"Evaluation completed for QA pair {message.qa_pair_id}: {evaluation_result[:100]}...")
+            log_qa_processing(self.logger, message.qa_pair_id, "Evaluation completed", evaluation_result)
 
             # Create evaluation result dictionary
             evaluation_data = {
@@ -1733,7 +1717,7 @@ class BackwardPassAgent(RoutedAgent):
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.backward_pass")
         self.shared_state = SharedState("agent_states")
 
-        # Import gradient prompts
+        # Import gradient prompts and optimizer prompts
         from parameters import (
             generation_prompt_gradient_prompt,
             retrieved_content_gradient_prompt_graph,
@@ -1741,7 +1725,11 @@ class BackwardPassAgent(RoutedAgent):
             retrieval_planning_prompt_gradient_prompt,
             graph_gradient_prompt,
             graph_extraction_prompt_gradient_prompt,
-            rag_hyperparameters_agent_gradient_prompt
+            rag_hyperparameters_agent_gradient_prompt,
+            answer_generation_prompt_optimizer,
+            retrieval_planner_prompt_optimizer,
+            graph_builder_prompt_optimizer,
+            hyperparameters_graph_agent_prompt_optimizer
         )
 
         # Initialize OpenAI model client for simple text response
@@ -1750,7 +1738,7 @@ class BackwardPassAgent(RoutedAgent):
             api_key=llm_keys.OPENAI_KEY
         )
 
-        # Store all gradient prompts
+        # Store all gradient prompts and optimizer prompts
         self.generation_prompt_gradient_prompt = generation_prompt_gradient_prompt
         self.retrieved_content_gradient_prompt_graph = retrieved_content_gradient_prompt_graph
         self.retrieval_plan_gradient_prompt_graph = retrieval_plan_gradient_prompt_graph
@@ -1758,6 +1746,12 @@ class BackwardPassAgent(RoutedAgent):
         self.graph_gradient_prompt = graph_gradient_prompt
         self.graph_extraction_prompt_gradient_prompt = graph_extraction_prompt_gradient_prompt
         self.rag_hyperparameters_agent_gradient_prompt = rag_hyperparameters_agent_gradient_prompt
+
+        # Store optimizer prompts
+        self.answer_generation_prompt_optimizer = answer_generation_prompt_optimizer
+        self.retrieval_planner_prompt_optimizer = retrieval_planner_prompt_optimizer
+        self.graph_builder_prompt_optimizer = graph_builder_prompt_optimizer
+        self.hyperparameters_graph_agent_prompt_optimizer = hyperparameters_graph_agent_prompt_optimizer
 
     @message_handler
     async def handle_backward_pass_start(self, message: BackwardPassStartMessage, ctx: MessageContext) -> BackwardPassReadyMessage:
@@ -1814,6 +1808,12 @@ class BackwardPassAgent(RoutedAgent):
                         "graph_critique",
                         "graph_builder_agent_critique",
                         "hyperparameters_graph_agent_critique"
+                    ],
+                    "learned_prompts_generated": [
+                        "learned_prompt_answer_generator_graph",
+                        "learned_prompt_graph_retrieval_planner",
+                        "learned_prompt_graph_builder",
+                        "learned_prompt_hyperparameters_graph"
                     ]
                 }
             )
@@ -1862,7 +1862,16 @@ class BackwardPassAgent(RoutedAgent):
         critique = await self._call_llm(prompt_content, ctx)
         current_state["answer_generation_critique"] = critique
 
-        self.logger.info("Answer generation critique generated and saved")
+        # Generate optimized prompt using the critique
+        optimizer_prompt = self.answer_generation_prompt_optimizer.format(critique)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+
+        # Only update if not frozen
+        is_frozen = self._is_prompt_frozen("answer_generator_graph", current_state)
+        if not is_frozen:
+            current_state["learned_prompt_answer_generator_graph"] = optimized_prompt
+
+        log_critique_result(self.logger, "answer_generator_graph", critique, is_frozen)
 
     async def _generate_retrieved_content_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for retrieved content based on conversations, contexts, and evaluations."""
@@ -1957,7 +1966,16 @@ class BackwardPassAgent(RoutedAgent):
         critique = await self._call_llm(prompt_content, ctx)
         current_state["retrieval_planner_agent_critique"] = critique
 
-        self.logger.info("Retrieval planning prompt critique generated and saved")
+        # Generate optimized prompt using the critique
+        optimizer_prompt = self.retrieval_planner_prompt_optimizer.format(critique)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+
+        # Only update if not frozen
+        is_frozen = self._is_prompt_frozen("graph_retrieval_planner", current_state)
+        if not is_frozen:
+            current_state["learned_prompt_graph_retrieval_planner"] = optimized_prompt
+
+        log_critique_result(self.logger, "graph_retrieval_planner", critique, is_frozen)
 
     async def _generate_graph_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for the graph based on questions, description, and retrieval plans."""
@@ -1999,7 +2017,7 @@ class BackwardPassAgent(RoutedAgent):
 
         graph_builder_prompt = current_state.get("graph_builder_prompt", "")
         batch_info = current_state.get("batch_information", {})
-        corpus_sample = batch_info.get("document_text", "")[:500]  # Sample of corpus
+        corpus_sample = current_state.get("full_document_text", batch_info.get("document_text", ""))[:500]  # Sample of corpus
         graph_description = current_state.get("graph_description", "")
         graph_critique = current_state.get("graph_critique", "No critique available")
 
@@ -2015,9 +2033,16 @@ class BackwardPassAgent(RoutedAgent):
         critique = await self._call_llm(prompt_content, ctx)
         current_state["graph_builder_agent_critique"] = critique
 
-        self.logger.info(f"Graph builder agent critique: {critique}")
+        # Generate optimized prompt using the critique
+        optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
 
-        self.logger.info("Graph builder critique generated and saved")
+        # Only update if not frozen
+        is_frozen = self._is_prompt_frozen("graph_builder", current_state)
+        if not is_frozen:
+            current_state["learned_prompt_graph_builder"] = optimized_prompt
+
+        log_critique_result(self.logger, "graph_builder", critique, is_frozen)
 
     async def _generate_hyperparameters_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for hyperparameters agent."""
@@ -2027,7 +2052,7 @@ class BackwardPassAgent(RoutedAgent):
         chunk_size = rag_hyperparams.get("chunk_size", "Not specified")
 
         batch_info = current_state.get("batch_information", {})
-        corpus_sample = batch_info.get("document_text", "")[:500]  # Sample of corpus
+        corpus_sample = current_state.get("full_document_text", batch_info.get("document_text", ""))[:500]  # Sample of corpus
         graph_description = current_state.get("graph_description", "")
         graph_critique = current_state.get("graph_critique", "No critique available")
 
@@ -2042,9 +2067,22 @@ class BackwardPassAgent(RoutedAgent):
 
         critique = await self._call_llm(prompt_content, ctx)
         current_state["hyperparameters_graph_agent_critique"] = critique
-        self.logger.info(f"hyperparameters graph agent critique: {critique}")
 
-        self.logger.info("Hyperparameters critique generated and saved")
+        # Generate optimized prompt using the critique
+        optimizer_prompt = self.hyperparameters_graph_agent_prompt_optimizer.format(critique)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+
+        # Only update if not frozen
+        is_frozen = self._is_prompt_frozen("hyperparameters_graph", current_state)
+        if not is_frozen:
+            current_state["learned_prompt_hyperparameters_graph"] = optimized_prompt
+
+        log_critique_result(self.logger, "hyperparameters_graph", critique, is_frozen)
+
+    def _is_prompt_frozen(self, prompt_type: str, current_state: Dict[str, Any]) -> bool:
+        """Check if a prompt type is frozen."""
+        frozen_prompts = current_state.get("frozen_prompts", [])
+        return prompt_type in frozen_prompts
 
     async def _call_llm(self, prompt_content: str, ctx: MessageContext) -> str:
         """Helper method to call LLM with given prompt."""

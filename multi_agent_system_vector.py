@@ -12,6 +12,8 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 from pydantic import BaseModel
 
+from logging_utils import LoggingUtils, log_agent_action, log_batch_progress, log_qa_processing, log_critique_result
+
 from autogen_core import (
     AgentId, MessageContext, RoutedAgent, message_handler,
     SingleThreadedAgentRuntime, TRACE_LOGGER_NAME
@@ -547,18 +549,22 @@ class HyperparametersVectorAgent(RoutedAgent):
         self.logger.info(f"HyperparametersVectorAgent processing QA pair {message.qa_pair_id}")
 
         try:
-            # Load shared state to get critique
+            # Load shared state to get learned system prompt
             current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-            critique = current_state.get("hyperparameters_vector_agent_critique", "")
+            learned_system_prompt = current_state.get("learned_prompt_hyperparameters_vector", "")
 
-            # Prepare prompt
-            prompt_content = self.base_prompt_hyperparameters_vector.format(
-                critique or "No previous critique available."
+            # Prepare base user prompt without critique placeholder
+            text = message.qa_pair.get("text", "")
+            question = message.qa_pair.get("question", "")
+
+            user_prompt_content = self.base_prompt_hyperparameters_vector.format(
+                text=text,
+                question=question
             )
 
-            # Call LLM with structured output
-            system_message = SystemMessage(content=prompt_content)
-            user_message = UserMessage(content="Please analyze and provide hyperparameters.", source="system")
+            # Create messages with dual-prompt structure
+            system_message = SystemMessage(content=learned_system_prompt)
+            user_message = UserMessage(content=user_prompt_content, source="user")
 
             response = await self.model_client.create(
                 [system_message, user_message],
@@ -569,8 +575,10 @@ class HyperparametersVectorAgent(RoutedAgent):
             assert isinstance(response.content, str)
             hyperparams_response = HyperparametersVectorResponse.model_validate_json(response.content)
 
-            self.logger.info(f"LLM recommended chunk_size: {hyperparams_response.chunk_size} "
-                           f"(confidence: {hyperparams_response.confidence_score:.2f})")
+            log_agent_action(self.logger, "HyperparametersVector", "LLM recommendation",
+                            chunk_size=hyperparams_response.chunk_size,
+                            confidence=f"{hyperparams_response.confidence_score:.2f}",
+                            reasoning=hyperparams_response.reasoning)
 
             # Save chunk_size to shared state
             rag_hyperparams = current_state.get("rag_hyperparameters", {})
@@ -631,7 +639,7 @@ class VectorBuilderAgent(RoutedAgent):
         # Load shared state
         current_state = message.shared_state
         batch_info = current_state.get("batch_information", {})
-        corpus = batch_info.get("document_text", "")
+        corpus = current_state.get("full_document_text", batch_info.get("document_text", ""))
 
         if not corpus:
             self.logger.error("No document text found in batch information")
@@ -709,7 +717,7 @@ class VectorBuilderAgent(RoutedAgent):
                 # Save metadata
                 metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_metadata.json")
                 with open(metadata_filename, 'w', encoding='utf-8') as f:
-                    json.dump(self.chunk_metadata, f, indent=2)
+                    json.dump(self.chunk_metadata, f, indent=2, ensure_ascii=False)
 
                 self.logger.info(f"Saved FAISS index and metadata to {index_filename}")
 
@@ -803,11 +811,11 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
 
         # Load shared state
         current_state = message.shared_state
-        critique = current_state.get("retrieval_planner_agent_critique", "")
+        learned_system_prompt = current_state.get("learned_prompt_vector_retrieval_planner", "")
 
-        # Create retrieval prompt template and save to shared state
+        # Create base user prompt template and save to shared state
         prompt_template = self.base_prompt_vector_retrieval_planner.format(
-            message.query, "{RETRIEVED_CONTEXT}", critique or "No critique available."
+            message.query, "{RETRIEVED_CONTEXT}"
         )
         current_state["retrieval_prompt"] = prompt_template
 
@@ -820,14 +828,14 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
             self.logger.info(f"Retrieval iteration {iteration + 1}/{message.k_iterations}")
 
             try:
-                # Prepare prompt with current context
-                prompt_content = self.base_prompt_vector_retrieval_planner.format(
-                    message.query, retrieved_context, critique or "No critique available."
+                # Prepare base user prompt with current context
+                user_prompt_content = self.base_prompt_vector_retrieval_planner.format(
+                    message.query, retrieved_context
                 )
 
-                # Call LLM to get next retrieval step
-                system_message = SystemMessage(content=prompt_content)
-                user_message = UserMessage(content="Please refine the query for retrieval.", source="system")
+                # Create messages with dual-prompt structure
+                system_message = SystemMessage(content=learned_system_prompt)
+                user_message = UserMessage(content=user_prompt_content, source="user")
 
                 response = await self.model_client.create(
                     [system_message, user_message],
@@ -961,19 +969,19 @@ class AnswerGeneratorAgent(RoutedAgent):
         """Handle AnswerGenerationStart message and generate answer using LLM."""
         self.logger.info(f"AnswerGeneratorAgent processing QA pair {message.qa_pair_id}")
 
-        # Load shared state to get critique
+        # Load shared state to get learned system prompt
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-        critique = current_state.get("answer_generation_critique", "")
+        learned_system_prompt = current_state.get("learned_prompt_answer_generator_vector", "")
 
-        # Prepare prompt with question, retrieved context, and critique
-        prompt_content = self.base_prompt_answer_generator_vector.format(
-            message.question, message.retrieved_context, critique or "No critique available."
+        # Prepare base user prompt with question and retrieved context
+        user_prompt_content = self.base_prompt_answer_generator_vector.format(
+            message.question, message.retrieved_context
         )
 
         try:
-            # Call LLM for answer generation
-            system_message = SystemMessage(content=prompt_content)
-            user_message = UserMessage(content="Please generate an answer based on the retrieved context.", source="system")
+            # Create messages with dual-prompt structure
+            system_message = SystemMessage(content=learned_system_prompt)
+            user_message = UserMessage(content=user_prompt_content, source="user")
 
             response = await self.model_client.create(
                 [system_message, user_message],
@@ -983,16 +991,16 @@ class AnswerGeneratorAgent(RoutedAgent):
             # Get generated answer
             generated_answer = response.content if isinstance(response.content, str) else str(response.content)
 
-            self.logger.info(f"Generated answer for QA pair {message.qa_pair_id}: {generated_answer[:100]}...")
+            log_qa_processing(self.logger, message.qa_pair_id, "Generated answer", generated_answer)
 
             # Store conversation in shared state
             conversation_entry = {
                 "qa_pair_id": message.qa_pair_id,
                 "question": message.question,
                 "retrieved_context": message.retrieved_context,
-                "prompt": prompt_content,
-                "generated_answer": generated_answer,
-                "critique": critique
+                "system_prompt": learned_system_prompt,
+                "user_prompt": user_prompt_content,
+                "generated_answer": generated_answer
             }
 
             conversations = current_state.get("conversations_answer_generation", [])
@@ -1081,7 +1089,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
             # Get evaluation result
             evaluation_result = response.content if isinstance(response.content, str) else str(response.content)
 
-            self.logger.info(f"Evaluation completed for QA pair {message.qa_pair_id}: {evaluation_result[:100]}...")
+            log_qa_processing(self.logger, message.qa_pair_id, "Evaluation completed", evaluation_result)
 
             # Create evaluation result dictionary
             evaluation_data = {
@@ -1140,13 +1148,16 @@ class BackwardPassAgent(RoutedAgent):
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.backward_pass")
         self.shared_state = SharedState("agent_states")
 
-        # Import vector-specific gradient prompts
+        # Import vector-specific gradient prompts and optimizer prompts
         from parameters import (
             generation_prompt_gradient_prompt_vector,
             retrieved_content_gradient_prompt_vector,
             retrieval_plan_gradient_prompt_vector,
             retrieval_planning_prompt_gradient_vector,
-            rag_hyperparameters_agent_gradient_vector
+            rag_hyperparameters_agent_gradient_vector,
+            answer_generation_prompt_optimizer_vector,
+            retrieval_planner_prompt_optimizer_vector,
+            hyperparameters_vector_agent_prompt_optimizer
         )
 
         # Initialize OpenAI model client for simple text response
@@ -1161,6 +1172,11 @@ class BackwardPassAgent(RoutedAgent):
         self.retrieval_plan_gradient_prompt_vector = retrieval_plan_gradient_prompt_vector
         self.retrieval_planning_prompt_gradient_vector = retrieval_planning_prompt_gradient_vector
         self.rag_hyperparameters_agent_gradient_vector = rag_hyperparameters_agent_gradient_vector
+
+        # Store all vector-specific optimizer prompts
+        self.answer_generation_prompt_optimizer_vector = answer_generation_prompt_optimizer_vector
+        self.retrieval_planner_prompt_optimizer_vector = retrieval_planner_prompt_optimizer_vector
+        self.hyperparameters_vector_agent_prompt_optimizer = hyperparameters_vector_agent_prompt_optimizer
 
     @message_handler
     async def handle_backward_pass_start(self, message: BackwardPassStartMessage, ctx: MessageContext) -> BackwardPassReadyMessage:
@@ -1255,7 +1271,16 @@ class BackwardPassAgent(RoutedAgent):
         critique = await self._call_llm(prompt_content, ctx)
         current_state["answer_generation_critique"] = critique
 
-        self.logger.info("Answer generation critique generated and saved")
+        # Generate optimized system prompt based on critique
+        optimizer_prompt = self.answer_generation_prompt_optimizer_vector.format(critique)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+
+        # Only update if not frozen
+        is_frozen = self._is_prompt_frozen("answer_generator_vector", current_state)
+        if not is_frozen:
+            current_state["learned_prompt_answer_generator_vector"] = optimized_prompt
+
+        log_critique_result(self.logger, "answer_generator_vector", critique, is_frozen)
 
     async def _generate_retrieved_content_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for retrieved content based on conversations, contexts, and evaluations."""
@@ -1349,7 +1374,16 @@ class BackwardPassAgent(RoutedAgent):
         critique = await self._call_llm(prompt_content, ctx)
         current_state["retrieval_planner_agent_critique"] = critique
 
-        self.logger.info("Retrieval planning prompt critique generated and saved")
+        # Generate optimized system prompt based on critique
+        optimizer_prompt = self.retrieval_planner_prompt_optimizer_vector.format(critique)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+
+        # Only update if not frozen
+        is_frozen = self._is_prompt_frozen("vector_retrieval_planner", current_state)
+        if not is_frozen:
+            current_state["learned_prompt_vector_retrieval_planner"] = optimized_prompt
+
+        log_critique_result(self.logger, "vector_retrieval_planner", critique, is_frozen)
 
     async def _generate_hyperparameters_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for hyperparameters agent."""
@@ -1387,7 +1421,21 @@ class BackwardPassAgent(RoutedAgent):
         current_state["hyperparameters_vector_agent_critique"] = critique
         self.logger.info(f"hyperparameters vector agent critique: {critique}")
 
-        self.logger.info("Hyperparameters critique generated and saved")
+        # Generate optimized system prompt based on critique
+        optimizer_prompt = self.hyperparameters_vector_agent_prompt_optimizer.format(critique)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+
+        # Only update if not frozen
+        is_frozen = self._is_prompt_frozen("hyperparameters_vector", current_state)
+        if not is_frozen:
+            current_state["learned_prompt_hyperparameters_vector"] = optimized_prompt
+
+        log_critique_result(self.logger, "hyperparameters_vector", critique, is_frozen)
+
+    def _is_prompt_frozen(self, prompt_type: str, current_state: Dict[str, Any]) -> bool:
+        """Check if a prompt type is frozen."""
+        frozen_prompts = current_state.get("frozen_prompts", [])
+        return prompt_type in frozen_prompts
 
     async def _call_llm(self, prompt_content: str, ctx: MessageContext) -> str:
         """Helper method to call LLM with given prompt."""

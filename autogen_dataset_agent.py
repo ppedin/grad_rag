@@ -95,11 +95,11 @@ class DatasetAgent(RoutedAgent):
         self.dataset = self._load_dataset()
 
         self.logger.info(f"DatasetAgent initialized for {dataset_name} ({setting})")
-        self.logger.info(f"Found {len(self.dataset.questions)} questions in dataset")
+        self.logger.info(f"Loaded {self.dataset.metadata.get('total_documents', 1)} documents with {len(self.dataset.questions)} total questions")
         self.logger.info(f"Repetitions per batch: {repetitions}")
 
     def _load_dataset(self) -> Document:
-        """Load the dataset from JSON file."""
+        """Load the dataset from JSON file and merge all documents into one for processing."""
         dataset_file = Path(f"{self.dataset_name}/{self.dataset_name}_{self.setting}.json")
 
         if not dataset_file.exists():
@@ -109,25 +109,64 @@ class DatasetAgent(RoutedAgent):
             with open(dataset_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            # Convert to Document objects - handle both demo format and real dataset format
-            doc_data = None
+            # Handle different dataset formats
+            documents_data = []
 
             if isinstance(data, list) and len(data) > 0:
                 # Demo format: direct array of documents
-                doc_data = data[0]
+                documents_data = data
             elif isinstance(data, dict) and 'documents' in data and len(data['documents']) > 0:
                 # Real dataset format: {"documents": [...]}
-                doc_data = data['documents'][0]
+                documents_data = data['documents']
             else:
                 raise ValueError("Invalid dataset format - expected array of documents or {documents: [...]}")
 
-            # Extract questions and create Document
-            questions = [Question(**q) for q in doc_data.get('questions', [])]
+            # Merge all documents into a single dataset for processing
+            all_questions = []
+            all_texts = []
+            all_metadata = {}
+
+            for doc_data in documents_data:
+                # Collect all questions from all documents
+                questions = [Question(**q) for q in doc_data.get('questions', [])]
+                all_questions.extend(questions)
+
+                # Collect text (we'll concatenate all texts)
+                doc_text = doc_data.get('text', '')
+                if doc_text.strip():
+                    all_texts.append(doc_text.strip())
+
+                # Merge metadata
+                doc_metadata = doc_data.get('metadata', {})
+                for key, value in doc_metadata.items():
+                    if key in all_metadata:
+                        # If key exists, create a list or extend existing list
+                        if isinstance(all_metadata[key], list):
+                            if isinstance(value, list):
+                                all_metadata[key].extend(value)
+                            else:
+                                all_metadata[key].append(value)
+                        else:
+                            all_metadata[key] = [all_metadata[key], value]
+                    else:
+                        all_metadata[key] = value
+
+            # Combine all texts with a separator to avoid merging issues
+            combined_text = '\n\n--- DOCUMENT SEPARATOR ---\n\n'.join(all_texts)
+
+            # Add dataset statistics to metadata
+            all_metadata.update({
+                'total_documents': len(documents_data),
+                'total_questions': len(all_questions),
+                'dataset_name': self.dataset_name,
+                'dataset_setting': self.setting
+            })
+
             return Document(
-                id=doc_data.get('id', 'doc_0'),
-                text=doc_data.get('text', ''),
-                questions=questions,
-                metadata=doc_data.get('metadata', {})
+                id=f"{self.dataset_name}_{self.setting}_combined",
+                text=combined_text,
+                questions=all_questions,
+                metadata=all_metadata
             )
 
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -166,29 +205,62 @@ class DatasetAgent(RoutedAgent):
 
     def generate_batch(self, batch_id: int) -> Optional[Dict[str, Any]]:
         """Generate batch information for a specific batch."""
-        # For now, we'll use the entire document as one batch
-        # In a real implementation, you might split the document into smaller batches
+        # Process questions sequentially - one question per batch
         if batch_id >= len(self.dataset.questions):
             return None
 
-        # Create batch with all questions for this document
+        # Get the question for this batch
+        question = self.dataset.questions[batch_id]
+
+        # Create document chunk for this question (use reasonable chunk size)
+        chunk_size = 2000  # Characters per chunk
+        document_chunks = self._split_document_into_chunks(self.dataset.text, chunk_size)
+
+        # For now, use first chunk or create a relevant chunk for the question
+        # In a more advanced implementation, you could select the most relevant chunk
+        document_chunk = document_chunks[0] if document_chunks else self.dataset.text[:chunk_size]
+
+        # Create batch with single question and relevant document chunk
         batch_info = {
             "batch_id": batch_id,
-            "document_text": self.dataset.text,
-            "qa_pairs": []
-        }
-
-        # Add all questions as QA pairs
-        for question in self.dataset.questions:
-            qa_pair = {
+            "document_text": document_chunk,
+            "qa_pairs": [{
                 "question_id": question.id,
                 "question": question.question,
                 "answers": question.answers,
                 "metadata": question.metadata
-            }
-            batch_info["qa_pairs"].append(qa_pair)
+            }]
+        }
 
         return batch_info
+
+    def _split_document_into_chunks(self, text: str, chunk_size: int) -> List[str]:
+        """Split document into chunks of specified size, trying to break at sentence boundaries."""
+        if not text or chunk_size <= 0:
+            return []
+
+        chunks = []
+        current_pos = 0
+
+        while current_pos < len(text):
+            # Get chunk of specified size
+            chunk_end = min(current_pos + chunk_size, len(text))
+            chunk = text[current_pos:chunk_end]
+
+            # If not at end of text, try to break at sentence boundary
+            if chunk_end < len(text):
+                # Look for last sentence ending in the chunk
+                for i in range(len(chunk) - 1, max(0, len(chunk) - 200), -1):
+                    if chunk[i] in '.!?':
+                        # Found sentence boundary, adjust chunk
+                        chunk = chunk[:i+1]
+                        chunk_end = current_pos + i + 1
+                        break
+
+            chunks.append(chunk.strip())
+            current_pos = chunk_end
+
+        return [chunk for chunk in chunks if chunk]  # Remove empty chunks
 
     @message_handler
     async def handle_dataset_processing_request(
@@ -326,14 +398,44 @@ class DatasetAgent(RoutedAgent):
             self._log_to_file("No more batches to process")
             return
 
-        self.logger.info(f"Processing batch {self.current_batch_id}, repetition {self.current_repetition + 1}/{self.repetitions}")
-        self._log_to_file(f"Processing batch {self.current_batch_id}, repetition {self.current_repetition + 1}/{self.repetitions}")
+        # Log progress with question information
+        current_question = self.dataset.questions[self.current_batch_id] if self.current_batch_id < len(self.dataset.questions) else None
+        question_preview = current_question.question[:80] + "..." if current_question and len(current_question.question) > 80 else (current_question.question if current_question else "No question")
+
+        self.logger.info(f"Processing batch {self.current_batch_id + 1}/{len(self.dataset.questions)}, repetition {self.current_repetition + 1}/{self.repetitions}")
+        self.logger.info(f"Question: {question_preview}")
+        self._log_to_file(f"Processing batch {self.current_batch_id + 1}/{len(self.dataset.questions)}, repetition {self.current_repetition + 1}/{self.repetitions} - Q: {question_preview}")
 
         # Update shared state with batch information
         current_state = self.shared_state.load_state(
             self.dataset_name, self.setting, self.current_batch_id
         )
-        current_state["batch_information"] = batch_info
+
+        # Create a heavily truncated version for logging to keep logs clean
+        batch_info_for_logging = batch_info.copy()
+        if "document_text" in batch_info_for_logging:
+            # Truncate to just 100 characters for logging to keep logs readable
+            original_text = batch_info_for_logging["document_text"]
+            if len(original_text) > 100:
+                batch_info_for_logging["document_text"] = original_text[:100] + "..."
+            else:
+                batch_info_for_logging["document_text"] = original_text
+
+        # Also truncate question and answer text in QA pairs for logging
+        if "qa_pairs" in batch_info_for_logging:
+            for qa_pair in batch_info_for_logging["qa_pairs"]:
+                if len(qa_pair.get("question", "")) > 100:
+                    qa_pair["question"] = qa_pair["question"][:100] + "..."
+                if isinstance(qa_pair.get("answers"), list) and qa_pair["answers"]:
+                    for i, answer in enumerate(qa_pair["answers"]):
+                        if isinstance(answer, str) and len(answer) > 100:
+                            qa_pair["answers"][i] = answer[:100] + "..."
+
+        # Store truncated batch information for logging
+        current_state["batch_information"] = batch_info_for_logging
+
+        # Store full document text separately for agents to access
+        current_state["full_document_text"] = batch_info["document_text"]
 
         # Save state
         self.shared_state.save_state(

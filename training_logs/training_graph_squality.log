@@ -1,0 +1,5 @@
+2025-09-26 05:07:42,033 - autogen_core.events - INFO - {"payload": "{\"dataset_name\":\"squality\",\"setting\":\"train\",\"repetitions\":3}", "sender": null, "receiver": "dataset_agent/default", "kind": "MessageKind.DIRECT", "delivery_stage": "DeliveryStage.SEND", "type": "Message"}
+2025-09-26 05:07:42,033 - autogen_core.events - INFO - {"payload": "{\"dataset_name\":\"squality\",\"setting\":\"train\",\"repetitions\":3}", "sender": null, "receiver": "dataset_agent/default", "kind": "MessageKind.DIRECT", "delivery_stage": "DeliveryStage.DELIVER", "type": "Message"}
+2025-09-26 05:07:42,062 - autogen_core.trace.dataset_agent - INFO - DatasetAgent initialized for squality (train)
+2025-09-26 05:07:42,062 - autogen_core.events - INFO - {"agent_id": "dataset_agent/default", "exception": "'list' object has no attribute 'metadata'", "type": "AgentConstructionException"}
+2025-09-26 05:07:42,078 - autogen_core.events - INFO - {"payload": "{\"dataset_name\":\"squality\",\"setting\":\"train\",\"repetitions\":3}", "handling_agent": "dataset_agent/default", "exception": "'list' object has no attribute 'metadata'", "type": "MessageHandlerException"}
