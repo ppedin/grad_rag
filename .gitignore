@@ -20,3 +20,7 @@ verify_graph.py
 llm_keys.py
 demo_*
 validate_*
+
+frozen_prompts/
+training_logs/
+vector_indexes/

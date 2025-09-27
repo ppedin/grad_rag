@@ -108,6 +108,19 @@ class ResponseEvaluationReadyMessage(BaseModel):
     batch_id: int
     repetition: int
 
+class SummarizationStartMessage(BaseModel):
+    batch_id: int
+    repetition: int
+    retrieved_contexts: List[str]
+    dataset: str
+    setting: str
+
+class SummarizationReadyMessage(BaseModel):
+    batch_id: int
+    repetition: int
+    context_summaries: List[str]
+    concatenated_summary: str
+
 class BackwardPassStartMessage(BaseModel):
     batch_id: int
     repetition: int
@@ -782,10 +795,18 @@ class HyperparametersGraphAgent(RoutedAgent):
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.hyperparameters_graph")
         self.shared_state = SharedState("agent_states")
 
-        # Initialize OpenAI model client with structured output
+        # Initialize Gemini model client with structured output
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY,
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            },
             response_format=HyperparametersGraphResponse
         )
 
@@ -896,76 +917,139 @@ class GraphBuilderAgent(RoutedAgent):
         self.shared_state = SharedState("agent_states")
 
         # Import response formats and prompts
-        from parameters import base_prompt_graph_builder, GraphBuilderResponse
+        from parameters import (
+            base_prompt_graph_builder,
+            base_prompt_graph_refinement,
+            GraphBuilderResponse,
+            GraphRefinementResponse
+        )
 
-        # Initialize OpenAI model client with structured output
-        self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY,
+        self.model_client_creation = OpenAIChatCompletionClient(
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": False,
+                "json_output": False,
+                "family": "unknown",
+                "structured_output": True,
+            },
             response_format=GraphBuilderResponse
         )
 
+        self.model_client_refinement = OpenAIChatCompletionClient(
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            },
+            response_format=GraphRefinementResponse
+        )
+
         self.base_prompt_graph_builder = base_prompt_graph_builder
+        self.base_prompt_graph_refinement = base_prompt_graph_refinement
         
 
     @message_handler
     async def handle_graph_start(self, message: GraphStartMessage, ctx: MessageContext) -> GraphReadyMessage:
-        """Handle GraphStart message by chunking text and building graph."""
+        """Handle GraphStart message by chunking text and building/refining graph."""
         self.logger.info(f"GraphBuilderAgent processing batch {message.batch_id} with chunk_size {message.chunk_size}")
 
         # Load shared state
         current_state = message.shared_state
         batch_info = current_state.get("batch_information", {})
-        corpus = current_state.get("full_document_text", batch_info.get("document_text", ""))
+        example_info = current_state.get("example_information", {})
+        corpus = current_state.get("full_document_text", batch_info.get("document_text", example_info.get("document_text", "")))
+
+        # Determine if this is graph creation (first iteration) or refinement (subsequent iterations)
+        is_first_iteration = message.repetition == 0
+        self.logger.info(f"Graph mode: {'Creation' if is_first_iteration else 'Refinement'} (iteration {message.repetition})")
 
         if not corpus:
             self.logger.error("No document text found in batch information")
             return
 
-        # Get learned system prompt from shared state
-        learned_system_prompt = current_state.get("learned_prompt_graph_builder", "")
+        # Get appropriate learned system prompt based on iteration
+        if is_first_iteration:
+            learned_system_prompt = current_state.get("learned_prompt_graph_builder", "")
+        else:
+            learned_system_prompt = current_state.get("learned_prompt_graph_refinement", "")
 
-        # Split corpus into chunks
-        chunks = self._split_text_into_chunks(corpus, message.chunk_size)
-        self.logger.info(f"Split corpus into {len(chunks)} chunks")
+        if is_first_iteration:
+            # Graph creation mode
+            chunks = self._split_text_into_chunks(corpus, message.chunk_size)
+            self.logger.info(f"Split corpus into {len(chunks)} chunks for graph creation")
 
-        # Save prompt template (without text chunk) to shared state
-        # The base_prompt now has only one {} placeholder for the text chunk
-        prompt_without_critique = self.base_prompt_graph_builder.format("{TEXT_CHUNK}")
-        current_state["graph_builder_prompt"] = prompt_without_critique
+            # Save prompt template (without text chunk) to shared state
+            prompt_without_critique = self.base_prompt_graph_builder.format("{TEXT_CHUNK}")
+            current_state["graph_builder_prompt"] = prompt_without_critique
 
-        # Initialize graph data structure
-        all_entities = []
-        all_relationships = []
-        all_triplets = []
+            # Initialize graph data structure
+            all_entities = []
+            all_relationships = []
+            all_triplets = []
 
-        # Process all chunks asynchronously for better time efficiency
-        self.logger.info(f"Starting concurrent processing of {len(chunks)} chunks")
+            # Process chunks for graph creation
+            new_entities, new_relationships, new_triplets = await self._process_graph_creation(chunks, learned_system_prompt, ctx)
+            all_entities.extend(new_entities)
+            all_relationships.extend(new_relationships)
+            all_triplets.extend(new_triplets)
+        else:
+            # Graph refinement mode
+            self.logger.info("Graph refinement mode: loading existing graph and refining")
 
-        # Create tasks for all chunks
-        async def process_chunk_with_index(i: int, chunk: str) -> tuple:
-            """Wrapper to process chunk with index for logging and error handling."""
-            try:
-                self.logger.info(f"Processing chunk {i+1}/{len(chunks)}")
-                entities, relationships, triplets = await self._process_chunk(chunk, learned_system_prompt, ctx)
-                self.logger.info(f"Completed chunk {i+1}/{len(chunks)}")
-                return entities, relationships, triplets
-            except Exception as e:
-                self.logger.error(f"Error processing chunk {i+1}: {e}")
-                return [], [], []  # Return empty results for failed chunks
+            # Get existing graph summary for refinement
+            existing_graph_summary = await self._get_existing_graph_summary()
 
-        # Execute all chunk processing tasks concurrently
-        import asyncio
-        tasks = [process_chunk_with_index(i, chunk) for i, chunk in enumerate(chunks)]
-        chunk_results = await asyncio.gather(*tasks, return_exceptions=False)
+            # For refinement, split text into chunks like in creation mode
+            chunks = self._split_text_into_chunks(corpus, message.chunk_size)
+            self.logger.info(f"Split corpus into {len(chunks)} chunks for graph refinement")
 
-        # Aggregate results from all chunks
-        for entities, relationships, triplets in chunk_results:
-            all_entities.extend(entities)
-            all_relationships.extend(relationships)
-            all_triplets.extend(triplets)
+            # Save refinement prompt template to shared state
+            prompt_without_critique = self.base_prompt_graph_refinement.format("{GRAPH_SUMMARY}", "{TEXT_CHUNK}")
+            current_state["graph_refinement_prompt"] = prompt_without_critique
 
-        self.logger.info(f"Completed concurrent processing of all {len(chunks)} chunks")
+            # Process refinement
+            new_entities, new_relationships, new_triplets = await self._process_graph_refinement(
+                chunks, existing_graph_summary, learned_system_prompt, ctx
+            )
+
+            # For refinement, merge new entities/relationships with existing ones
+            existing_entities, existing_relationships, existing_triplets = await self._load_existing_graph_data()
+
+            # Log existing entities details
+            if existing_entities:
+                existing_names = [entity.name for entity in existing_entities[:10]]  # First 10 names
+                self.logger.info(f"EXISTING ENTITIES ({len(existing_entities)} total): {', '.join(existing_names)}{'...' if len(existing_entities) > 10 else ''}")
+            else:
+                self.logger.info("EXISTING ENTITIES: None found (first iteration or loading failed)")
+
+            # Log new entities details
+            if new_entities:
+                new_names = [entity.name for entity in new_entities[:10]]  # First 10 names
+                self.logger.info(f"NEW ENTITIES ({len(new_entities)} total): {', '.join(new_names)}{'...' if len(new_entities) > 10 else ''}")
+            else:
+                self.logger.info("NEW ENTITIES: None found")
+
+            # Merge new entities with existing ones
+            all_entities = existing_entities + new_entities
+            all_relationships = existing_relationships + new_relationships
+            all_triplets = existing_triplets + new_triplets
+
+            # Log merge results
+            self.logger.info(f"MERGE RESULT: {len(existing_entities)} existing + {len(new_entities)} new = {len(all_entities)} total entities")
+            self.logger.info(f"MERGE RESULT: {len(existing_relationships)} existing + {len(new_relationships)} new = {len(all_relationships)} total relationships")
+
+            # Log sample of merged entities to verify merging worked
+            if all_entities:
+                merged_sample = [entity.name for entity in all_entities[:15]]  # Show more for verification
+                self.logger.info(f"MERGED ENTITIES SAMPLE (first 15): {', '.join(merged_sample)}{'...' if len(all_entities) > 15 else ''}")
 
         # Perform entity resolution to merge similar entities
         all_entities, all_relationships, all_triplets = self._resolve_entities(
@@ -989,25 +1073,43 @@ class GraphBuilderAgent(RoutedAgent):
 
         # Load graph into Memgraph server
         try:
-            from graph_functions import load_graph_from_json_flexible, clear_graph
+            from graph_functions import load_graph_from_json_flexible, clear_graph, merge_graph_incremental
             import os
 
-            # Clear existing graph to free up memory
-            self.logger.info("Clearing existing graph from Memgraph to free memory")
-            clear_result = clear_graph()
-            if clear_result.get("status") == "success":
-                self.logger.info(f"Graph cleared successfully: {clear_result.get('message')}")
-            else:
-                self.logger.warning(f"Failed to clear graph: {clear_result.get('message')}")
+            if is_first_iteration:
+                # For first iteration, clear existing graph and load new one
+                self.logger.info("First iteration: Clearing existing graph and loading new one")
+                clear_result = clear_graph()
+                if clear_result.get("status") == "success":
+                    self.logger.info(f"Graph cleared successfully: {clear_result.get('message')}")
+                else:
+                    self.logger.warning(f"Failed to clear graph: {clear_result.get('message')}")
 
-            # Use the filename relative to the mounted volume
-            graph_file_basename = os.path.basename(graph_filename)
-            load_result = load_graph_from_json_flexible(graph_file_basename)
+                # Use the filename relative to the mounted volume
+                graph_file_basename = os.path.basename(graph_filename)
+                load_result = load_graph_from_json_flexible(graph_file_basename)
 
-            if load_result.get("status") == "success":
-                self.logger.info(f"Successfully loaded graph {graph_file_basename} into Memgraph server")
+                if load_result.get("status") == "success":
+                    self.logger.info(f"Successfully loaded graph {graph_file_basename} into Memgraph server")
+                else:
+                    self.logger.error(f"Failed to load graph: {load_result.get('message')}")
             else:
-                self.logger.error(f"Failed to load graph: {load_result.get('message')}")
+                # For refinement, merge new entities/relationships into existing graph
+                self.logger.info("Refinement mode: Merging new entities and relationships into existing graph")
+                graph_file_basename = os.path.basename(graph_filename)
+
+                # Try to use incremental merge if function exists, otherwise fallback to replace
+                try:
+                    merge_result = merge_graph_incremental(graph_file_basename)
+                    if merge_result.get("status") == "success":
+                        self.logger.info(f"Successfully merged graph updates into existing graph")
+                    else:
+                        self.logger.warning(f"Merge failed, falling back to full replace: {merge_result.get('message')}")
+                        load_result = load_graph_from_json_flexible(graph_file_basename)
+                except Exception as merge_error:
+                    self.logger.warning(f"Incremental merge not available, using full replace: {merge_error}")
+                    load_result = load_graph_from_json_flexible(graph_file_basename)
+
         except Exception as e:
             self.logger.error(f"Error loading graph into Memgraph: {e}")
 
@@ -1081,7 +1183,7 @@ class GraphBuilderAgent(RoutedAgent):
         system_message = SystemMessage(content=learned_system_prompt)
         user_message = UserMessage(content=prompt_content, source="user")
 
-        response = await self.model_client.create(
+        response = await self.model_client_creation.create(
             [system_message, user_message],
             cancellation_token=ctx.cancellation_token
         )
@@ -1143,6 +1245,188 @@ class GraphBuilderAgent(RoutedAgent):
                 rel_id_counter += 1
 
         return memgraph_items
+
+    async def _process_graph_creation(self, chunks: List[str], learned_system_prompt: str, ctx: MessageContext) -> tuple:
+        """Process chunks for graph creation mode."""
+        all_entities = []
+        all_relationships = []
+        all_triplets = []
+
+        # Process all chunks asynchronously for better time efficiency
+        self.logger.info(f"Starting concurrent processing of {len(chunks)} chunks")
+
+        # Create tasks for all chunks
+        async def process_chunk_with_index(i: int, chunk: str) -> tuple:
+            """Wrapper to process chunk with index for logging and error handling."""
+            try:
+                self.logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+                entities, relationships, triplets = await self._process_chunk(chunk, learned_system_prompt, ctx)
+                self.logger.info(f"Completed chunk {i+1}/{len(chunks)}")
+                return entities, relationships, triplets
+            except Exception as e:
+                self.logger.error(f"Error processing chunk {i+1}: {e}")
+                return [], [], []  # Return empty results for failed chunks
+
+        # Execute all chunk processing tasks concurrently
+        import asyncio
+        tasks = [process_chunk_with_index(i, chunk) for i, chunk in enumerate(chunks)]
+        chunk_results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        # Aggregate results from all chunks
+        for entities, relationships, triplets in chunk_results:
+            all_entities.extend(entities)
+            all_relationships.extend(relationships)
+            all_triplets.extend(triplets)
+
+        self.logger.info(f"Completed concurrent processing of all {len(chunks)} chunks")
+        return all_entities, all_relationships, all_triplets
+
+    async def _process_graph_refinement(self, chunks: list, existing_graph_summary: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
+        """Process chunks for graph refinement mode - parallel processing like graph creation."""
+        all_entities = []
+        all_relationships = []
+        all_triplets = []
+
+        # Process all chunks asynchronously for better time efficiency
+        self.logger.info(f"Starting concurrent refinement processing of {len(chunks)} chunks")
+
+        # Create tasks for all chunks
+        async def process_refinement_chunk_with_index(i: int, chunk: str) -> tuple:
+            """Wrapper to process refinement chunk with index for logging and error handling."""
+            try:
+                self.logger.info(f"Processing refinement chunk {i+1}/{len(chunks)}")
+                entities, relationships, triplets = await self._process_refinement_chunk(chunk, existing_graph_summary, learned_system_prompt, ctx)
+                self.logger.info(f"Completed refinement chunk {i+1}/{len(chunks)}")
+                return entities, relationships, triplets
+            except Exception as e:
+                self.logger.error(f"Error processing refinement chunk {i+1}: {e}")
+                return [], [], []  # Return empty results for failed chunks
+
+        # Execute all chunk processing tasks concurrently
+        import asyncio
+        tasks = [process_refinement_chunk_with_index(i, chunk) for i, chunk in enumerate(chunks)]
+        chunk_results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        # Aggregate results from all chunks
+        for entities, relationships, triplets in chunk_results:
+            all_entities.extend(entities)
+            all_relationships.extend(relationships)
+            all_triplets.extend(triplets)
+
+        self.logger.info(f"Completed concurrent refinement processing of all {len(chunks)} chunks")
+
+        log_agent_action(self.logger, "GraphRefinement", "LLM refinement",
+                        entities=len(all_entities),
+                        relationships=len(all_relationships),
+                        triplets=len(all_triplets))
+
+        return all_entities, all_relationships, all_triplets
+
+    async def _process_refinement_chunk(self, chunk: str, existing_graph_summary: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
+        """Process a single text chunk for graph refinement."""
+        # Prepare the refinement prompt
+        user_prompt = self.base_prompt_graph_refinement.format(existing_graph_summary, chunk)
+
+        # Create complete prompt with optional system message
+        if learned_system_prompt:
+            messages = [
+                SystemMessage(content=learned_system_prompt),
+                UserMessage(content=user_prompt, source="user")
+            ]
+        else:
+            messages = [UserMessage(content=user_prompt, source="user")]
+
+        # Use refinement model client
+        response = await self.model_client_refinement.create(messages, cancellation_token=ctx.cancellation_token)
+
+        # Parse structured response
+        assert isinstance(response.content, str)
+        from parameters import GraphRefinementResponse
+        refinement_response = GraphRefinementResponse.model_validate_json(response.content)
+
+        return refinement_response.new_entities, refinement_response.new_relationships, refinement_response.new_triplets
+
+    async def _get_existing_graph_summary(self) -> str:
+        """Get a summary of the existing graph from Memgraph."""
+        try:
+            from graph_functions import generate_graph_description
+            graph_description_result = generate_graph_description()
+            return graph_description_result.get("description", "No existing graph found")
+        except Exception as e:
+            self.logger.error(f"Error getting existing graph summary: {e}")
+            return "No existing graph available"
+
+    async def _load_existing_graph_data(self) -> tuple:
+        """Load existing graph entities and relationships from the previous iteration."""
+        try:
+            # Try to load the existing graph file to get the actual entities/relationships
+            import os
+            import json
+            from parameters import Entity, Relationship, Triplet, EntityProperty
+
+            graphs_dir = "graphs"
+            # We need to figure out the current batch info to find the right file
+            # For now, we'll look for the most recent graph file
+
+            if not os.path.exists(graphs_dir):
+                self.logger.info("No existing graphs directory found, starting with empty graph")
+                return [], [], []
+
+            graph_files = [f for f in os.listdir(graphs_dir) if f.endswith('_graph.json')]
+            if not graph_files:
+                self.logger.info("No existing graph files found, starting with empty graph")
+                return [], [], []
+
+            # Get the most recent graph file
+            latest_file = max(graph_files, key=lambda f: os.path.getmtime(os.path.join(graphs_dir, f)))
+            graph_path = os.path.join(graphs_dir, latest_file)
+
+            with open(graph_path, 'r', encoding='utf-8') as f:
+                graph_data = json.load(f)
+
+            # Extract entities and relationships from the memgraph format
+            entities = []
+            relationships = []
+            triplets = []
+
+            for item in graph_data:
+                if item.get("type") == "node":
+                    # Convert back to Entity format
+                    props = item.get("properties", {})
+
+                    # Create entity properties list from additional properties
+                    entity_properties = []
+                    for key, value in props.items():
+                        if key not in ["name", "entity_type"]:  # Skip main fields
+                            entity_prop = EntityProperty(key=key, value=str(value))
+                            entity_properties.append(entity_prop)
+
+                    entity = Entity(
+                        name=props.get("name", ""),
+                        type=props.get("entity_type", ""),  # Note: 'type' not 'entity_type'
+                        properties=entity_properties
+                    )
+                    entities.append(entity)
+
+                elif item.get("type") == "relationship":
+                    # Convert back to Relationship format
+                    props = item.get("properties", {})
+                    relationship = Relationship(
+                        source_entity=props.get("start_entity", ""),
+                        target_entity=props.get("end_entity", ""),
+                        relationship_type=props.get("type", ""),
+                        description=props.get("description", ""),
+                        evidence=props.get("evidence", "")
+                    )
+                    relationships.append(relationship)
+
+            self.logger.info(f"Loaded existing graph: {len(entities)} entities, {len(relationships)} relationships")
+            return entities, relationships, triplets
+
+        except Exception as e:
+            self.logger.error(f"Error loading existing graph data: {e}")
+            self.logger.info("Continuing with empty existing graph")
+            return [], [], []
 
     def _compute_string_similarity(self, str1: str, str2: str) -> float:
         """
@@ -1302,8 +1586,9 @@ class GraphBuilderAgent(RoutedAgent):
         return merged_entities, updated_relationships, updated_triplets
 
     async def close(self) -> None:
-        """Close the model client."""
-        await self.model_client.close()
+        """Close the model clients."""
+        await self.model_client_creation.close()
+        await self.model_client_refinement.close()
 
 
 # ===== GRAPH RETRIEVAL PLANNER AGENT =====
@@ -1321,10 +1606,18 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
         # Import response formats and prompts
         from parameters import base_prompt_graph_retrieval_planner, GraphRetrievalPlannerResponse
 
-        # Initialize OpenAI model client with structured output
+        # Initialize Gemini model client with structured output
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY,
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            },
             response_format=GraphRetrievalPlannerResponse
         )
 
@@ -1410,7 +1703,7 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 retrieval_plan_responses.append(retrieval_response.reasoning)
 
                 # Execute the function call and retrieve context
-                new_context = await self._execute_retrieval_function(retrieval_response.function_call)
+                new_context = await self._execute_retrieval_function(retrieval_response)
 
                 # Add to retrieved context
                 if new_context:
@@ -1440,10 +1733,10 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
         # Return the retrieval ready message
         return retrieval_ready_msg
 
-    async def _execute_retrieval_function(self, function_call) -> str:
+    async def _execute_retrieval_function(self, retrieval_response) -> str:
         """Execute the graph retrieval function based on LLM response."""
         try:
-            function_name = function_call.function_name
+            function_name = retrieval_response.function_name
 
             # Import graph functions
             from graph_functions import (
@@ -1452,36 +1745,71 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
             )
 
             if function_name == "search_nodes_by_keyword":
-                result = search_nodes_by_keyword(function_call.keyword)
+                result = search_nodes_by_keyword(retrieval_response.keyword)
             elif function_name == "search_nodes_by_types":
-                result = search_nodes_by_types(function_call.node_type)
+                result = search_nodes_by_types(retrieval_response.node_type)
             elif function_name == "get_neighbors":
-                result = get_neighbors(function_call.node_name)
+                result = get_neighbors(retrieval_response.node_name)
             elif function_name == "search_relations_by_type":
-                result = search_relations_by_type(function_call.relation_type)
+                result = search_relations_by_type(retrieval_response.relation_type)
             elif function_name == "identify_communities":
-                result = identify_communities(function_call.node_name)
+                result = identify_communities(retrieval_response.node_name)
             elif function_name == "analyze_path":
-                result = analyze_path(function_call.start_node_name, function_call.end_node_name)
+                result = analyze_path(retrieval_response.start_node_name, retrieval_response.end_node_name)
             elif function_name == "find_hub_nodes":
                 result = find_hub_nodes()
             else:
                 self.logger.error(f"Unknown function: {function_name}")
                 return ""
 
-            # Convert result to string format
+            # Convert result to string format - prioritize textual descriptions only
             if isinstance(result, dict):
+                # First try to extract graph_string directly
                 graph_string = result.get("graph_string", "")
                 if graph_string:
                     return graph_string
-                return json.dumps(result, indent=2, ensure_ascii=False)
+
+                # Check if there's a nested subgraph with graph_string
+                subgraph = result.get("subgraph", {})
+                if isinstance(subgraph, dict):
+                    subgraph_string = subgraph.get("graph_string", "")
+                    if subgraph_string:
+                        return subgraph_string
+
+                # If no graph_string, create a simple textual summary from available metadata
+                # Check both top-level and subgraph-level metadata
+                node_count = result.get("node_count", subgraph.get("node_count", 0)) if isinstance(subgraph, dict) else result.get("node_count", 0)
+                rel_count = result.get("relationship_count", subgraph.get("relationship_count", 0)) if isinstance(subgraph, dict) else result.get("relationship_count", 0)
+                node_names = result.get("node_names", subgraph.get("node_names", [])) if isinstance(subgraph, dict) else result.get("node_names", [])
+
+                # Also check for count field (from search functions)
+                count = result.get("count", 0)
+                if count > 0 and node_count == 0:
+                    node_count = count
+
+                if node_names:
+                    names_text = ", ".join(node_names[:10])  # Limit to first 10 names
+                    if len(node_names) > 10:
+                        names_text += f" (and {len(node_names) - 10} more)"
+                    return f"Found {node_count} nodes and {rel_count} relationships. Nodes include: {names_text}."
+                elif node_count > 0 or count > 0:
+                    return f"Found {max(node_count, count)} nodes and {rel_count} relationships."
+                else:
+                    # Fallback to message if available
+                    message = result.get("message", "")
+                    if message:
+                        return message
             elif isinstance(result, list):
-                return json.dumps(result, indent=2, ensure_ascii=False)
+                # For lists, create a simple textual summary instead of JSON
+                if result:
+                    return f"Retrieved {len(result)} items: {', '.join(str(item)[:50] for item in result[:5])}{'...' if len(result) > 5 else ''}"
+                else:
+                    return "No results found."
             else:
                 return str(result)
 
         except Exception as e:
-            self.logger.error(f"Error executing retrieval function {function_call.function_name}: {e}")
+            self.logger.error(f"Error executing retrieval function {retrieval_response.function_name}: {e}")
             return ""
 
     async def close(self) -> None:
@@ -1515,10 +1843,18 @@ class AnswerGeneratorAgent(RoutedAgent):
         # Import prompts
         from parameters import base_prompt_answer_generator_graph
 
-        # Initialize OpenAI model client for simple text response
+        # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            }
         )
 
         self.base_prompt_answer_generator_graph = base_prompt_answer_generator_graph
@@ -1610,10 +1946,18 @@ class ResponseEvaluatorAgent(RoutedAgent):
         # Import prompts
         from parameters import response_evaluator_prompt
 
-        # Initialize OpenAI model client for simple text response
+        # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            }
         )
 
         self.response_evaluator_prompt = response_evaluator_prompt
@@ -1712,10 +2056,13 @@ class BackwardPassAgent(RoutedAgent):
     Agent that performs backward pass through all agent critiques for system improvement.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, critique_token_limit: int = 512) -> None:
         super().__init__(name)
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.backward_pass")
         self.shared_state = SharedState("agent_states")
+
+        # Configuration for critique token limits
+        self.critique_token_limit = critique_token_limit
 
         # Import gradient prompts and optimizer prompts
         from parameters import (
@@ -1732,10 +2079,18 @@ class BackwardPassAgent(RoutedAgent):
             hyperparameters_graph_agent_prompt_optimizer
         )
 
-        # Initialize OpenAI model client for simple text response
+        # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            }
         )
 
         # Store all gradient prompts and optimizer prompts
@@ -1760,6 +2115,11 @@ class BackwardPassAgent(RoutedAgent):
 
         # Load shared state with correct dataset and setting parameters
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+
+        # Store repetition information in batch_information for critique logic
+        batch_info = current_state.get("batch_information", {})
+        batch_info["current_repetition"] = message.repetition
+        current_state["batch_information"] = batch_info
 
         try:
             # Step 1: Generate answer generation critique
@@ -2012,37 +2372,73 @@ class BackwardPassAgent(RoutedAgent):
         self.logger.info("Graph critique generated and saved")
 
     async def _generate_graph_builder_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for graph builder prompt."""
-        self.logger.info("Generating graph builder critique")
+        """Generate critique for graph builder/refinement prompt based on current iteration."""
 
-        graph_builder_prompt = current_state.get("graph_builder_prompt", "")
+        # Determine current repetition to decide creation vs refinement
         batch_info = current_state.get("batch_information", {})
-        corpus_sample = current_state.get("full_document_text", batch_info.get("document_text", ""))[:500]  # Sample of corpus
-        graph_description = current_state.get("graph_description", "")
-        graph_critique = current_state.get("graph_critique", "No critique available")
+        current_repetition = batch_info.get("current_repetition", 0)
+        is_first_iteration = current_repetition == 0
 
-        if not graph_builder_prompt or not corpus_sample or not graph_description:
-            self.logger.warning("Missing data for graph builder critique")
-            return
+        if is_first_iteration:
+            # First iteration: optimize graph creation prompt
+            self.logger.info("Generating graph builder (creation) critique - first iteration")
 
-        # Call LLM with graph_extraction_prompt_gradient_prompt
-        prompt_content = self.graph_extraction_prompt_gradient_prompt.format(
-            graph_builder_prompt, corpus_sample, graph_description, graph_critique
-        )
+            graph_builder_prompt = current_state.get("graph_builder_prompt", "")
+            corpus_sample = current_state.get("full_document_text", batch_info.get("document_text", ""))[:500]
+            graph_description = current_state.get("graph_description", "")
+            graph_critique = current_state.get("graph_critique", "No critique available")
 
-        critique = await self._call_llm(prompt_content, ctx)
-        current_state["graph_builder_agent_critique"] = critique
+            if not graph_builder_prompt or not corpus_sample or not graph_description:
+                self.logger.warning("Missing data for graph builder critique")
+                return
 
-        # Generate optimized prompt using the critique
-        optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+            # Call LLM with graph_extraction_prompt_gradient_prompt
+            prompt_content = self.graph_extraction_prompt_gradient_prompt.format(
+                graph_builder_prompt, corpus_sample, graph_description, graph_critique
+            )
 
-        # Only update if not frozen
-        is_frozen = self._is_prompt_frozen("graph_builder", current_state)
-        if not is_frozen:
-            current_state["learned_prompt_graph_builder"] = optimized_prompt
+            critique = await self._call_llm(prompt_content, ctx)
+            current_state["graph_builder_agent_critique"] = critique
 
-        log_critique_result(self.logger, "graph_builder", critique, is_frozen)
+            # Generate optimized prompt using the critique
+            optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
+            optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+
+            # Only update if not frozen (creation prompt is NEVER optimized - it's fixed)
+            # So we don't actually save this, but we generate it for logging purposes
+            self.logger.info("Graph creation prompt is fixed - not updating learned_prompt_graph_builder")
+
+        else:
+            # Subsequent iterations: optimize graph refinement prompt
+            self.logger.info(f"Generating graph refinement critique - iteration {current_repetition}")
+
+            graph_refinement_prompt = current_state.get("graph_refinement_prompt", "")
+            corpus_sample = current_state.get("full_document_text", batch_info.get("document_text", ""))[:500]
+            graph_description = current_state.get("graph_description", "")
+            graph_critique = current_state.get("graph_critique", "No critique available")
+
+            if not graph_refinement_prompt or not corpus_sample or not graph_description:
+                self.logger.warning("Missing data for graph refinement critique")
+                return
+
+            # For refinement, we use the same gradient prompt format but focus on refinement
+            prompt_content = self.graph_extraction_prompt_gradient_prompt.format(
+                graph_refinement_prompt, corpus_sample, graph_description, graph_critique
+            )
+
+            critique = await self._call_llm(prompt_content, ctx)
+            current_state["graph_refinement_agent_critique"] = critique
+
+            # Generate optimized refinement prompt using the critique
+            optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
+            optimized_refinement_prompt = await self._call_llm(optimizer_prompt, ctx)
+
+            # Update the refinement prompt (this IS optimized in backward pass)
+            is_frozen = self._is_prompt_frozen("graph_refinement", current_state)
+            if not is_frozen:
+                current_state["learned_prompt_graph_refinement"] = optimized_refinement_prompt
+
+            log_critique_result(self.logger, "graph_refinement", critique, is_frozen)
 
     async def _generate_hyperparameters_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for hyperparameters agent."""
@@ -2085,9 +2481,12 @@ class BackwardPassAgent(RoutedAgent):
         return prompt_type in frozen_prompts
 
     async def _call_llm(self, prompt_content: str, ctx: MessageContext) -> str:
-        """Helper method to call LLM with given prompt."""
+        """Helper method to call LLM with given prompt and token limit."""
         try:
-            system_message = SystemMessage(content=prompt_content)
+            # Add token limit instruction to the prompt
+            enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your critique to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the most critical points and be concise."
+
+            system_message = SystemMessage(content=enhanced_prompt)
             user_message = UserMessage(content="Please provide your critique and feedback.", source="system")
 
             response = await self.model_client.create(
@@ -2106,8 +2505,120 @@ class BackwardPassAgent(RoutedAgent):
         await self.model_client.close()
 
 
+# ===== SUMMARIZER AGENT =====
+
+class SummarizerAgent(RoutedAgent):
+    """
+    Agent that summarizes retrieved contexts to avoid overly long backward pass prompts.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.summarizer")
+        self.shared_state = SharedState("agent_states")
+
+        # Initialize Gemini model client for text summarization
+        self.model_client = OpenAIChatCompletionClient(
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            }
+        )
+
+        # Base prompt for context summarization
+        self.base_summarization_prompt = """
+You are a context summarization expert. Your task is to create concise but comprehensive summaries of retrieved contexts.
+
+Please summarize the following retrieved context, preserving all key information, entities, relationships, and facts that would be relevant for question answering and system improvement:
+
+Context to summarize:
+{context}
+
+Provide a concise summary that captures all essential information while being significantly shorter than the original context.
+"""
+
+    @message_handler
+    async def handle_summarization_start(self, message: SummarizationStartMessage, ctx: MessageContext) -> SummarizationReadyMessage:
+        """Handle SummarizationStart message and generate summaries of retrieved contexts."""
+        self.logger.info(f"SummarizerAgent processing {len(message.retrieved_contexts)} contexts for batch {message.batch_id}")
+
+        context_summaries = []
+
+        try:
+            # Summarize each retrieved context
+            for i, context in enumerate(message.retrieved_contexts):
+                if not context.strip():
+                    context_summaries.append("Empty context")
+                    continue
+
+                self.logger.info(f"Summarizing context {i+1}/{len(message.retrieved_contexts)} (length: {len(context)} chars)")
+
+                # Prepare prompt for summarization
+                prompt_content = self.base_summarization_prompt.format(context=context)
+
+                # Call LLM for summarization
+                system_message = SystemMessage(content="You are a helpful assistant that creates concise summaries.")
+                user_message = UserMessage(content=prompt_content, source="user")
+
+                response = await self.model_client.create(
+                    [system_message, user_message],
+                    cancellation_token=ctx.cancellation_token
+                )
+
+                summary = response.content if isinstance(response.content, str) else str(response.content)
+                context_summaries.append(summary)
+
+                self.logger.info(f"Context {i+1} summarized (original: {len(context)} → summary: {len(summary)} chars)")
+
+            # Create concatenated summary
+            concatenated_summary = "\n\n--- Context Summary ---\n".join([
+                f"Context {i+1}: {summary}"
+                for i, summary in enumerate(context_summaries)
+            ])
+
+            self.logger.info(f"Generated {len(context_summaries)} summaries, concatenated length: {len(concatenated_summary)} chars")
+
+            # Save summaries to shared state
+            current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+            current_state["retrieved_context_summaries"] = context_summaries
+            current_state["concatenated_context_summary"] = concatenated_summary
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+
+            # Return SummarizationReady message
+            return SummarizationReadyMessage(
+                batch_id=message.batch_id,
+                repetition=message.repetition,
+                context_summaries=context_summaries,
+                concatenated_summary=concatenated_summary
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error in context summarization: {e}")
+            # Return empty summaries on error
+            return SummarizationReadyMessage(
+                batch_id=message.batch_id,
+                repetition=message.repetition,
+                context_summaries=["Error in summarization"],
+                concatenated_summary="Error in summarization"
+            )
+
+    async def close(self) -> None:
+        """Close the model client."""
+        await self.model_client.close()
+
+
 # ===== UPDATED FACTORY FUNCTIONS =====
 
-def create_backward_pass_agent() -> BackwardPassAgent:
+def create_backward_pass_agent(critique_token_limit: int = 512) -> BackwardPassAgent:
     """Factory function to create BackwardPassAgent instances."""
-    return BackwardPassAgent("backward_pass_agent")
+    return BackwardPassAgent("backward_pass_agent", critique_token_limit)
+
+def create_summarizer_agent() -> SummarizerAgent:
+    """Factory function to create SummarizerAgent instances."""
+    return SummarizerAgent("summarizer_agent")

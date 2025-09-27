@@ -126,6 +126,20 @@ class HyperparametersVectorResponse(BaseModel):
     chunk_size: int
     confidence_score: float
 
+# Message types for SummarizerAgent
+class SummarizationStartMessage(BaseModel):
+    batch_id: int
+    repetition: int
+    retrieved_contexts: List[str]
+    dataset: str
+    setting: str
+
+class SummarizationReadyMessage(BaseModel):
+    batch_id: int
+    repetition: int
+    context_summaries: List[str]
+    concatenated_summary: str
+
 
 # ===== BATCH ORCHESTRATOR AGENT =====
 
@@ -150,7 +164,13 @@ class BatchOrchestratorAgent(RoutedAgent):
     @message_handler
     async def handle_batch_start(self, message: BatchStartMessage, ctx: MessageContext) -> BatchReadyMessage:
         """Handle BatchStart message by iterating over QA pairs."""
-        self.logger.info(f"BatchOrchestrator received BatchStart for batch {message.batch_id}")
+        self.logger.info(f"VectorRAG BatchOrchestrator received BatchStart for batch {message.batch_id}")
+
+        # Validate that only test datasets are used for test-time training
+        if message.setting != "test":
+            error_msg = f"VectorRAG test-time training only supports 'test' setting. Got: '{message.setting}'"
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
         self.current_batch_id = message.batch_id
         self.current_repetition = message.repetition
@@ -166,10 +186,16 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             self.logger.info(f"Processing {len(qa_pairs)} QA pairs in batch {message.batch_id}")
 
-            # Start processing each QA pair
-            for qa_pair in qa_pairs:
-                qa_pair_id = qa_pair.get("question_id", f"qa_{len(self.current_batch_qa_pairs)}")
+            # First, populate ALL QA pairs in the tracking dictionary
+            for i, qa_pair in enumerate(qa_pairs):
+                qa_pair_id = qa_pair.get("question_id", f"qa_{i}")
                 self.current_batch_qa_pairs[qa_pair_id] = qa_pair
+
+            self.logger.info(f"Initialized tracking for {len(self.current_batch_qa_pairs)} QA pairs")
+
+            # Now start processing each QA pair
+            for qa_pair in qa_pairs:
+                qa_pair_id = qa_pair.get("question_id", f"qa_{qa_pairs.index(qa_pair)}")
 
                 # Send HyperparametersVectorStart message
                 hyperparams_msg = HyperparametersVectorStartMessage(
@@ -253,7 +279,8 @@ class BatchOrchestratorAgent(RoutedAgent):
         qa_pairs = batch_info.get("qa_pairs", [])
 
         # Process each QA pair for retrieval
-        for qa_pair in qa_pairs:
+        for i, qa_pair in enumerate(qa_pairs):
+            qa_pair_id = qa_pair.get("question_id", f"qa_{i}")
             question = qa_pair.get("question", "")
 
             # Send VectorRetrievalStart message
@@ -267,68 +294,67 @@ class BatchOrchestratorAgent(RoutedAgent):
                 shared_state=current_state
             )
 
-            self.logger.info(f"Sending VectorRetrievalStart for batch {vector_response.batch_id}, question: {question[:50]}...")
+            self.logger.info(f"Sending VectorRetrievalStart for batch {vector_response.batch_id}, QA pair {qa_pair_id}, question: {question[:50]}...")
 
             # Send to VectorRetrievalPlannerAgent
             try:
                 retrieval_agent_id = AgentId("vector_retrieval_planner_agent", "default")
                 retrieval_response = await self.send_message(retrieval_start_msg, retrieval_agent_id)
-                self.logger.info(f"Received VectorRetrievalReady response")
+                self.logger.info(f"Received VectorRetrievalReady response for QA pair {qa_pair_id}")
 
-                # Continue with answer generation
-                await self._process_retrieval_response(retrieval_response, ctx)
+                # Continue with answer generation FOR THIS SPECIFIC QA PAIR
+                await self._process_single_qa_retrieval(retrieval_response, qa_pair, qa_pair_id, ctx)
 
             except Exception as e:
                 self.logger.warning(f"VectorRetrievalPlannerAgent not available, falling back to simulation: {e}")
                 # Fallback to simulation if agent is not available
                 await self._simulate_retrieval_ready(retrieval_start_msg, ctx)
 
-    async def _process_retrieval_response(self, retrieval_response: VectorRetrievalReadyMessage, ctx: MessageContext) -> None:
-        """Process retrieval response and continue with answer generation."""
-        self.logger.info(f"Processing retrieval response for batch {retrieval_response.batch_id}")
+    async def _process_single_qa_retrieval(self, retrieval_response: VectorRetrievalReadyMessage,
+                                          qa_pair: Dict[str, Any], qa_pair_id: str, ctx: MessageContext) -> None:
+        """Process retrieval, answer generation, and evaluation for a single QA pair."""
+        self.logger.info(f"Processing single QA pair {qa_pair_id} for batch {retrieval_response.batch_id}")
 
-        # Load current shared state to get all QA pairs
+        # Load and update shared state
         current_state = self.shared_state.load_state(retrieval_response.dataset, retrieval_response.setting, retrieval_response.batch_id)
-        batch_info = current_state.get("batch_information", {})
-        qa_pairs = batch_info.get("qa_pairs", [])
 
-        # Store retrieved context for backward pass critiques
+        # Store retrieved context for this QA pair
         retrieved_contexts = current_state.get("retrieved_contexts", [])
         retrieved_contexts.append(retrieval_response.retrieved_context)
         current_state["retrieved_contexts"] = retrieved_contexts
+
+        # Store the query associated with this retrieval
+        retrieval_queries = current_state.get("retrieval_queries", [])
+        retrieval_queries.append(qa_pair.get("question", ""))
+        current_state["retrieval_queries"] = retrieval_queries
+
         self.shared_state.save_state(current_state, retrieval_response.dataset, retrieval_response.setting, retrieval_response.batch_id)
 
-        # Process each QA pair for answer generation
-        for qa_pair in qa_pairs:
-            qa_pair_id = qa_pair.get("question_id", f"qa_{len(qa_pairs)}")
-            question = qa_pair.get("question", "")
+        # Send AnswerGenerationStart message for THIS QA pair
+        answer_gen_msg = AnswerGenerationStartMessage(
+            qa_pair_id=qa_pair_id,
+            question=qa_pair.get("question", ""),
+            retrieved_context=retrieval_response.retrieved_context,
+            batch_id=retrieval_response.batch_id,
+            repetition=retrieval_response.repetition,
+            dataset=retrieval_response.dataset,
+            setting=retrieval_response.setting
+        )
 
-            # Send AnswerGenerationStart message
-            answer_gen_msg = AnswerGenerationStartMessage(
-                qa_pair_id=qa_pair_id,
-                question=question,
-                retrieved_context=retrieval_response.retrieved_context,
-                batch_id=retrieval_response.batch_id,
-                repetition=retrieval_response.repetition,
-                dataset=retrieval_response.dataset,
-                setting=retrieval_response.setting
-            )
+        self.logger.info(f"Sending AnswerGenerationStart for QA pair {qa_pair_id}")
 
-            self.logger.info(f"Sending AnswerGenerationStart for QA pair {qa_pair_id}")
+        # Send to AnswerGeneratorAgent
+        try:
+            answer_gen_agent_id = AgentId("answer_generator_agent", "default")
+            answer_response = await self.send_message(answer_gen_msg, answer_gen_agent_id)
+            self.logger.info(f"Received AnswerGenerationReady response for QA pair {qa_pair_id}")
 
-            # Send to AnswerGeneratorAgent
-            try:
-                answer_gen_agent_id = AgentId("answer_generator_agent", "default")
-                answer_response = await self.send_message(answer_gen_msg, answer_gen_agent_id)
-                self.logger.info(f"Received AnswerGenerationReady response")
+            # Continue with evaluation for THIS QA pair
+            await self._process_answer_response(answer_response, ctx)
 
-                # Continue with evaluation
-                await self._process_answer_response(answer_response, ctx)
-
-            except Exception as e:
-                self.logger.warning(f"AnswerGeneratorAgent not available, falling back to simulation: {e}")
-                # Fallback to simulation if agent is not available
-                await self._simulate_answer_generation_ready(answer_gen_msg, ctx)
+        except Exception as e:
+            self.logger.warning(f"AnswerGeneratorAgent not available, falling back to simulation: {e}")
+            await self._simulate_answer_generation_ready(answer_gen_msg, ctx)
 
     async def _process_answer_response(self, answer_response: AnswerGenerationReadyMessage, ctx: MessageContext) -> None:
         """Process answer generation response and continue with evaluation."""
@@ -410,8 +436,59 @@ class BatchOrchestratorAgent(RoutedAgent):
 
         # Check if all QA pairs are completed
         if len(self.completed_qa_pairs) == len(self.current_batch_qa_pairs):
-            self.logger.info(f"All QA pairs completed for batch {eval_response.batch_id}")
+            self.logger.info(f"All {len(self.completed_qa_pairs)} QA pairs completed for batch {eval_response.batch_id}")
+
+            # Generate context summary before backward pass
+            await self._generate_context_summary(eval_response.batch_id, eval_response.repetition, ctx)
+
+            # Now start the backward pass
             await self._start_backward_pass(eval_response.batch_id, eval_response.repetition, ctx)
+
+    async def _generate_context_summary(self, batch_id: int, repetition: int, ctx: MessageContext) -> None:
+        """Generate summary of all retrieved contexts before backward pass."""
+        self.logger.info(f"Generating context summary for batch {batch_id}")
+
+        # Load current shared state
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, batch_id)
+        retrieved_contexts = current_state.get("retrieved_contexts", [])
+
+        if not retrieved_contexts:
+            self.logger.warning("No retrieved contexts to summarize")
+            return
+
+        # Log context details
+        self.logger.info(f"Preparing to summarize {len(retrieved_contexts)} contexts")
+
+        # Send SummarizationStart message with list of contexts
+        summarization_msg = SummarizationStartMessage(
+            batch_id=batch_id,
+            repetition=repetition,
+            retrieved_contexts=retrieved_contexts,  # Pass list directly
+            dataset=self.current_dataset,
+            setting=self.current_setting
+        )
+
+        try:
+            summarizer_agent_id = AgentId("summarizer_agent", "default")
+            self.logger.info("Sending summarization request to SummarizerAgent")
+            summary_response = await self.send_message(summarization_msg, summarizer_agent_id)
+
+            # Store the summary in shared state
+            current_state["context_summary"] = summary_response.summary
+            self.logger.info(f"Context summary generated successfully, length: {len(summary_response.summary)} chars")
+
+            # Log the summary for debugging
+            self.logger.debug(f"Generated summary preview: {summary_response.summary[:200]}...")
+
+        except Exception as e:
+            self.logger.warning(f"SummarizerAgent not available, using concatenated contexts as fallback: {e}")
+            # Fallback to using concatenated contexts
+            concatenated_contexts = "\n\n--- Context Separator ---\n\n".join(retrieved_contexts)
+            current_state["context_summary"] = concatenated_contexts
+
+        # Save state with summary
+        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, batch_id)
+        self.logger.info(f"Context summary saved to shared state for batch {batch_id}")
 
     # Continue with other methods...
     async def _start_backward_pass(self, batch_id: int, repetition: int, ctx: MessageContext) -> None:
@@ -633,13 +710,18 @@ class VectorBuilderAgent(RoutedAgent):
 
     @message_handler
     async def handle_vector_start(self, message: VectorStartMessage, ctx: MessageContext) -> VectorReadyMessage:
-        """Handle VectorStart message by chunking text and building FAISS index."""
-        self.logger.info(f"VectorBuilderAgent processing batch {message.batch_id} with chunk_size {message.chunk_size}")
+        """Handle VectorStart message by rebuilding FAISS index from scratch."""
+        self.logger.info(f"VectorBuilderAgent processing batch {message.batch_id} with chunk_size {message.chunk_size} (iteration {message.repetition})")
+
+        # Always clear existing index for reconstruction (test-time training approach)
+        self._reset_vector_store()
+        self.logger.info(f"Cleared existing vector store for reconstruction (iteration {message.repetition})")
 
         # Load shared state
         current_state = message.shared_state
         batch_info = current_state.get("batch_information", {})
-        corpus = current_state.get("full_document_text", batch_info.get("document_text", ""))
+        example_info = current_state.get("example_information", {})
+        corpus = current_state.get("full_document_text", batch_info.get("document_text", example_info.get("document_text", "")))
 
         if not corpus:
             self.logger.error("No document text found in batch information")
@@ -765,6 +847,12 @@ class VectorBuilderAgent(RoutedAgent):
     def get_chunk_metadata(self):
         """Return the current chunk metadata."""
         return self.chunk_metadata
+
+    def _reset_vector_store(self):
+        """Reset the vector store for reconstruction in test-time training."""
+        self.faiss_index = None
+        self.chunk_metadata = []
+        self.logger.info("Vector store reset completed - cleared FAISS index and metadata")
 
 
 # ===== VECTOR RETRIEVAL PLANNER AGENT =====
@@ -1065,14 +1153,10 @@ class ResponseEvaluatorAgent(RoutedAgent):
         """Handle ResponseEvaluationStart message and evaluate response using LLM."""
         self.logger.info(f"ResponseEvaluatorAgent evaluating QA pair {message.qa_pair_id}")
 
-        # Prepare gold responses (join multiple answers if available)
-        gold_response = " | ".join(message.gold_answers) if message.gold_answers else "No gold response available"
-
-        # Prepare prompt with query, generated response, gold response, and ROUGE score
+        # Prepare prompt with query, generated response, and ROUGE score (no gold solution to prevent data leakage)
         prompt_content = self.response_evaluator_prompt.format(
             message.original_query,
             message.generated_answer,
-            gold_response,
             message.rouge_score
         )
 
@@ -1143,10 +1227,13 @@ class BackwardPassAgent(RoutedAgent):
     Agent that performs backward pass through all agent critiques for vector system improvement.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, critique_token_limit: int = 512) -> None:
         super().__init__(name)
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.backward_pass")
         self.shared_state = SharedState("agent_states")
+
+        # Configuration for critique token limits
+        self.critique_token_limit = critique_token_limit
 
         # Import vector-specific gradient prompts and optimizer prompts
         from parameters import (
@@ -1245,8 +1332,8 @@ class BackwardPassAgent(RoutedAgent):
             )
 
     async def _generate_answer_generation_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for answer generation based on conversations and evaluations."""
-        self.logger.info("Generating answer generation critique")
+        """Generate critique for answer generation based on single example conversation and evaluation."""
+        self.logger.info("Generating answer generation critique for single example")
 
         conversations = current_state.get("conversations_answer_generation", [])
         evaluation_responses = current_state.get("response_evaluations", [])
@@ -1255,18 +1342,15 @@ class BackwardPassAgent(RoutedAgent):
             self.logger.warning("No conversations or evaluations found for answer generation critique")
             return
 
-        # Create triplets: conversation (prompt-answer) + evaluation
-        triplets = []
-        for i, conv in enumerate(conversations):
-            if i < len(evaluation_responses):
-                eval_resp = evaluation_responses[i]
-                triplet = f"Conversation: {conv.get('prompt', '')} -> {conv.get('generated_answer', '')}\nEvaluation: {eval_resp.get('evaluation_feedback', '')}"
-                triplets.append(triplet)
+        # For single example format, use the latest (typically only) conversation and evaluation
+        latest_conv = conversations[-1] if conversations else {}
+        latest_eval = evaluation_responses[-1] if evaluation_responses else {}
 
-        concatenated_feedback = "\n\n".join(triplets)
+        # Create single prompt-answer-feedback format (no summaries)
+        single_feedback = f"Prompt: {latest_conv.get('prompt', '')}\nAnswer: {latest_conv.get('generated_answer', '')}\nFeedback: {latest_eval.get('evaluation_feedback', '')}"
 
-        # Call LLM with generation_prompt_gradient_prompt_vector
-        prompt_content = self.generation_prompt_gradient_prompt_vector.format(concatenated_feedback)
+        # Call LLM with generation_prompt_gradient_prompt_vector using single feedback
+        prompt_content = self.generation_prompt_gradient_prompt_vector.format(single_feedback)
 
         critique = await self._call_llm(prompt_content, ctx)
         current_state["answer_generation_critique"] = critique
@@ -1287,23 +1371,28 @@ class BackwardPassAgent(RoutedAgent):
         self.logger.info("Generating retrieved content critique")
 
         conversations = current_state.get("conversations_answer_generation", [])
-        retrieved_contexts = current_state.get("retrieved_contexts", [])
         evaluation_responses = current_state.get("response_evaluations", [])
+
+        # Use context summary instead of full retrieved contexts for backward pass
+        context_summary = current_state.get("context_summary", "")
+        if not context_summary:
+            # Fallback to full contexts if summary is not available
+            retrieved_contexts = current_state.get("retrieved_contexts", [])
+            context_summary = "\n\n--- Context Separator ---\n\n".join(retrieved_contexts) if retrieved_contexts else "No context available"
 
         if not conversations or not evaluation_responses:
             self.logger.warning("Missing data for retrieved content critique")
             return
 
-        # Create quadruplets: retrieved context + conversation (prompt-answer) + evaluation response
-        quadruplets = []
+        # Create triplets: summarized context + conversation (prompt-answer) + evaluation response
+        triplets = []
         for i, conv in enumerate(conversations):
             if i < len(evaluation_responses):
-                context = retrieved_contexts[i] if i < len(retrieved_contexts) else "No context available"
                 eval_resp = evaluation_responses[i]
-                quadruplet = f"Retrieved Context: {context}\nConversation: {conv.get('prompt', '')} -> {conv.get('generated_answer', '')}\nEvaluation: {eval_resp.get('evaluation_feedback', '')}"
-                quadruplets.append(quadruplet)
+                triplet = f"Context Summary: {context_summary}\nConversation: {conv.get('prompt', '')} -> {conv.get('generated_answer', '')}\nEvaluation: {eval_resp.get('evaluation_feedback', '')}"
+                triplets.append(triplet)
 
-        concatenated_data = "\n\n".join(quadruplets)
+        concatenated_data = "\n\n".join(triplets)
 
         # Call LLM with retrieved_content_gradient_prompt_vector
         prompt_content = self.retrieved_content_gradient_prompt_vector.format(concatenated_data)
@@ -1318,19 +1407,25 @@ class BackwardPassAgent(RoutedAgent):
         self.logger.info("Generating retrieval plan critique")
 
         retrieval_plans = current_state.get("retrieval_plans", [])
-        retrieved_contexts = current_state.get("retrieved_contexts", [])
+
+        # Use context summary instead of full retrieved contexts for backward pass
+        context_summary = current_state.get("context_summary", "")
+        if not context_summary:
+            # Fallback to full contexts if summary is not available
+            retrieved_contexts = current_state.get("retrieved_contexts", [])
+            context_summary = "\n\n--- Context Separator ---\n\n".join(retrieved_contexts) if retrieved_contexts else "No context available"
 
         self.logger.info(f"Retrieval plans: {retrieval_plans}")
-        self.logger.info(f"Retrieved contexts: {retrieved_contexts}")
+        self.logger.info(f"Using context summary for critique generation")
 
-        if not retrieval_plans or not retrieved_contexts:
-            self.logger.warning("Missing retrieval plans or contexts for critique")
+        if not retrieval_plans:
+            self.logger.warning("Missing retrieval plans for critique")
             return
 
-        # Create pairs (retrieval_plan, retrieved_context) with same indices
+        # Create pairs (retrieval_plan, context_summary)
         pairs = []
-        for i in range(min(len(retrieval_plans), len(retrieved_contexts))):
-            pair = f"Retrieval Plan: {retrieval_plans[i]}\nRetrieved Context: {retrieved_contexts[i]}"
+        for plan in retrieval_plans:
+            pair = f"Retrieval Plan: {plan}\nContext Summary: {context_summary}"
             pairs.append(pair)
 
         concatenated_pairs = "\n\n".join(pairs)
@@ -1352,24 +1447,26 @@ class BackwardPassAgent(RoutedAgent):
 
         retrieval_prompt = current_state.get("retrieval_prompt", "")
         retrieval_plans = current_state.get("retrieval_plans", [])
+        retrieval_queries = current_state.get("retrieval_queries", [])
 
         if not retrieval_prompt or not retrieval_plans:
             self.logger.warning("Missing retrieval prompt or plans for critique")
             return
 
-        # Create pairs: retrieval_prompt + retrieval_plan
-        pairs = []
-        for plan in retrieval_plans:
-            pair = f"Retrieval Prompt: {retrieval_prompt}\nRetrieval Plan: {plan}"
-            pairs.append(pair)
+        # Create triplets: query + retrieval_prompt + retrieval_plan
+        triplets = []
+        for i, plan in enumerate(retrieval_plans):
+            query = retrieval_queries[i] if i < len(retrieval_queries) else "No query available"
+            triplet = f"Query: {query}\nRetrieval Prompt: {retrieval_prompt}\nRetrieval Plan: {plan}"
+            triplets.append(triplet)
 
-        concatenated_pairs = "\n\n".join(pairs)
+        concatenated_triplets = "\n\n".join(triplets)
 
         # Get retrieval_plan_critique for the second variable
         retrieval_plan_critique = current_state.get("retrieval_plan_critique", "No critique available")
 
         # Call LLM with retrieval_planning_prompt_gradient_vector
-        prompt_content = self.retrieval_planning_prompt_gradient_vector.format(concatenated_pairs, retrieval_plan_critique)
+        prompt_content = self.retrieval_planning_prompt_gradient_vector.format(concatenated_triplets, retrieval_plan_critique)
 
         critique = await self._call_llm(prompt_content, ctx)
         current_state["retrieval_planner_agent_critique"] = critique
@@ -1438,9 +1535,12 @@ class BackwardPassAgent(RoutedAgent):
         return prompt_type in frozen_prompts
 
     async def _call_llm(self, prompt_content: str, ctx: MessageContext) -> str:
-        """Helper method to call LLM with given prompt."""
+        """Helper method to call LLM with given prompt and token limit."""
         try:
-            system_message = SystemMessage(content=prompt_content)
+            # Add token limit instruction to the prompt
+            enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your critique to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the most critical points and be concise."
+
+            system_message = SystemMessage(content=enhanced_prompt)
             user_message = UserMessage(content="Please provide your critique and feedback.", source="system")
 
             response = await self.model_client.create(
@@ -1485,6 +1585,110 @@ def create_response_evaluator_agent() -> ResponseEvaluatorAgent:
     """Factory function to create ResponseEvaluatorAgent instances."""
     return ResponseEvaluatorAgent("response_evaluator_agent")
 
-def create_backward_pass_agent() -> BackwardPassAgent:
+# ===== SUMMARIZER AGENT =====
+
+class SummarizerAgent(RoutedAgent):
+    """
+    Agent that summarizes retrieved contexts to avoid overly long backward pass prompts.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.summarizer")
+        self.shared_state = SharedState("agent_states")
+
+        # Initialize OpenAI model client for text summarization
+        self.model_client = OpenAIChatCompletionClient(
+            model="gpt-4o-mini",
+            api_key=llm_keys.OPENAI_KEY
+        )
+
+        # Base prompt for context summarization
+        self.base_summarization_prompt = """
+You are a context summarization expert. Your task is to create concise but comprehensive summaries of retrieved contexts.
+
+Please summarize the following retrieved context, preserving all key information, entities, relationships, and facts that would be relevant for question answering and system improvement:
+
+Context to summarize:
+{context}
+
+Provide a concise summary that captures all essential information while being significantly shorter than the original context.
+"""
+
+    @message_handler
+    async def handle_summarization_start(self, message: SummarizationStartMessage, ctx: MessageContext) -> SummarizationReadyMessage:
+        """Handle SummarizationStart message and generate summaries of retrieved contexts."""
+        self.logger.info(f"SummarizerAgent processing {len(message.retrieved_contexts)} contexts for batch {message.batch_id}")
+
+        context_summaries = []
+
+        try:
+            # Summarize each retrieved context
+            for i, context in enumerate(message.retrieved_contexts):
+                if not context.strip():
+                    context_summaries.append("Empty context")
+                    continue
+
+                self.logger.info(f"Summarizing context {i+1}/{len(message.retrieved_contexts)} (length: {len(context)} chars)")
+
+                # Prepare prompt for summarization
+                prompt_content = self.base_summarization_prompt.format(context=context)
+
+                # Call LLM for summarization
+                system_message = SystemMessage(content="You are a helpful assistant that creates concise summaries.")
+                user_message = UserMessage(content=prompt_content, source="user")
+
+                response = await self.model_client.create(
+                    [system_message, user_message],
+                    cancellation_token=ctx.cancellation_token
+                )
+
+                summary = response.content if isinstance(response.content, str) else str(response.content)
+                context_summaries.append(summary)
+
+                self.logger.info(f"Context {i+1} summarized (original: {len(context)} → summary: {len(summary)} chars)")
+
+            # Create concatenated summary
+            concatenated_summary = "\n\n--- Context Summary ---\n".join([
+                f"Context {i+1}: {summary}"
+                for i, summary in enumerate(context_summaries)
+            ])
+
+            self.logger.info(f"Generated {len(context_summaries)} summaries, concatenated length: {len(concatenated_summary)} chars")
+
+            # Save summaries to shared state
+            current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+            current_state["retrieved_context_summaries"] = context_summaries
+            current_state["concatenated_context_summary"] = concatenated_summary
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+
+            # Return SummarizationReady message
+            return SummarizationReadyMessage(
+                batch_id=message.batch_id,
+                repetition=message.repetition,
+                context_summaries=context_summaries,
+                concatenated_summary=concatenated_summary
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error in context summarization: {e}")
+            # Return empty summaries on error
+            return SummarizationReadyMessage(
+                batch_id=message.batch_id,
+                repetition=message.repetition,
+                context_summaries=["Error in summarization"],
+                concatenated_summary="Error in summarization"
+            )
+
+    async def close(self) -> None:
+        """Close the model client."""
+        await self.model_client.close()
+
+
+def create_backward_pass_agent(critique_token_limit: int = 512) -> BackwardPassAgent:
     """Factory function to create BackwardPassAgent instances."""
-    return BackwardPassAgent("backward_pass_agent")
+    return BackwardPassAgent("backward_pass_agent", critique_token_limit)
+
+def create_summarizer_agent() -> SummarizerAgent:
+    """Factory function to create SummarizerAgent instances."""
+    return SummarizerAgent("summarizer_agent")

@@ -846,10 +846,40 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
     Returns:
         dict: Result containing the graph description, statistics, and metrics JSON
     """
-    driver = GraphDatabase.driver(uri, auth=(user, password))
+    driver = GraphDatabase.driver(uri, auth=(user, password), max_connection_lifetime=30)
 
     try:
         with driver.session() as session:
+            # Get total counts first (simplest queries)
+            total_nodes_query = "MATCH (n) RETURN count(n) as total_nodes"
+            total_rels_query = "MATCH ()-[r]->() RETURN count(r) as total_relationships"
+
+            total_nodes = session.run(total_nodes_query).single()["total_nodes"]
+            total_rels = session.run(total_rels_query).single()["total_relationships"]
+
+            # If graph is too large, return basic description to avoid performance issues
+            if total_nodes > 10000 or total_rels > 50000:
+                return {
+                    "status": "success",
+                    "message": f"Generated basic description for large graph with {total_nodes} nodes and {total_rels} relationships",
+                    "description": f"This is a large graph containing {total_nodes} nodes and {total_rels} relationships. Detailed analysis skipped for performance reasons.",
+                    "statistics": {
+                        "total_nodes": total_nodes,
+                        "total_relationships": total_rels,
+                        "entity_types": [],
+                        "relationship_types": []
+                    },
+                    "metrics": {
+                        "graph_density": 0.0,
+                        "fragmentation_index": 0.0
+                    },
+                    "density": 0.0,
+                    "fragmentation_index": 0.0,
+                    "largest_component_size": total_nodes,
+                    "total_nodes": total_nodes,
+                    "total_relationships": total_rels
+                }
+
             # Get node type frequencies
             node_query = """
             MATCH (n)
@@ -867,13 +897,6 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
             """
             rel_result = session.run(rel_query)
 
-            # Get total counts
-            total_nodes_query = "MATCH (n) RETURN count(n) as total_nodes"
-            total_rels_query = "MATCH ()-[r]->() RETURN count(r) as total_relationships"
-
-            total_nodes = session.run(total_nodes_query).single()["total_nodes"]
-            total_rels = session.run(total_rels_query).single()["total_relationships"]
-
             # Calculate graph density
             if total_nodes > 1:
                 max_possible_edges = total_nodes * (total_nodes - 1) // 2
@@ -881,31 +904,10 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
             else:
                 graph_density = 0
 
-            # Calculate fragmentation index by finding largest connected component
-            # Use a proper algorithm to find connected components
-            try:
-                # Find the largest connected component using a traversal approach
-                component_query = """
-                MATCH (start)
-                WITH start LIMIT 1
-                MATCH (start)-[*0..]-(connected)
-                RETURN count(DISTINCT connected) as largest_component_size
-                """
-                component_result = session.run(component_query)
-                record = component_result.single()
-                if record:
-                    largest_component_size = record["largest_component_size"]
-                else:
-                    largest_component_size = total_nodes if total_nodes > 0 else 0
-            except:
-                # Fallback: assume all nodes are connected if we can't determine
-                largest_component_size = total_nodes if total_nodes > 0 else 0
-
-            # Calculate fragmentation index: 1 - (C_max/n)
-            if total_nodes > 0:
-                fragmentation_index = 1 - (largest_component_size / total_nodes)
-            else:
-                fragmentation_index = 0
+            # Skip fragmentation calculation to avoid performance issues
+            # Set default values
+            largest_component_size = total_nodes if total_nodes > 0 else 0
+            fragmentation_index = 0.0  # Assume well-connected graph
 
             # Process node types
             node_types = []
@@ -1008,7 +1010,12 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
                     "entity_types": node_types,
                     "relationship_types": rel_types
                 },
-                "metrics": metrics_json
+                "metrics": metrics_json,
+                "density": graph_density,
+                "fragmentation_index": fragmentation_index,
+                "largest_component_size": largest_component_size,
+                "total_nodes": total_nodes,
+                "total_relationships": total_rels
             }
 
     except Exception as e:
@@ -1019,3 +1026,34 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
 
     finally:
         driver.close()
+
+
+def merge_graph_incremental(graph_filename, uri="bolt://localhost:7687", user="", password=""):
+    """
+    Merge new entities and relationships from a JSON file into the existing graph.
+    This is a placeholder implementation that currently falls back to full replace.
+
+    Args:
+        graph_filename (str): Name of the JSON file containing new graph data
+        uri (str): Memgraph connection URI
+        user (str): Username for Memgraph connection
+        password (str): Password for Memgraph connection
+
+    Returns:
+        dict: Result containing status and message
+    """
+    # For now, this is a placeholder that falls back to full replace
+    # In a more sophisticated implementation, this would:
+    # 1. Load the existing graph structure
+    # 2. Compare with new entities/relationships
+    # 3. Only add new ones and update existing ones
+    # 4. Preserve existing relationships not affected by the update
+
+    try:
+        # For now, fallback to full replace
+        return load_graph_from_json_flexible(graph_filename)
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to merge graph incrementally: {str(e)}"
+        }

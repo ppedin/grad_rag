@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import List, Union, Literal
+from pydantic import BaseModel, Field
+from typing import List, Union, Literal, Dict, Any, Optional
 
 
 base_prompt_hyperparameters_graph = """
@@ -37,8 +37,13 @@ class HyperparametersGraphResponse(BaseModel):
 
 base_prompt_graph_builder = """
 You will be given a text. Your goal is to identify entities in the text and all the relationships among the identified entities.
-For each entity and relationship, you will include its type in the response.
-The relationships must be among the extracted entities. For each relationship, include a description (why you think the two entities are related to each other), and the evidence from the text that supports this.
+For each entity, you will include:
+- name: the entity name
+- type: the entity type (e.g., Person, Organization, Location, Event, Concept)
+- properties: a list of key-value pairs describing characteristics of the entity extracted from the text (e.g., for a person: age, role, description; for a location: description, significance). Each property should have a "key" and "value" field.
+
+For each relationship, you will include its type, a description (why you think the two entities are related to each other), and the evidence from the text that supports this.
+The relationships must be among the extracted entities.
 Provide a list of triplets in your answer.
 
 Text:
@@ -47,13 +52,48 @@ Text:
 Provide the reasoning that led to your response.
 """
 
+base_prompt_graph_refinement = """
+You will be given a text and an existing knowledge graph. Your goal is to refine and enhance the existing graph by:
+1. Adding new entities and relationships that are mentioned in the text but missing from the graph
+2. Adding new properties to existing entities based on information in the text
+3. Creating new relationships between existing entities that were previously unconnected
+4. Updating or enriching existing entity properties with additional information from the text
+
+For each new entity, you will include:
+- name: the entity name
+- type: the entity type (e.g., Person, Organization, Location, Event, Concept)
+- properties: a list of key-value pairs describing characteristics of the entity extracted from the text. Each property should have a "key" and "value" field.
+
+For each new relationship, you will include its type, a description, and the evidence from the text that supports this.
+The relationships must be among the entities (both existing and new).
+Provide a list of triplets for new relationships in your answer.
+
+Existing Graph Summary:
+{}
+
+Text to analyze for refinement:
+{}
+
+Focus on finding new information not already captured in the existing graph. Only add entities, relationships, and properties that provide new value.
+
+Provide the reasoning that led to your response.
+"""
+
+
+class EntityProperty(BaseModel):
+    model_config = {"extra": "forbid"}
+    key: str
+    value: str
 
 class Entity(BaseModel):
+    model_config = {"extra": "forbid"}
     name: str
     type: str
+    properties: List[EntityProperty] = Field(default_factory=list)
 
 
 class Relationship(BaseModel):
+    model_config = {"extra": "forbid"}
     source_entity: str
     target_entity: str
     relationship_type: str
@@ -62,15 +102,32 @@ class Relationship(BaseModel):
 
 
 class Triplet(BaseModel):
+    model_config = {"extra": "forbid"}
     subject: str
     predicate: str
     object: str
 
 
 class GraphBuilderResponse(BaseModel):
+    model_config = {"extra": "forbid"}
     entities: List[Entity]
     relationships: List[Relationship]
     triplets: List[Triplet]
+    reasoning: str
+
+
+class EntityUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    entity_name: str
+    property_key: str
+    property_value: str
+
+class GraphRefinementResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+    new_entities: List[Entity]
+    new_relationships: List[Relationship]
+    new_triplets: List[Triplet]
+    entity_property_updates: List[EntityUpdate] = Field(default_factory=list)
     reasoning: str
 
 
@@ -117,51 +174,54 @@ Provide the reasoning that led to your response.
 
 
 class SearchNodesByKeywordCall(BaseModel):
+    model_config = {"extra": "forbid"}
     function_name: Literal["search_nodes_by_keyword"] = "search_nodes_by_keyword"
     keyword: str
 
 class SearchNodesByTypesCall(BaseModel):
+    model_config = {"extra": "forbid"}
     function_name: Literal["search_nodes_by_types"] = "search_nodes_by_types"
     node_type: str
 
 class GetNeighborsCall(BaseModel):
+    model_config = {"extra": "forbid"}
     function_name: Literal["get_neighbors"] = "get_neighbors"
     node_name: str
 
 class SearchRelationsByTypeCall(BaseModel):
+    model_config = {"extra": "forbid"}
     function_name: Literal["search_relations_by_type"] = "search_relations_by_type"
     relation_type: str
 
 class IdentifyCommunitiesCall(BaseModel):
+    model_config = {"extra": "forbid"}
     function_name: Literal["identify_communities"] = "identify_communities"
     node_name: str
 
 class AnalyzePathCall(BaseModel):
+    model_config = {"extra": "forbid"}
     function_name: Literal["analyze_path"] = "analyze_path"
     start_node_name: str
     end_node_name: str
 
 class FindHubNodesCall(BaseModel):
+    model_config = {"extra": "forbid"}
     function_name: Literal["find_hub_nodes"] = "find_hub_nodes"
 
 
-# Union type for all possible function calls
-FunctionCall = Union[
-    SearchNodesByKeywordCall,
-    SearchNodesByTypesCall,
-    GetNeighborsCall,
-    SearchRelationsByTypeCall,
-    IdentifyCommunitiesCall,
-    AnalyzePathCall,
-    FindHubNodesCall
-]
-
-
 class GraphRetrievalPlannerResponse(BaseModel):
-    function_call: FunctionCall
+    model_config = {"extra": "forbid"}
+    function_name: Literal["search_nodes_by_keyword", "search_nodes_by_types", "get_neighbors", "search_relations_by_type", "identify_communities", "analyze_path", "find_hub_nodes"]
+    keyword: Optional[str] = None  # for search_nodes_by_keyword
+    node_type: Optional[str] = None  # for search_nodes_by_types
+    node_name: Optional[str] = None  # for get_neighbors, identify_communities
+    relation_type: Optional[str] = None  # for search_relations_by_type
+    start_node_name: Optional[str] = None  # for analyze_path
+    end_node_name: Optional[str] = None  # for analyze_path
     reasoning: str
 
 class VectorRetrievalPlannerResponse(BaseModel):
+    model_config = {"extra": "forbid"}
     query: str
     reasoning: str
 
@@ -196,7 +256,7 @@ Use the following critique:
 
 
 response_evaluator_prompt = """
-You are evaluating the response generated by a RAG system. 
+You are evaluating the response generated by a RAG system.
 
 The query was:
 {}
@@ -204,63 +264,60 @@ The query was:
 The response was:
 {}
 
-The gold response is:
+The ROUGE score for this response is:
 {}
 
-The ROUGE score between the response and the gold response is:
-{}
-
-Provide a detailed explanation of how the response can be improved. 
+Based on the query and the generated response, provide a detailed explanation of how the response can be improved. Focus on aspects like completeness, accuracy, relevance, clarity, and whether it fully addresses the question asked.
 """
 
 
 generation_prompt_gradient_prompt = """
-You are evaluating the prompt used for answer generation in a Graph RAG system. 
+You are evaluating the prompt used for answer generation in a Graph RAG system during test-time training.
 
 The system works this way:
 The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. For each chunk, an LLM is used to extract a graph. The graphs are then merged. An LLM agent has access to a set of functions to explore the graph (the set is fixed and includes queries on entities and relations based on type or name, access to neighbors, community detection, and identification of central nodes). The context obtained from the exploration is then passed to an LLM together with the query. The LLM generates an answer.
 
-Here are some examples of prompts and answers, with feedback of how the response can be improved:
+Here is the current example with prompt, answer, and feedback:
 {}
 
-Based on these contents, provide a detailed critique that will be used to improve the answer generation prompt. 
+Based on this single example, provide a detailed critique that will be used to improve the answer generation prompt. Focus on specific issues identified in the feedback and how the prompt could be modified to address them.
 """
 
 generation_prompt_gradient_prompt_vector = """
-You are evaluating the prompt used for answer generation in a RAG system. 
+You are evaluating the prompt used for answer generation in a VectorRAG system during test-time training.
 
 The system works this way:
 The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. Each chunk is embedded. An LLM agent refines the queries to retrieve the content. The context obtained is then passed to an LLM together with the query. The LLM generates an answer.
 
-Here are some examples of prompts and answers, with feedback of how the response can be improved:
+Here is the current example with prompt, answer, and feedback:
 {}
 
-Based on these contents, provide a detailed critique that will be used to improve the answer generation prompt. 
+Based on this single example, provide a detailed critique that will be used to improve the answer generation prompt. Focus on specific issues identified in the feedback and how the prompt could be modified to address them.
 """
 
 
 retrieved_content_gradient_prompt_graph = """
-You are evaluating the content retrieved by a GraphRAG system. 
+You are evaluating the content retrieved by a GraphRAG system during test-time training.
 
 The system works this way:
 The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. For each chunk, an LLM is used to extract a graph. The graphs are then merged. An LLM agent has access to a set of functions to explore the graph (the set is fixed and includes queries on entities and relations based on type or name, access to neighbors, community detection, and identification of central nodes). The context obtained from the exploration is then passed to an LLM together with the query. The LLM generates an answer.
 
-Here are some examples of retrieved contexts, queries, and answers, with feedback of how the response can be improved. 
+Here is the current example with retrieved context, query, answer, and feedback:
 {}
 
 Based on these contents, provide a detailed critique of how the retrieved content can be improved.
 """
 
 retrieved_content_gradient_prompt_vector = """
-You are evaluating the content retrieved by a RAG system. 
+You are evaluating the content retrieved by a VectorRAG system during test-time training.
 
 The system works this way:
 The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. Each chunk is embedded. An LLM agent refines the queries to retrieve the content. The context obtained is then passed to an LLM together with the query. The LLM generates an answer.
 
-Here are some examples of retrieved contexts, queries, and answers, with feedback of how the response can be improved. 
+Here is the current example with retrieved context, query, answer, and feedback:
 {}
 
-Based on these contents, provide a detailed critique of how the retrieved content can be improved.
+Based on this single example, provide a detailed critique of how the retrieved content can be improved.
 """
 
 
@@ -281,18 +338,18 @@ Based on these contents, provide a detailed critique of how the retrieval plan c
 
 
 retrieval_plan_gradient_prompt_vector = """
-You are evaluating the retrieval plan made by an agentic GraphRAG system. 
+You are evaluating the retrieval plan made by an agentic VectorRAG system during test-time training.
 
 The system works this way:
 The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. Each chunk is embedded. An LLM agent refines the queries to retrieve the content. The context obtained is then passed to an LLM together with the query. The LLM generates an answer.
 
-Here are some examples of retrieval plans, with the retrieved contents:
+Here is the current example with retrieval plan and retrieved content:
 {}
 
 The critique on the retrieved content was:
 {}
 
-Based on these contents, provide a detailed critique of how the retrieval plan can be improved. 
+Based on this single example, provide a detailed critique of how the retrieval plan can be improved.
 """
 
 
@@ -389,17 +446,18 @@ Based on these contents, provide a detailed critique of how the chunk size can b
 
 
 rag_hyperparameters_agent_gradient_vector = """
-You are evaluating the choice of the chunk size for a RAG system. 
+You are evaluating the choice of the chunk size for a VectorRAG system during test-time training.
 
 The system works this way:
 The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. Each chunk is embedded. An LLM agent refines the queries to retrieve the content. The context obtained is then passed to an LLM together with the query. The LLM generates an answer.
 
-The chosen chunk size was the following:
+The chosen chunk size for this example was:
 {}
 
-Here are the queries, the retrieval prompts, and the retrieval plans generated by the agent.
+Here is the current example with query, retrieval prompt, and retrieval plan generated by the agent:
+{}
 
-Based on these contents, provide a detailed critique of how the chunk size can be improved. 
+Based on this single example, provide a detailed critique of how the chunk size can be improved.
 """
 
 answer_generation_prompt_optimizer = """

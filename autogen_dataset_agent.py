@@ -45,6 +45,16 @@ class DatasetProcessingRequest(BaseModel):
     repetitions: int = 3
 
 
+class DatasetProcessingResponse(BaseModel):
+    """Response from dataset processing completion."""
+    status: str
+    final_metrics: Dict[str, Any]
+    dataset_name: str
+    setting: str
+    total_qa_pairs: int
+    completed_qa_pairs: int
+
+
 class MetricsComputedMessage(BaseModel):
     """Message sent after metrics are computed."""
     batch_id: int
@@ -62,20 +72,24 @@ class DatasetAgent(RoutedAgent):
     def __init__(self, name: str, dataset_name: str, setting: str, repetitions: int = 3) -> None:
         """
         Initialize DatasetAgent.
-
         Args:
             name (str): Agent name
             dataset_name (str): Name of the dataset to process
-            setting (str): 'train' or 'test'
+            setting (str): Must be 'test' for test-time training
             repetitions (int): Number of repetitions per batch (hyperparameter n)
         """
         super().__init__(name)
+
+        # Validate that only test datasets are used
+        if setting != "test":
+            raise ValueError(f"Only 'test' setting is supported for test-time training. Got: '{setting}'")
 
         self.dataset_name = dataset_name
         self.setting = setting
         self.repetitions = repetitions
         self.current_batch_id = 0
         self.current_repetition = 0
+        self.current_qa_index = 0  # Track current QA pair within document
 
         # Initialize shared state manager
         self.shared_state = SharedState("agent_states")
@@ -88,18 +102,31 @@ class DatasetAgent(RoutedAgent):
         self.log_dir.mkdir(exist_ok=True)
         self.log_file = self.log_dir / f"{dataset_name}_{setting}_processing.log"
 
-        # Load processed examples log
-        self.processed_examples = self._load_processed_log()
+        # For test-time training, start fresh each time (don't load previous state)
+        self.processed_examples = {}
 
         # Load dataset
-        self.dataset = self._load_dataset()
+        self.dataset = self._load_dataset() # This now returns a List[Document]
+
+        # Generate QA pair index for single-example processing (after dataset is loaded)
+        self.qa_pairs_list = self._generate_qa_pairs_list()
+
+        # --- THIS IS THE CORRECTED PART ---
+        # Calculate totals from the list of documents
+        total_documents = len(self.dataset)
+        total_questions = sum(len(doc.questions) for doc in self.dataset)
+        total_qa_pairs = len(self.qa_pairs_list)
 
         self.logger.info(f"DatasetAgent initialized for {dataset_name} ({setting})")
-        self.logger.info(f"Loaded {self.dataset.metadata.get('total_documents', 1)} documents with {len(self.dataset.questions)} total questions")
-        self.logger.info(f"Repetitions per batch: {repetitions}")
+        self.logger.info(f"Loaded {total_documents} documents with {total_questions} total questions")
+        self.logger.info(f"Generated {total_qa_pairs} individual QA pairs for test-time training")
+        self.logger.info(f"Repetitions per example: {repetitions}")
 
-    def _load_dataset(self) -> Document:
-        """Load the dataset from JSON file and merge all documents into one for processing."""
+    def _load_dataset(self) -> List[Document]:
+        """
+        Load the dataset from a JSON file as a list of Document objects.
+        Each document retains its own text and associated questions.
+        """
         dataset_file = Path(f"{self.dataset_name}/{self.dataset_name}_{self.setting}.json")
 
         if not dataset_file.exists():
@@ -109,65 +136,38 @@ class DatasetAgent(RoutedAgent):
             with open(dataset_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            # Handle different dataset formats
             documents_data = []
-
-            if isinstance(data, list) and len(data) > 0:
-                # Demo format: direct array of documents
+            if isinstance(data, list):
                 documents_data = data
-            elif isinstance(data, dict) and 'documents' in data and len(data['documents']) > 0:
-                # Real dataset format: {"documents": [...]}
+            elif isinstance(data, dict) and 'documents' in data:
                 documents_data = data['documents']
             else:
                 raise ValueError("Invalid dataset format - expected array of documents or {documents: [...]}")
 
-            # Merge all documents into a single dataset for processing
-            all_questions = []
-            all_texts = []
-            all_metadata = {}
-
+        
+            individual_documents = []
             for doc_data in documents_data:
-                # Collect all questions from all documents
+                # Here we are using the schema you provided to parse the data
                 questions = [Question(**q) for q in doc_data.get('questions', [])]
-                all_questions.extend(questions)
+                
+                if not doc_data.get('text', '').strip() or not questions:
+                    continue
 
-                # Collect text (we'll concatenate all texts)
-                doc_text = doc_data.get('text', '')
-                if doc_text.strip():
-                    all_texts.append(doc_text.strip())
-
-                # Merge metadata
                 doc_metadata = doc_data.get('metadata', {})
-                for key, value in doc_metadata.items():
-                    if key in all_metadata:
-                        # If key exists, create a list or extend existing list
-                        if isinstance(all_metadata[key], list):
-                            if isinstance(value, list):
-                                all_metadata[key].extend(value)
-                            else:
-                                all_metadata[key].append(value)
-                        else:
-                            all_metadata[key] = [all_metadata[key], value]
-                    else:
-                        all_metadata[key] = value
+                doc_metadata.update({
+                    'dataset_name': self.dataset_name,
+                    'dataset_setting': self.setting
+                })
+                
+                document = Document(
+                    id=doc_data.get('id', 'unknown_id'),
+                    text=doc_data.get('text', ''),
+                    questions=questions,
+                    metadata=doc_metadata
+                )
+                individual_documents.append(document)
 
-            # Combine all texts with a separator to avoid merging issues
-            combined_text = '\n\n--- DOCUMENT SEPARATOR ---\n\n'.join(all_texts)
-
-            # Add dataset statistics to metadata
-            all_metadata.update({
-                'total_documents': len(documents_data),
-                'total_questions': len(all_questions),
-                'dataset_name': self.dataset_name,
-                'dataset_setting': self.setting
-            })
-
-            return Document(
-                id=f"{self.dataset_name}_{self.setting}_combined",
-                text=combined_text,
-                questions=all_questions,
-                metadata=all_metadata
-            )
+            return individual_documents
 
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             raise ValueError(f"Error loading dataset: {e}")
@@ -204,32 +204,27 @@ class DatasetAgent(RoutedAgent):
             pass
 
     def generate_batch(self, batch_id: int) -> Optional[Dict[str, Any]]:
-        """Generate batch information for a specific batch."""
-        # Process questions sequentially - one question per batch
-        if batch_id >= len(self.dataset.questions):
+        """
+        Generate a batch using the document at the given batch_id (index).
+        Each batch consists of one document's text and all its associated questions.
+        """
+        if batch_id >= len(self.dataset):
             return None
 
-        # Get the question for this batch
-        question = self.dataset.questions[batch_id]
+        current_document = self.dataset[batch_id]
+        document_text = current_document.text
 
-        # Create document chunk for this question (use reasonable chunk size)
-        chunk_size = 2000  # Characters per chunk
-        document_chunks = self._split_document_into_chunks(self.dataset.text, chunk_size)
+        qa_pairs = [{
+            "question_id": q.id,
+            "question": q.question,
+            "answers": q.answers,
+            "metadata": q.metadata
+        } for q in current_document.questions]
 
-        # For now, use first chunk or create a relevant chunk for the question
-        # In a more advanced implementation, you could select the most relevant chunk
-        document_chunk = document_chunks[0] if document_chunks else self.dataset.text[:chunk_size]
-
-        # Create batch with single question and relevant document chunk
         batch_info = {
             "batch_id": batch_id,
-            "document_text": document_chunk,
-            "qa_pairs": [{
-                "question_id": question.id,
-                "question": question.question,
-                "answers": question.answers,
-                "metadata": question.metadata
-            }]
+            "document_text": document_text,
+            "qa_pairs": qa_pairs
         }
 
         return batch_info
@@ -262,10 +257,158 @@ class DatasetAgent(RoutedAgent):
 
         return [chunk for chunk in chunks if chunk]  # Remove empty chunks
 
+    def _generate_qa_pairs_list(self) -> List[Dict[str, Any]]:
+        """
+        Generate a flat list of all QA pairs with their document context.
+        Each entry contains: document_text, question, answers, document_id, question_id, metadata
+        """
+        qa_pairs_list = []
+        for doc_idx, document in enumerate(self.dataset):
+            for qa_idx, question in enumerate(document.questions):
+                qa_pair = {
+                    "document_index": doc_idx,
+                    "question_index": qa_idx,
+                    "document_id": document.id,
+                    "document_text": document.text,
+                    "question_id": question.id,
+                    "question": question.question,
+                    "answers": question.answers,
+                    "metadata": question.metadata,
+                    "global_index": len(qa_pairs_list)  # Global index for this QA pair
+                }
+                qa_pairs_list.append(qa_pair)
+        return qa_pairs_list
+
+    def generate_single_qa_pair(self, qa_index: int) -> Optional[Dict[str, Any]]:
+        """
+        Generate a single QA pair for test-time training.
+        Args:
+            qa_index: Global index of the QA pair to generate
+        Returns:
+            Dictionary containing single QA pair with document context
+        """
+        if qa_index >= len(self.qa_pairs_list):
+            return None
+
+        qa_pair = self.qa_pairs_list[qa_index]
+
+        # Return format compatible with single example processing
+        single_example = {
+            "qa_index": qa_index,
+            "document_text": qa_pair["document_text"],
+            "qa_pair": {
+                "question_id": qa_pair["question_id"],
+                "question": qa_pair["question"],
+                "answers": qa_pair["answers"],
+                "metadata": qa_pair["metadata"]
+            },
+            "document_metadata": {
+                "document_id": qa_pair["document_id"],
+                "document_index": qa_pair["document_index"],
+                "question_index": qa_pair["question_index"]
+            }
+        }
+
+        return single_example
+
+    async def _reset_state_for_new_example(self, dataset: str, setting: str) -> None:
+        """
+        Reset learned prompts and clear graph when moving to a new example.
+        This ensures each example starts fresh without influence from previous examples.
+        """
+        self.logger.info("Resetting state for new example")
+
+        # Get the current state for the new QA index
+        current_state = self.shared_state.load_state(dataset, setting, self.current_qa_index)
+
+        # Clear all learned prompts (these will be re-optimized during the new example's iterations)
+        learned_prompt_keys = [
+            # GraphRAG prompts
+            "learned_prompt_graph_builder",
+            "learned_prompt_graph_refinement",
+            "learned_prompt_retrieval_planner",
+            "learned_prompt_answer_generator",
+            "learned_prompt_hyperparameters",
+            # VectorRAG prompts
+            "learned_prompt_hyperparameters_vector",
+            "learned_prompt_vector_retrieval_planner",
+            "learned_prompt_answer_generator_vector"
+        ]
+
+        for key in learned_prompt_keys:
+            if key in current_state:
+                del current_state[key]
+                self.logger.info(f"Cleared learned prompt: {key}")
+
+        # Clear previous critiques and optimization results
+        critique_keys = [
+            "answer_generation_critique",
+            "retrieved_content_critique",
+            "retrieval_plan_critique",
+            "graph_critique",
+            "graph_builder_agent_critique",
+            "hyperparameters_graph_agent_critique"
+        ]
+
+        for key in critique_keys:
+            if key in current_state:
+                del current_state[key]
+
+        # Clear conversation histories from previous examples
+        conversation_keys = [
+            # GraphRAG conversations
+            "conversations_answer_generation",
+            "conversations_retrieval_planning",
+            "conversations_graph_builder",
+            "conversations_hyperparameters",
+            # VectorRAG conversations
+            "conversations_vector_answer_generation",
+            "conversations_vector_retrieval_planning",
+            "conversations_vector_hyperparameters"
+        ]
+
+        for key in conversation_keys:
+            if key in current_state:
+                del current_state[key]
+
+        # Save the reset state
+        self.shared_state.save_state(current_state, dataset, setting, self.current_qa_index)
+
+        # Clear the graph from Memgraph to start fresh (for GraphRAG)
+        try:
+            from graph_functions import clear_graph
+            clear_result = clear_graph()
+            if clear_result.get("status") == "success":
+                self.logger.info("Successfully cleared graph for new example")
+            else:
+                self.logger.warning(f"Failed to clear graph: {clear_result.get('message')}")
+        except Exception as e:
+            self.logger.error(f"Error clearing graph for new example: {e}")
+
+        # Clear vector-specific data for VectorRAG systems
+        try:
+            # Clear any cached vector embeddings or FAISS indices
+            # This ensures VectorRAG systems start fresh for each example
+            vector_data_keys = [
+                "vector_index_metadata",
+                "chunk_embeddings",
+                "faiss_index_state"
+            ]
+
+            for key in vector_data_keys:
+                if key in current_state:
+                    del current_state[key]
+
+            self.logger.info("Successfully cleared vector-specific data for new example")
+        except Exception as e:
+            self.logger.error(f"Error clearing vector data for new example: {e}")
+
+        self.logger.info("State reset completed for new example")
+
     @message_handler
     async def handle_dataset_processing_request(
         self, message: DatasetProcessingRequest, ctx: MessageContext
-    ) -> str:
+    ) -> DatasetProcessingResponse:
         """Handle request to start dataset processing."""
         self.logger.info(f"Received dataset processing request for {message.dataset_name} ({message.setting})")
         self._log_to_file(f"Received dataset processing request for {message.dataset_name} ({message.setting})")
@@ -280,8 +423,27 @@ class DatasetAgent(RoutedAgent):
         # Start processing
         await self._process_dataset(ctx)
 
-        # Return completion status
-        return f"Dataset processing completed for {message.dataset_name} ({message.setting})"
+        # Calculate final metrics
+        total_qa_pairs = len(self.qa_pairs_list)
+        completed_qa_pairs = len([qa_idx for qa_idx, count in self.processed_examples.items() if count >= self.repetitions])
+
+        final_metrics = {
+            "total_qa_pairs": total_qa_pairs,
+            "completed_qa_pairs": completed_qa_pairs,
+            "completion_rate": completed_qa_pairs / total_qa_pairs if total_qa_pairs > 0 else 0.0,
+            "repetitions_per_example": self.repetitions,
+            "total_iterations": completed_qa_pairs * self.repetitions
+        }
+
+        # Return proper response object
+        return DatasetProcessingResponse(
+            status="completed",
+            final_metrics=final_metrics,
+            dataset_name=message.dataset_name,
+            setting=message.setting,
+            total_qa_pairs=total_qa_pairs,
+            completed_qa_pairs=completed_qa_pairs
+        )
 
     @message_handler
     async def handle_batch_ready_message(
@@ -335,24 +497,26 @@ class DatasetAgent(RoutedAgent):
             # Determine if we should continue
             continue_processing = False
 
-            # Check if we need more repetitions
+            # Check if we need more iterations for current QA pair
             if message.repetition < self.repetitions - 1:
                 self.current_repetition = message.repetition + 1
                 continue_processing = True
-                self.logger.info(f"Starting repetition {self.current_repetition + 1}/{self.repetitions}")
-                self._log_to_file(f"Starting repetition {self.current_repetition + 1}/{self.repetitions}")
+                self.logger.info(f"Starting iteration {self.current_repetition + 1}/{self.repetitions} for QA pair {self.current_qa_index}")
+                self._log_to_file(f"Starting iteration {self.current_repetition + 1}/{self.repetitions} for QA pair {self.current_qa_index}")
             else:
-                # Move to next batch
+                # Move to next QA pair (reset state between examples)
                 self.current_repetition = 0
-                self.current_batch_id = message.batch_id + 1
-                next_batch = self.generate_batch(self.current_batch_id)
-                if next_batch is not None:
+                self.current_qa_index = message.batch_id + 1  # message.batch_id is actually QA index
+                next_example = self.generate_single_qa_pair(self.current_qa_index)
+                if next_example is not None:
                     continue_processing = True
-                    self.logger.info(f"Moving to batch {self.current_batch_id}")
-                    self._log_to_file(f"Moving to batch {self.current_batch_id}")
+                    self.logger.info(f"Moving to QA pair {self.current_qa_index}, resetting learned prompts")
+                    self._log_to_file(f"Moving to QA pair {self.current_qa_index}, resetting learned prompts")
+                    # Reset learned prompts and clear graph for new example
+                    await self._reset_state_for_new_example(self.dataset_name, self.setting)
                 else:
-                    self.logger.info("All batches completed")
-                    self._log_to_file("All batches completed")
+                    self.logger.info("All QA pairs completed")
+                    self._log_to_file("All QA pairs completed")
 
             # Send metrics computed message
             metrics_msg = MetricsComputedMessage(
@@ -366,7 +530,7 @@ class DatasetAgent(RoutedAgent):
             # In a real multi-agent system, you would send this to other agents
             # For now, we'll continue processing if needed
             if continue_processing:
-                await self._process_next_batch(ctx)
+                await self._process_next_example(ctx)
 
         except Exception as e:
             self.logger.error(f"Error handling BatchReady message: {e}")
@@ -374,98 +538,120 @@ class DatasetAgent(RoutedAgent):
             # Return early on error to prevent implicit None return
 
     async def _process_dataset(self, ctx: MessageContext) -> None:
-        """Process the entire dataset."""
-        self.logger.info(f"Starting dataset processing for {self.dataset_name} ({self.setting})")
-        self._log_to_file(f"Starting dataset processing for {self.dataset_name} ({self.setting})")
+        """Process the entire dataset using single QA pair processing."""
+        self.logger.info(f"Starting test-time training for {self.dataset_name} ({self.setting})")
+        self._log_to_file(f"Starting test-time training for {self.dataset_name} ({self.setting})")
 
-        # Find the first unprocessed batch
-        while self.current_batch_id in self.processed_examples:
-            if self.processed_examples[self.current_batch_id] >= self.repetitions:
-                self.current_batch_id += 1
+        # Find the first unprocessed QA pair
+        self.logger.info(f"Looking for unprocessed QA pairs. Current index: {self.current_qa_index}, Total pairs: {len(self.qa_pairs_list)}")
+
+        while self.current_qa_index in self.processed_examples:
+            if self.processed_examples[self.current_qa_index] >= self.repetitions:
+                self.current_qa_index += 1
+                self.logger.info(f"QA pair {self.current_qa_index - 1} already completed, moving to {self.current_qa_index}")
             else:
-                self.current_repetition = self.processed_examples[self.current_batch_id]
+                self.current_repetition = self.processed_examples[self.current_qa_index]
+                self.logger.info(f"Resuming QA pair {self.current_qa_index} at repetition {self.current_repetition}")
                 break
 
-        # Start processing
-        await self._process_next_batch(ctx)
-
-    async def _process_next_batch(self, ctx: MessageContext) -> None:
-        """Process the next batch."""
-        # Generate batch information
-        batch_info = self.generate_batch(self.current_batch_id)
-        if batch_info is None:
-            self.logger.info("No more batches to process")
-            self._log_to_file("No more batches to process")
+        # Check if we have QA pairs to process
+        if self.current_qa_index >= len(self.qa_pairs_list):
+            self.logger.info("No QA pairs to process - all completed or index out of range")
             return
 
-        # Log progress with question information
-        current_question = self.dataset.questions[self.current_batch_id] if self.current_batch_id < len(self.dataset.questions) else None
-        question_preview = current_question.question[:80] + "..." if current_question and len(current_question.question) > 80 else (current_question.question if current_question else "No question")
+        self.logger.info(f"Starting processing from QA pair {self.current_qa_index}")
+        # Start processing single QA pairs
+        await self._process_next_example(ctx)
 
-        self.logger.info(f"Processing batch {self.current_batch_id + 1}/{len(self.dataset.questions)}, repetition {self.current_repetition + 1}/{self.repetitions}")
+    async def _process_next_example(self, ctx: MessageContext) -> None:
+        """Process the next single QA pair example for test-time training."""
+        # Generate single QA pair information
+        example_info = self.generate_single_qa_pair(self.current_qa_index)
+        if example_info is None:
+            self.logger.info("No more QA pairs to process")
+            self._log_to_file("No more QA pairs to process")
+            return
+
+        # --- START OF SINGLE QA PROCESSING SECTION ---
+
+        # Get current QA pair information
+        qa_pair_info = example_info["qa_pair"]
+        document_metadata = example_info["document_metadata"]
+
+        question_preview = (
+            qa_pair_info["question"][:80] + "..."
+            if len(qa_pair_info["question"]) > 80
+            else qa_pair_info["question"]
+        )
+
+        # The total number of examples is the total number of QA pairs
+        total_examples = len(self.qa_pairs_list)
+
+        self.logger.info(f"Processing QA pair {self.current_qa_index + 1}/{total_examples}, iteration {self.current_repetition + 1}/{self.repetitions}")
+        self.logger.info(f"Document ID: {document_metadata['document_id']}")
+        self.logger.info(f"Question ID: {qa_pair_info['question_id']}")
         self.logger.info(f"Question: {question_preview}")
-        self._log_to_file(f"Processing batch {self.current_batch_id + 1}/{len(self.dataset.questions)}, repetition {self.current_repetition + 1}/{self.repetitions} - Q: {question_preview}")
+        self._log_to_file(f"Processing QA {self.current_qa_index + 1}/{total_examples}, iteration {self.current_repetition + 1}/{self.repetitions} - DocID: {document_metadata['document_id']} - QID: {qa_pair_info['question_id']} - Q: {question_preview}")
 
-        # Update shared state with batch information
+        # --- END OF SINGLE QA PROCESSING SECTION ---
+
+        # Update shared state with single QA pair information
         current_state = self.shared_state.load_state(
-            self.dataset_name, self.setting, self.current_batch_id
+            self.dataset_name, self.setting, self.current_qa_index
         )
 
-        # Create a heavily truncated version for logging to keep logs clean
-        batch_info_for_logging = batch_info.copy()
-        if "document_text" in batch_info_for_logging:
-            # Truncate to just 100 characters for logging to keep logs readable
-            original_text = batch_info_for_logging["document_text"]
-            if len(original_text) > 100:
-                batch_info_for_logging["document_text"] = original_text[:100] + "..."
-            else:
-                batch_info_for_logging["document_text"] = original_text
+        # Create a truncated version for logging to keep logs clean
+        example_info_for_logging = {
+            "qa_index": example_info["qa_index"],
+            "document_text": example_info["document_text"][:100] + "..." if len(example_info["document_text"]) > 100 else example_info["document_text"],
+            "qa_pair": {
+                "question_id": qa_pair_info["question_id"],
+                "question": qa_pair_info["question"][:100] + "..." if len(qa_pair_info["question"]) > 100 else qa_pair_info["question"],
+                "answers": [
+                    answer[:100] + "..." if isinstance(answer, str) and len(answer) > 100 else answer
+                    for answer in qa_pair_info["answers"]
+                ] if qa_pair_info["answers"] else [],
+                "metadata": qa_pair_info["metadata"]
+            },
+            "document_metadata": document_metadata
+        }
 
-        # Also truncate question and answer text in QA pairs for logging
-        if "qa_pairs" in batch_info_for_logging:
-            for qa_pair in batch_info_for_logging["qa_pairs"]:
-                if len(qa_pair.get("question", "")) > 100:
-                    qa_pair["question"] = qa_pair["question"][:100] + "..."
-                if isinstance(qa_pair.get("answers"), list) and qa_pair["answers"]:
-                    for i, answer in enumerate(qa_pair["answers"]):
-                        if isinstance(answer, str) and len(answer) > 100:
-                            qa_pair["answers"][i] = answer[:100] + "..."
+        current_state["example_information"] = example_info_for_logging
+        current_state["full_document_text"] = example_info["document_text"]
+        current_state["current_qa_pair"] = qa_pair_info
 
-        # Store truncated batch information for logging
-        current_state["batch_information"] = batch_info_for_logging
+        # Also create batch_information format that BatchOrchestrator expects
+        batch_info_for_orchestrator = {
+            "batch_id": self.current_qa_index,
+            "document_text": example_info["document_text"],
+            "qa_pairs": [qa_pair_info]  # Single QA pair in array format
+        }
+        current_state["batch_information"] = batch_info_for_orchestrator
 
-        # Store full document text separately for agents to access
-        current_state["full_document_text"] = batch_info["document_text"]
-
-        # Save state
         self.shared_state.save_state(
-            current_state, self.dataset_name, self.setting, self.current_batch_id
+            current_state, self.dataset_name, self.setting, self.current_qa_index
         )
 
-        # Create and send BatchStart message
+        # Create and send BatchStart message (reusing existing message format but with QA index as batch_id)
         batch_start_msg = BatchStartMessage(
-            batch_id=self.current_batch_id,
+            batch_id=self.current_qa_index,  # Use QA index as unique identifier
             repetition=self.current_repetition,
             dataset=self.dataset_name,
             setting=self.setting,
             shared_state=current_state
         )
 
-        self.logger.info(f"Sending BatchStart message for batch {self.current_batch_id}")
-        self._log_to_file(f"Sending BatchStart message for batch {self.current_batch_id}")
+        self.logger.info(f"Sending BatchStart message for QA pair {self.current_qa_index}")
+        self._log_to_file(f"Sending BatchStart message for QA pair {self.current_qa_index}")
 
-        # Send BatchStart message to BatchOrchestratorAgent and get response
         try:
             batch_orchestrator_id = AgentId("batch_orchestrator_agent", "default")
             batch_ready_response = await self.send_message(batch_start_msg, batch_orchestrator_id)
             self.logger.info(f"Received BatchReady response from BatchOrchestratorAgent")
-
-            # Process the response
             await self.handle_batch_ready_message(batch_ready_response, ctx)
 
         except Exception as e:
             self.logger.warning(f"BatchOrchestratorAgent not available, falling back to simulation: {e}")
-            # Fallback to simulation if BatchOrchestratorAgent is not available
             await self._simulate_batch_processing(ctx, batch_start_msg)
 
     async def _simulate_batch_processing(self, ctx: MessageContext, batch_start: BatchStartMessage) -> None:
