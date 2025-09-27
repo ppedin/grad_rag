@@ -264,10 +264,7 @@ The query was:
 The response was:
 {}
 
-The ROUGE score for this response is:
-{}
-
-Based on the query and the generated response, provide a detailed explanation of how the response can be improved. Focus on aspects like completeness, accuracy, relevance, clarity, and whether it fully addresses the question asked.
+Based on the query and the generated response, provide a detailed explanation of how the response can be improved. Focus on aspects like completeness, accuracy, relevance, clarity, and whether it fully addresses the question asked. Consider whether the response is well-structured, directly addresses the question, provides sufficient detail, and maintains factual consistency.
 """
 
 

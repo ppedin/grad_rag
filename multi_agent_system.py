@@ -11,6 +11,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from logging_utils import LoggingUtils, log_agent_action, log_batch_progress, log_qa_processing, log_critique_result
+from prompt_response_logger import get_global_prompt_logger
 
 from autogen_core import (
     AgentId, MessageContext, RoutedAgent, message_handler,
@@ -306,9 +307,13 @@ class BatchOrchestratorAgent(RoutedAgent):
         batch_info = current_state.get("batch_information", {})
         qa_pairs = batch_info.get("qa_pairs", [])
 
-        # Store retrieved context for backward pass critiques
+        # Store retrieved context for backward pass critiques (with repetition tracking)
         retrieved_contexts = current_state.get("retrieved_contexts", [])
-        retrieved_contexts.append(retrieval_response.retrieved_context)
+        context_entry = {
+            "retrieved_context": retrieval_response.retrieved_context,
+            "repetition": retrieval_response.repetition
+        }
+        retrieved_contexts.append(context_entry)
         current_state["retrieved_contexts"] = retrieved_contexts
         self.shared_state.save_state(current_state, retrieval_response.dataset, retrieval_response.setting, retrieval_response.batch_id)
 
@@ -732,9 +737,13 @@ class BatchOrchestratorAgent(RoutedAgent):
         current_state["retrieval_prompt"] = "Mock retrieval prompt template for graph queries"
         current_state["retrieval_plans"] = ["Mock retrieval plan 1", "Mock retrieval plan 2"]
 
-        # Store mock retrieved contexts for backward pass
+        # Store mock retrieved contexts for backward pass (with repetition tracking)
         retrieved_contexts = current_state.get("retrieved_contexts", [])
-        retrieved_contexts.append("Mock retrieved context from graph")
+        context_entry = {
+            "retrieved_context": "Mock retrieved context from graph",
+            "repetition": retrieval_start.repetition
+        }
+        retrieved_contexts.append(context_entry)
         current_state["retrieved_contexts"] = retrieved_contexts
 
         self.shared_state.save_state(current_state, retrieval_start.dataset, retrieval_start.setting, retrieval_start.batch_id)
@@ -824,7 +833,13 @@ class HyperparametersGraphAgent(RoutedAgent):
         try:
             # Load shared state to get learned system prompt
             current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-            learned_system_prompt = current_state.get("learned_prompt_hyperparameters_graph", "")
+
+            # For first repetition (repetition=0), start with empty system prompt to avoid data leakage
+            if message.repetition == 0:
+                learned_system_prompt = ""
+                self.logger.info(f"First repetition for QA pair {message.qa_pair_id} - using empty system prompt")
+            else:
+                learned_system_prompt = current_state.get("learned_prompt_hyperparameters_graph", "")
 
             # Extract text and question from QA pair
             qa_pair = message.qa_pair
@@ -847,6 +862,22 @@ class HyperparametersGraphAgent(RoutedAgent):
             response = await self.model_client.create(
                 [system_message, user_message],
                 cancellation_token=ctx.cancellation_token
+            )
+
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            logger.log_interaction(
+                agent_name="HyperparametersGraphAgent",
+                interaction_type="hyperparameters_recommendation",
+                system_prompt=learned_system_prompt,
+                user_prompt=prompt_content,
+                llm_response=response.content if isinstance(response.content, str) else str(response.content),
+                batch_id=message.batch_id,
+                qa_pair_id=message.qa_pair_id,
+                additional_metadata={
+                    "document_length": len(document_text),
+                    "question": question
+                }
             )
 
             # Parse structured response
@@ -976,9 +1007,12 @@ class GraphBuilderAgent(RoutedAgent):
             return
 
         # Get appropriate learned system prompt based on iteration
+        # For first iteration (repetition=0), start with empty system prompt to avoid data leakage from previous QA pairs
         if is_first_iteration:
-            learned_system_prompt = current_state.get("learned_prompt_graph_builder", "")
+            learned_system_prompt = ""
+            self.logger.info(f"First repetition for batch {message.batch_id} - using empty graph creation system prompt")
         else:
+            # For subsequent iterations, use appropriate learned prompts
             learned_system_prompt = current_state.get("learned_prompt_graph_refinement", "")
 
         if is_first_iteration:
@@ -1188,6 +1222,20 @@ class GraphBuilderAgent(RoutedAgent):
             cancellation_token=ctx.cancellation_token
         )
 
+        # Log LLM interaction
+        logger = get_global_prompt_logger()
+        logger.log_interaction(
+            agent_name="GraphBuilderAgent",
+            interaction_type="graph_creation",
+            system_prompt=learned_system_prompt,
+            user_prompt=prompt_content,
+            llm_response=response.content if isinstance(response.content, str) else str(response.content),
+            additional_metadata={
+                "chunk_length": len(chunk),
+                "mode": "creation"
+            }
+        )
+
         # Parse structured response
         assert isinstance(response.content, str)
         from parameters import GraphBuilderResponse
@@ -1338,6 +1386,21 @@ class GraphBuilderAgent(RoutedAgent):
 
         # Use refinement model client
         response = await self.model_client_refinement.create(messages, cancellation_token=ctx.cancellation_token)
+
+        # Log LLM interaction
+        logger = get_global_prompt_logger()
+        logger.log_interaction(
+            agent_name="GraphBuilderAgent",
+            interaction_type="graph_refinement",
+            system_prompt=learned_system_prompt if learned_system_prompt else "",
+            user_prompt=user_prompt,
+            llm_response=response.content if isinstance(response.content, str) else str(response.content),
+            additional_metadata={
+                "chunk_length": len(chunk),
+                "existing_graph_summary_length": len(existing_graph_summary),
+                "mode": "refinement"
+            }
+        )
 
         # Parse structured response
         assert isinstance(response.content, str)
@@ -1660,7 +1723,13 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
 
         # Load shared state
         current_state = message.shared_state
-        learned_system_prompt = current_state.get("learned_prompt_graph_retrieval_planner", "")
+
+        # For first repetition (repetition=0), start with empty system prompt to avoid data leakage
+        if message.repetition == 0:
+            learned_system_prompt = ""
+            self.logger.info(f"First repetition for batch {message.batch_id} - using empty retrieval planner system prompt")
+        else:
+            learned_system_prompt = current_state.get("learned_prompt_graph_retrieval_planner", "")
 
         # Get graph description from shared state
         graph_description = current_state.get("graph_description", "")
@@ -1692,6 +1761,24 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 response = await self.model_client.create(
                     [system_message, user_message],
                     cancellation_token=ctx.cancellation_token
+                )
+
+                # Log LLM interaction
+                logger = get_global_prompt_logger()
+                logger.log_interaction(
+                    agent_name="GraphRetrievalPlannerAgent",
+                    interaction_type="retrieval_planning",
+                    system_prompt=learned_system_prompt,
+                    user_prompt=prompt_content,
+                    llm_response=response.content if isinstance(response.content, str) else str(response.content),
+                    batch_id=message.batch_id,
+                    iteration=iteration + 1,
+                    additional_metadata={
+                        "query": message.query,
+                        "k_iterations": message.k_iterations,
+                        "current_context_length": len(retrieved_context),
+                        "graph_description_length": len(graph_description)
+                    }
                 )
 
                 # Parse structured response
@@ -1866,7 +1953,13 @@ class AnswerGeneratorAgent(RoutedAgent):
 
         # Load shared state to get learned system prompt
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-        learned_system_prompt = current_state.get("learned_prompt_answer_generator_graph", "")
+
+        # For first repetition (repetition=0), start with empty system prompt to avoid data leakage
+        if message.repetition == 0:
+            learned_system_prompt = ""
+            self.logger.info(f"First repetition for QA pair {message.qa_pair_id} - using empty answer generator system prompt")
+        else:
+            learned_system_prompt = current_state.get("learned_prompt_answer_generator_graph", "")
 
         # Prepare prompt with question and retrieved context (without critique)
         prompt_content = self.base_prompt_answer_generator_graph.format(
@@ -1886,6 +1979,23 @@ class AnswerGeneratorAgent(RoutedAgent):
             # Get generated answer
             generated_answer = response.content if isinstance(response.content, str) else str(response.content)
 
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            logger.log_interaction(
+                agent_name="AnswerGeneratorAgent",
+                interaction_type="answer_generation",
+                system_prompt=learned_system_prompt,
+                user_prompt=prompt_content,
+                llm_response=generated_answer,
+                batch_id=message.batch_id,
+                qa_pair_id=message.qa_pair_id,
+                additional_metadata={
+                    "question": message.question,
+                    "retrieved_context_length": len(message.retrieved_context),
+                    "answer_length": len(generated_answer)
+                }
+            )
+
             log_qa_processing(self.logger, message.qa_pair_id, "Generated answer", generated_answer)
 
             # Store conversation in shared state
@@ -1894,7 +2004,8 @@ class AnswerGeneratorAgent(RoutedAgent):
                 "question": message.question,
                 "retrieved_context": message.retrieved_context,
                 "prompt": prompt_content,
-                "generated_answer": generated_answer
+                "generated_answer": generated_answer,
+                "repetition": message.repetition  # Add repetition to track which iteration this belongs to
             }
 
             conversations = current_state.get("conversations_answer_generation", [])
@@ -1967,15 +2078,10 @@ class ResponseEvaluatorAgent(RoutedAgent):
         """Handle ResponseEvaluationStart message and evaluate response using LLM."""
         self.logger.info(f"ResponseEvaluatorAgent evaluating QA pair {message.qa_pair_id}")
 
-        # Prepare gold responses (join multiple answers if available)
-        gold_response = " | ".join(message.gold_answers) if message.gold_answers else "No gold response available"
-
-        # Prepare prompt with query, generated response, gold response, and ROUGE score
+        # Prepare prompt with only query and generated response (no gold answers or ROUGE score to avoid data leakage)
         prompt_content = self.response_evaluator_prompt.format(
             message.original_query,
-            message.generated_answer,
-            gold_response,
-            message.rouge_score
+            message.generated_answer
         )
 
         try:
@@ -1991,16 +2097,32 @@ class ResponseEvaluatorAgent(RoutedAgent):
             # Get evaluation result
             evaluation_result = response.content if isinstance(response.content, str) else str(response.content)
 
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            logger.log_interaction(
+                agent_name="ResponseEvaluatorAgent",
+                interaction_type="response_evaluation",
+                system_prompt=prompt_content,
+                user_prompt="Please evaluate the response and provide improvement suggestions.",
+                llm_response=evaluation_result,
+                batch_id=message.batch_id,
+                qa_pair_id=message.qa_pair_id,
+                additional_metadata={
+                    "original_query": message.original_query,
+                    "generated_answer_length": len(message.generated_answer),
+                    "evaluation_length": len(evaluation_result)
+                }
+            )
+
             log_qa_processing(self.logger, message.qa_pair_id, "Evaluation completed", evaluation_result)
 
-            # Create evaluation result dictionary
+            # Create evaluation result dictionary (excluding gold answers and ROUGE score to prevent data leakage)
             evaluation_data = {
                 "qa_pair_id": message.qa_pair_id,
                 "original_query": message.original_query,
                 "generated_answer": message.generated_answer,
-                "gold_answers": message.gold_answers,
-                "rouge_score": message.rouge_score,
                 "evaluation_feedback": evaluation_result,
+                "repetition": message.repetition,  # Add repetition to track which iteration this belongs to
                 "timestamp": "2025-09-22T15:30:00"  # Could be made dynamic
             }
 
@@ -2199,25 +2321,62 @@ class BackwardPassAgent(RoutedAgent):
         """Generate critique for answer generation based on conversations and evaluations."""
         self.logger.info("Generating answer generation critique")
 
-        conversations = current_state.get("conversations_answer_generation", [])
-        evaluation_responses = current_state.get("response_evaluations", [])
+        all_conversations = current_state.get("conversations_answer_generation", [])
+        all_evaluation_responses = current_state.get("response_evaluations", [])
+
+        # Get current repetition from batch info
+        batch_info = current_state.get("batch_information", {})
+        current_repetition = batch_info.get("current_repetition", 0)
+
+        # Debug: Show what repetition values exist in the data
+        conv_repetitions = [conv.get("repetition", "MISSING") for conv in all_conversations]
+        eval_repetitions = [eval_resp.get("repetition", "MISSING") for eval_resp in all_evaluation_responses]
+        self.logger.info(f"Available conversation repetitions: {conv_repetitions}")
+        self.logger.info(f"Available evaluation repetitions: {eval_repetitions}")
+        self.logger.info(f"Looking for repetition: {current_repetition}")
+
+        # Filter for only current iteration's data
+        conversations = [conv for conv in all_conversations if conv.get("repetition") == current_repetition]
+        evaluation_responses = [eval_resp for eval_resp in all_evaluation_responses if eval_resp.get("repetition") == current_repetition]
+
+        self.logger.info(f"Filtered conversations: {len(conversations)} for repetition {current_repetition} (total available: {len(all_conversations)})")
+        self.logger.info(f"Filtered evaluations: {len(evaluation_responses)} for repetition {current_repetition} (total available: {len(all_evaluation_responses)})")
 
         if not conversations or not evaluation_responses:
-            self.logger.warning("No conversations or evaluations found for answer generation critique")
+            self.logger.error(f"CRITICAL: No conversations or evaluations found for answer generation critique in repetition {current_repetition}")
+            self.logger.error(f"This means the gradient step will be skipped! Check data flow and repetition tracking.")
+
+            # Temporary fallback: use the most recent data if available
+            if all_conversations and all_evaluation_responses:
+                self.logger.warning("FALLBACK: Using most recent conversation/evaluation data")
+                conversations = [all_conversations[-1]]
+                evaluation_responses = [all_evaluation_responses[-1]]
+            else:
+                return
+
+        # Get the current answer generation prompt for critique
+        current_answer_prompt = current_state.get("learned_prompt_answer_generator_graph", "")
+        if not current_answer_prompt:
+            # Use base prompt if no learned prompt exists yet
+            from parameters import base_prompt_answer_generator_graph
+            current_answer_prompt = base_prompt_answer_generator_graph
+
+        # For answer generation critique, we should have exactly ONE sequence per iteration
+        # If we have multiple QA pairs, something is wrong with the data flow
+        if len(conversations) != 1 or len(evaluation_responses) != 1:
+            self.logger.error(f"Expected exactly 1 conversation and 1 evaluation for answer generation critique, but got {len(conversations)} conversations and {len(evaluation_responses)} evaluations")
+            self.logger.error(f"This indicates a data flow issue - multiple QA pairs are being processed in one iteration")
             return
 
-        # Create triplets: conversation (prompt-answer) + evaluation
-        triplets = []
-        for i, conv in enumerate(conversations):
-            if i < len(evaluation_responses):
-                eval_resp = evaluation_responses[i]
-                triplet = f"Conversation: {conv.get('prompt', '')} -> {conv.get('generated_answer', '')}\nEvaluation: {eval_resp.get('evaluation_feedback', '')}"
-                triplets.append(triplet)
+        # Extract the single conversation and evaluation
+        conv = conversations[0]
+        eval_resp = evaluation_responses[0]
 
-        concatenated_feedback = "\n\n".join(triplets)
+        # Create the single sequence: previous prompt + answer + feedback
+        concatenated_data = f"Previous Answer Generation Prompt: {current_answer_prompt}\nGenerated Answer: {conv.get('generated_answer', '')}\nResponse Feedback: {eval_resp.get('evaluation_feedback', '')}"
 
         # Call LLM with generation_prompt_gradient_prompt
-        prompt_content = self.generation_prompt_gradient_prompt.format(concatenated_feedback)
+        prompt_content = self.generation_prompt_gradient_prompt.format(concatenated_data)
 
         critique = await self._call_llm(prompt_content, ctx)
         current_state["answer_generation_critique"] = critique
@@ -2237,24 +2396,101 @@ class BackwardPassAgent(RoutedAgent):
         """Generate critique for retrieved content based on conversations, contexts, and evaluations."""
         self.logger.info("Generating retrieved content critique")
 
-        conversations = current_state.get("conversations_answer_generation", [])
-        retrieved_contexts = current_state.get("retrieved_contexts", [])
-        evaluation_responses = current_state.get("response_evaluations", [])
+        all_conversations = current_state.get("conversations_answer_generation", [])
+        all_retrieved_contexts = current_state.get("retrieved_contexts", [])
+        all_evaluation_responses = current_state.get("response_evaluations", [])
+
+        # Get current repetition from batch info
+        batch_info = current_state.get("batch_information", {})
+        current_repetition = batch_info.get("current_repetition", 0)
+
+        # Debug: Show what repetition values exist in the data
+        conv_repetitions = [conv.get("repetition", "MISSING") for conv in all_conversations]
+        eval_repetitions = [eval_resp.get("repetition", "MISSING") for eval_resp in all_evaluation_responses]
+        ctx_repetitions = []
+        for ctx in all_retrieved_contexts:
+            if isinstance(ctx, dict) and "repetition" in ctx:
+                ctx_repetitions.append(ctx.get("repetition", "MISSING"))
+            else:
+                ctx_repetitions.append("OLD_FORMAT")
+
+        self.logger.info(f"Available conversation repetitions: {conv_repetitions}")
+        self.logger.info(f"Available evaluation repetitions: {eval_repetitions}")
+        self.logger.info(f"Available context repetitions: {ctx_repetitions}")
+        self.logger.info(f"Looking for repetition: {current_repetition}")
+
+        # Filter for only current iteration's data
+        conversations = [conv for conv in all_conversations if conv.get("repetition") == current_repetition]
+        evaluation_responses = [eval_resp for eval_resp in all_evaluation_responses if eval_resp.get("repetition") == current_repetition]
+
+        # Filter retrieved contexts by repetition (handle both old and new format)
+        retrieved_contexts = []
+        for ctx_entry in all_retrieved_contexts:
+            if isinstance(ctx_entry, dict) and "repetition" in ctx_entry:
+                # New format with repetition tracking
+                if ctx_entry.get("repetition") == current_repetition:
+                    retrieved_contexts.append(ctx_entry.get("retrieved_context", ""))
+            else:
+                # Old format (just string) - take last entries matching conversation count
+                # This is backward compatibility - ideally shouldn't happen after the fix
+                pass
+
+        # If no contexts found with new format, fall back to old logic
+        if not retrieved_contexts and all_retrieved_contexts:
+            self.logger.warning("No retrieved contexts found with repetition info - falling back to old format")
+            # Take the last contexts to match conversation count
+            retrieved_contexts = all_retrieved_contexts[-len(conversations):] if len(conversations) <= len(all_retrieved_contexts) else all_retrieved_contexts
+
+        self.logger.info(f"Filtered conversations: {len(conversations)} for repetition {current_repetition}")
+        self.logger.info(f"Filtered evaluations: {len(evaluation_responses)} for repetition {current_repetition}")
+        self.logger.info(f"Retrieved contexts: {len(retrieved_contexts)} (lengths: {[len(str(ctx)) for ctx in retrieved_contexts]})")
 
         if not conversations or not evaluation_responses:
-            self.logger.warning("Missing data for retrieved content critique")
+            self.logger.error(f"CRITICAL: Missing data for retrieved content critique in repetition {current_repetition}")
+            self.logger.error(f"This means the gradient step will be skipped! Check data flow and repetition tracking.")
+
+            # Temporary fallback: use the most recent data if available
+            if all_conversations and all_evaluation_responses:
+                self.logger.warning("FALLBACK: Using most recent conversation/evaluation data")
+                conversations = [all_conversations[-1]]
+                evaluation_responses = [all_evaluation_responses[-1]]
+                # Also use fallback for contexts
+                if all_retrieved_contexts:
+                    last_context = all_retrieved_contexts[-1]
+                    if isinstance(last_context, dict):
+                        retrieved_contexts = [last_context.get("retrieved_context", "")]
+                    else:
+                        retrieved_contexts = [last_context]
+            else:
+                return
+
+        # For retrieved content critique, we should have exactly ONE sequence per iteration
+        # If we have multiple QA pairs, something is wrong with the data flow
+        if len(conversations) != 1 or len(evaluation_responses) != 1:
+            self.logger.error(f"Expected exactly 1 conversation and 1 evaluation for retrieved content critique, but got {len(conversations)} conversations and {len(evaluation_responses)} evaluations")
+            self.logger.error(f"This indicates a data flow issue - multiple QA pairs are being processed in one iteration")
             return
 
-        # Create quadruplets: retrieved context + conversation (prompt-answer) + evaluation response
-        quadruplets = []
-        for i, conv in enumerate(conversations):
-            if i < len(evaluation_responses):
-                context = retrieved_contexts[i] if i < len(retrieved_contexts) else "No context available"
-                eval_resp = evaluation_responses[i]
-                quadruplet = f"Retrieved Context: {context}\nConversation: {conv.get('prompt', '')} -> {conv.get('generated_answer', '')}\nEvaluation: {eval_resp.get('evaluation_feedback', '')}"
-                quadruplets.append(quadruplet)
+        # Extract the single conversation, context, and evaluation
+        conv = conversations[0]
+        eval_resp = evaluation_responses[0]
+        context = retrieved_contexts[0] if retrieved_contexts else "No context available"
 
-        concatenated_data = "\n\n".join(quadruplets)
+        # Log context size to identify if it's too large
+        context_length = len(str(context))
+        self.logger.info(f"Retrieved context length: {context_length} characters")
+
+        # Truncate or summarize retrieved context if it's too large for gradient analysis
+        max_context_length = 5000  # Reasonable limit for gradient prompt
+        if context_length > max_context_length:
+            self.logger.warning(f"Retrieved context is very large ({context_length} chars) - truncating to {max_context_length} chars for gradient analysis")
+            context = str(context)[:max_context_length] + f"\n... [TRUNCATED - original length: {context_length} chars]"
+
+        # Extract query from conversation
+        query = conv.get('question', 'No query available')
+
+        # Create the single sequence: context + query + answer + feedback
+        concatenated_data = f"Retrieved Context: {context}\nQuery: {query}\nGenerated Answer: {conv.get('generated_answer', '')}\nFeedback: {eval_resp.get('evaluation_feedback', '')}"
 
         # Call LLM with retrieved_content_gradient_prompt_graph
         prompt_content = self.retrieved_content_gradient_prompt_graph.format(concatenated_data)
@@ -2480,7 +2716,7 @@ class BackwardPassAgent(RoutedAgent):
         frozen_prompts = current_state.get("frozen_prompts", [])
         return prompt_type in frozen_prompts
 
-    async def _call_llm(self, prompt_content: str, ctx: MessageContext) -> str:
+    async def _call_llm(self, prompt_content: str, ctx: MessageContext, interaction_type: str = "critique", batch_id: int = None) -> str:
         """Helper method to call LLM with given prompt and token limit."""
         try:
             # Add token limit instruction to the prompt
@@ -2494,7 +2730,26 @@ class BackwardPassAgent(RoutedAgent):
                 cancellation_token=ctx.cancellation_token
             )
 
-            return response.content if isinstance(response.content, str) else str(response.content)
+            response_content = response.content if isinstance(response.content, str) else str(response.content)
+
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            logger.log_interaction(
+                agent_name="BackwardPassAgent",
+                interaction_type=interaction_type,
+                system_prompt=enhanced_prompt,
+                user_prompt="Please provide your critique and feedback.",
+                llm_response=response_content,
+                batch_id=batch_id,
+                additional_metadata={
+                    "critique_token_limit": self.critique_token_limit,
+                    "prompt_length": len(prompt_content),
+                    "enhanced_prompt_length": len(enhanced_prompt),
+                    "response_length": len(response_content)
+                }
+            )
+
+            return response_content
 
         except Exception as e:
             self.logger.error(f"Error calling LLM: {e}")
@@ -2572,6 +2827,25 @@ Provide a concise summary that captures all essential information while being si
                 )
 
                 summary = response.content if isinstance(response.content, str) else str(response.content)
+
+                # Log LLM interaction
+                logger = get_global_prompt_logger()
+                logger.log_interaction(
+                    agent_name="SummarizerAgent",
+                    interaction_type="context_summarization",
+                    system_prompt="You are a helpful assistant that creates concise summaries.",
+                    user_prompt=prompt_content,
+                    llm_response=summary,
+                    batch_id=message.batch_id,
+                    additional_metadata={
+                        "context_index": i + 1,
+                        "total_contexts": len(message.retrieved_contexts),
+                        "original_context_length": len(context),
+                        "summary_length": len(summary),
+                        "compression_ratio": round(len(summary) / len(context), 3) if len(context) > 0 else 0
+                    }
+                )
+
                 context_summaries.append(summary)
 
                 self.logger.info(f"Context {i+1} summarized (original: {len(context)} → summary: {len(summary)} chars)")
