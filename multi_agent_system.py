@@ -66,7 +66,7 @@ class GraphRetrievalStartMessage(BaseModel):
     query: str
     dataset: str
     setting: str
-    k_iterations: int = 3
+    k_iterations: int = 6
     shared_state: Dict[str, Any]
 
 class GraphRetrievalReadyMessage(BaseModel):
@@ -706,7 +706,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             query=qa_pair.get("question", ""),
             dataset=graph_response.dataset,
             setting=graph_response.setting,
-            k_iterations=3,
+            k_iterations=6,
             shared_state=current_state
         )
 
@@ -3012,7 +3012,7 @@ class BackwardPassAgent(RoutedAgent):
 
         # Generate optimized prompt using the critique
         optimizer_prompt = self.answer_generation_prompt_optimizer.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
         # Only update if not frozen
         is_frozen = self._is_prompt_frozen("answer_generator_graph", current_state)
@@ -3170,7 +3170,7 @@ class BackwardPassAgent(RoutedAgent):
 
         # Generate optimized prompt using the critique
         optimizer_prompt = self.retrieval_planner_prompt_optimizer.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
         # Only update if not frozen
         is_frozen = self._is_prompt_frozen("graph_retrieval_planner", current_state)
@@ -3244,7 +3244,7 @@ class BackwardPassAgent(RoutedAgent):
 
             # Generate optimized prompt using the critique
             optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
-            optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+            optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
             # Store the optimized graph builder prompt for use in graph refinement
             is_frozen = self._is_prompt_frozen("graph_builder", current_state)
@@ -3277,7 +3277,7 @@ class BackwardPassAgent(RoutedAgent):
 
             # Generate optimized refinement prompt using the critique
             optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
-            optimized_refinement_prompt = await self._call_llm(optimizer_prompt, ctx)
+            optimized_refinement_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
             # Update the refinement prompt (this IS optimized in backward pass)
             is_frozen = self._is_prompt_frozen("graph_refinement", current_state)
@@ -3312,7 +3312,7 @@ class BackwardPassAgent(RoutedAgent):
 
         # Generate optimized prompt using the critique
         optimizer_prompt = self.hyperparameters_graph_agent_prompt_optimizer.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
         # Only update if not frozen
         is_frozen = self._is_prompt_frozen("hyperparameters_graph", current_state)
@@ -3326,14 +3326,17 @@ class BackwardPassAgent(RoutedAgent):
         frozen_prompts = current_state.get("frozen_prompts", [])
         return prompt_type in frozen_prompts
 
-    async def _call_llm(self, prompt_content: str, ctx: MessageContext, interaction_type: str = "critique", batch_id: int = None) -> str:
+    async def _call_llm(self, prompt_content: str, ctx: MessageContext, interaction_type: str = "critique", batch_id: int = None, user_prompt: str = "Please provide your critique and feedback.") -> str:
         """Helper method to call LLM with given prompt and token limit."""
         try:
-            # Add token limit instruction to the prompt
-            enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your critique to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the most critical points and be concise."
+            # Add token limit instruction to the prompt based on interaction type
+            if interaction_type == "optimization":
+                enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your response to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the optimized prompt and be concise."
+            else:
+                enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your critique to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the most critical points and be concise."
 
             system_message = SystemMessage(content=enhanced_prompt)
-            user_message = UserMessage(content="Please provide your critique and feedback.", source="system")
+            user_message = UserMessage(content=user_prompt, source="system")
 
             response = await self.model_client.create(
                 [system_message, user_message],
@@ -3348,7 +3351,7 @@ class BackwardPassAgent(RoutedAgent):
                 agent_name="BackwardPassAgent",
                 interaction_type=interaction_type,
                 system_prompt=enhanced_prompt,
-                user_prompt="Please provide your critique and feedback.",
+                user_prompt=user_prompt,
                 llm_response=response_content,
                 batch_id=batch_id,
                 additional_metadata={
