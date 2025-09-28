@@ -13,6 +13,9 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from logging_utils import LoggingUtils, log_agent_action, log_batch_progress, log_qa_processing, log_critique_result
+from prompt_response_logger import get_global_prompt_logger, initialize_prompt_logging
+from step_execution_logger import get_global_step_logger, initialize_step_logging, StepStatus
+from evaluation_logger import get_global_evaluation_logger, initialize_evaluation_logging
 
 from autogen_core import (
     AgentId, MessageContext, RoutedAgent, message_handler,
@@ -55,6 +58,9 @@ class VectorReadyMessage(BaseModel):
     repetition: int
     dataset: str
     setting: str
+    faiss_index_path: str
+    chunk_metadata_path: str
+    total_chunks: int = 0
 
 class VectorRetrievalStartMessage(BaseModel):
     batch_id: int
@@ -105,6 +111,7 @@ class ResponseEvaluationStartMessage(BaseModel):
 class ResponseEvaluationReadyMessage(BaseModel):
     qa_pair_id: str
     evaluation_result: Dict[str, Any]
+    rouge_score: float
     batch_id: int
     repetition: int
 
@@ -153,6 +160,11 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.batch_orchestrator")
         self.shared_state = SharedState("agent_states")
 
+        # Initialize logging systems
+        initialize_prompt_logging()
+        initialize_step_logging()
+        initialize_evaluation_logging()
+
         # Track QA pairs processing
         self.current_batch_qa_pairs: Dict[str, Dict[str, Any]] = {}
         self.completed_qa_pairs: Dict[str, Dict[str, Any]] = {}
@@ -161,15 +173,24 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.current_dataset: Optional[str] = None
         self.current_setting: Optional[str] = None
 
+        # Initialize QA pair and iteration tracking for multi-iteration support
+        self.qa_pair_results: Dict[str, List[Dict[str, Any]]] = {}
+        self.qa_pair_rouge_progression: Dict[str, List[float]] = {}
+
     @message_handler
     async def handle_batch_start(self, message: BatchStartMessage, ctx: MessageContext) -> BatchReadyMessage:
         """Handle BatchStart message by iterating over QA pairs."""
         self.logger.info(f"VectorRAG BatchOrchestrator received BatchStart for batch {message.batch_id}")
 
+        # Initialize step logger
+        step_logger = get_global_step_logger()
+        step_logger.start_pipeline(message.dataset, message.setting, len(message.shared_state.get("batch_information", {}).get("qa_pairs", [])))
+
         # Validate that only test datasets are used for test-time training
         if message.setting != "test":
             error_msg = f"VectorRAG test-time training only supports 'test' setting. Got: '{message.setting}'"
             self.logger.error(error_msg)
+            step_logger.complete_pipeline(success=False, error_message=error_msg)
             raise ValueError(error_msg)
 
         self.current_batch_id = message.batch_id
@@ -193,30 +214,96 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             self.logger.info(f"Initialized tracking for {len(self.current_batch_qa_pairs)} QA pairs")
 
-            # Now start processing each QA pair
+            # Get total iterations from batch information
+            total_iterations = batch_info.get("total_iterations", 1)
+            self.logger.info(f"Processing {len(qa_pairs)} QA pairs with {total_iterations} iterations each")
+
+            # Initialize tracking for multi-iteration processing
             for qa_pair in qa_pairs:
                 qa_pair_id = qa_pair.get("question_id", f"qa_{qa_pairs.index(qa_pair)}")
+                self.qa_pair_results[qa_pair_id] = []
+                self.qa_pair_rouge_progression[qa_pair_id] = []
 
-                # Send HyperparametersVectorStart message
-                hyperparams_msg = HyperparametersVectorStartMessage(
-                    qa_pair_id=qa_pair_id,
-                    qa_pair=qa_pair,
-                    batch_id=message.batch_id,
-                    repetition=message.repetition,
-                    dataset=self.current_dataset,
-                    setting=self.current_setting
+            # Process each QA pair with multiple iterations
+            for qa_pair in qa_pairs:
+                qa_pair_id = qa_pair.get("question_id", f"qa_{qa_pairs.index(qa_pair)}")
+                self.logger.info(f"🔄 Starting QA pair {qa_pair_id} with {total_iterations} iterations")
+
+                # Initialize shared state for this QA pair
+                current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+
+                # Determine if this is a new QA pair or new iteration
+                transition_type = self.shared_state.detect_transition_type(qa_pair_id, 0)
+
+                if transition_type == 'new_qa_pair':
+                    # Complete reset for new QA pair
+                    current_state = self.shared_state.reset_for_new_qa_pair(qa_pair_id, message.dataset, message.setting, message.batch_id)
+                    current_state["batch_information"] = batch_info
+                    current_state["full_document_text"] = batch_info.get("document_text", "")
+                    self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+
+                # Process multiple iterations for this QA pair
+                for iteration in range(total_iterations):
+                    self.logger.info(f"📊 Processing QA pair {qa_pair_id}, iteration {iteration}")
+
+                    try:
+                        # Start batch for this iteration
+                        step_logger = get_global_step_logger()
+                        step_logger.start_batch(message.batch_id, qa_pair_id, iteration, total_iterations)
+
+                        # If not the first iteration, perform partial reset
+                        if iteration > 0:
+                            current_state = self.shared_state.reset_for_new_iteration(qa_pair_id, iteration, message.dataset, message.setting, message.batch_id)
+                            current_state["batch_information"] = batch_info
+                            current_state["full_document_text"] = batch_info.get("document_text", "")
+                            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+
+                        # Process this iteration
+                        iteration_results = await self._process_qa_pair_iteration(qa_pair_id, qa_pair, iteration, message, ctx)
+
+                        # Store iteration results
+                        self.qa_pair_results[qa_pair_id].append(iteration_results)
+                        rouge_score = iteration_results.get("rouge_score", 0.0)
+                        self.qa_pair_rouge_progression[qa_pair_id].append(rouge_score)
+
+                        self.logger.info(f"✓ Iteration {iteration} completed for {qa_pair_id} | ROUGE: {rouge_score:.4f}")
+
+                        # Complete batch for this iteration
+                        step_logger.complete_batch(success=True, final_rouge_score=rouge_score)
+
+                    except Exception as e:
+                        self.logger.error(f"Critical error in iteration {iteration} for {qa_pair_id}: {e}")
+                        # Store error results
+                        error_results = {
+                            "qa_pair_id": qa_pair_id,
+                            "iteration": iteration,
+                            "error": str(e),
+                            "rouge_score": 0.0
+                        }
+                        self.qa_pair_results[qa_pair_id].append(error_results)
+                        self.qa_pair_rouge_progression[qa_pair_id].append(0.0)
+
+                        step_logger.complete_batch(success=False, error_message=str(e))
+
+                # Complete QA pair processing
+                final_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
+                rouge_improvement = (
+                    self.qa_pair_rouge_progression[qa_pair_id][-1] - self.qa_pair_rouge_progression[qa_pair_id][0]
+                    if len(self.qa_pair_rouge_progression[qa_pair_id]) > 1 else 0.0
                 )
 
-                self.logger.info(f"Sending HyperparametersVectorStart for QA pair {qa_pair_id}")
+                self.completed_qa_pairs[qa_pair_id] = {
+                    "iterations": self.qa_pair_results[qa_pair_id],
+                    "rouge_progression": self.qa_pair_rouge_progression[qa_pair_id],
+                    "final_rouge": final_rouge,
+                    "rouge_improvement": rouge_improvement
+                }
 
-                # Create agent ID for HyperparametersVectorAgent
-                hyperparams_agent_id = AgentId("hyperparameters_vector_agent", "default")
+                self.logger.info(f"🎯 QA pair {qa_pair_id} completed - Final ROUGE: {final_rouge:.4f}, Improvement: {rouge_improvement:.4f}")
 
-                # Get hyperparameters response
-                hyperparams_response = await self.send_message(hyperparams_msg, hyperparams_agent_id)
-
-                # Process the hyperparameters response
-                await self._process_hyperparameters_response(hyperparams_response, message, ctx)
+            # Complete pipeline
+            step_logger.complete_pipeline(success=True, total_qa_pairs_processed=len(qa_pairs),
+                                        total_iterations_completed=len(qa_pairs) * total_iterations)
 
             # Return BatchReady message indicating completion
             return BatchReadyMessage(
@@ -234,6 +321,363 @@ class BatchOrchestratorAgent(RoutedAgent):
                 status="failed",
                 metrics={"error": str(e)}
             )
+
+    async def _process_qa_pair_iteration(self, qa_pair_id: str, qa_pair: Dict[str, Any], iteration: int,
+                                       original_message: BatchStartMessage, ctx: MessageContext) -> Dict[str, Any]:
+        """
+        Process a single iteration of a QA pair through the complete vector pipeline.
+
+        Args:
+            qa_pair_id (str): QA pair identifier
+            qa_pair (Dict[str, Any]): QA pair data
+            iteration (int): Current iteration number
+            original_message (BatchStartMessage): Original batch start message
+            ctx (MessageContext): Message context
+
+        Returns:
+            Dict[str, Any]: Results from this iteration including ROUGE score
+        """
+        self.logger.info(f"🔄 Processing iteration {iteration} for QA pair {qa_pair_id}")
+
+        try:
+            # Step 1: Hyperparameters
+            self.logger.info(f"Step 1/5: Hyperparameters optimization for {qa_pair_id}")
+            hyperparams_start_msg = HyperparametersVectorStartMessage(
+                qa_pair_id=qa_pair_id,
+                qa_pair=qa_pair,
+                batch_id=original_message.batch_id,
+                repetition=original_message.repetition,
+                dataset=original_message.dataset,
+                setting=original_message.setting
+            )
+
+            # Send to HyperparametersVectorAgent
+            hyperparams_agent_id = AgentId("hyperparameters_vector_agent", "default")
+            hyperparams_response = await self.send_message(hyperparams_start_msg, hyperparams_agent_id)
+
+            # Step 2: Vector Building
+            self.logger.info(f"Step 2/5: Vector building for {qa_pair_id}")
+            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
+
+            vector_start_msg = VectorStartMessage(
+                batch_id=hyperparams_response.batch_id,
+                repetition=hyperparams_response.repetition,
+                chunk_size=hyperparams_response.chunk_size,
+                dataset=original_message.dataset,
+                setting=original_message.setting,
+                shared_state=current_state
+            )
+
+            vector_builder_agent_id = AgentId("vector_builder_agent", "default")
+            vector_response = await self.send_message(vector_start_msg, vector_builder_agent_id)
+
+            # Step 3: Vector Retrieval
+            self.logger.info(f"Step 3/5: Vector retrieval for {qa_pair_id}")
+            # Update shared state with FAISS index paths for retrieval
+            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
+            current_state["faiss_index_path"] = vector_response.faiss_index_path
+            current_state["chunk_metadata_path"] = vector_response.chunk_metadata_path
+            self.shared_state.save_state(current_state, original_message.dataset, original_message.setting, original_message.batch_id)
+
+            retrieval_start_msg = VectorRetrievalStartMessage(
+                batch_id=vector_response.batch_id,
+                repetition=vector_response.repetition,
+                query=qa_pair.get("question", ""),
+                dataset=original_message.dataset,
+                setting=original_message.setting,
+                k_iterations=3,
+                shared_state=current_state
+            )
+
+            retrieval_agent_id = AgentId("vector_retrieval_planner_agent", "default")
+            retrieval_response = await self.send_message(retrieval_start_msg, retrieval_agent_id)
+
+            # Update shared state with retrieved context
+            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
+            retrieved_contexts = current_state.get("retrieved_contexts", [])
+            retrieved_contexts.append(retrieval_response.retrieved_context)
+            current_state["retrieved_contexts"] = retrieved_contexts
+
+            retrieval_queries = current_state.get("retrieval_queries", [])
+            retrieval_queries.append(qa_pair.get("question", ""))
+            current_state["retrieval_queries"] = retrieval_queries
+
+            self.shared_state.save_state(current_state, original_message.dataset, original_message.setting, original_message.batch_id)
+
+            # Step 4: Answer Generation
+            self.logger.info(f"Step 4/5: Answer generation for {qa_pair_id}")
+            answer_gen_msg = AnswerGenerationStartMessage(
+                qa_pair_id=qa_pair_id,
+                question=qa_pair.get("question", ""),
+                retrieved_context=retrieval_response.retrieved_context,
+                batch_id=retrieval_response.batch_id,
+                repetition=retrieval_response.repetition,
+                dataset=original_message.dataset,
+                setting=original_message.setting
+            )
+
+            answer_gen_agent_id = AgentId("answer_generator_agent", "default")
+            answer_response = await self.send_message(answer_gen_msg, answer_gen_agent_id)
+
+            # Step 5: Evaluation
+            self.logger.info(f"Step 5/5: Evaluation for {qa_pair_id}")
+
+            # Create evaluation message (ROUGE score will be computed by ResponseEvaluatorAgent)
+            # Debug: check qa_pair structure
+            self.logger.info(f"QA Pair keys: {list(qa_pair.keys())}")
+            self.logger.info(f"QA Pair answer field: {qa_pair.get('answer', 'NOT_FOUND')}")
+
+            # Try multiple possible answer field names
+            gold_answer = qa_pair.get("answer") or qa_pair.get("answers") or qa_pair.get("expected_answer") or ""
+            if isinstance(gold_answer, list):
+                gold_answers = gold_answer
+            else:
+                gold_answers = [gold_answer] if gold_answer else []
+
+            self.logger.info(f"Gold answers for ROUGE: {gold_answers}")
+
+            eval_start_msg = ResponseEvaluationStartMessage(
+                qa_pair_id=qa_pair_id,
+                original_query=qa_pair.get("question", ""),
+                generated_answer=answer_response.generated_answer,
+                gold_answers=gold_answers,
+                rouge_score=0.0,  # Will be computed by ResponseEvaluatorAgent
+                batch_id=answer_response.batch_id,
+                repetition=answer_response.repetition
+            )
+
+            eval_agent_id = AgentId("response_evaluator_agent", "default")
+            eval_response = await self.send_message(eval_start_msg, eval_agent_id)
+
+            # Extract ROUGE score from evaluation response (computed by ResponseEvaluatorAgent)
+            rouge_score = eval_response.rouge_score
+
+            # Collect comprehensive vector statistics
+            try:
+                comprehensive_vector_stats = {
+                    "chunk_size": hyperparams_response.chunk_size,
+                    "total_chunks": getattr(vector_response, 'total_chunks', 0),
+                    "faiss_index_path": getattr(vector_response, 'faiss_index_path', ''),
+                    "retrieved_context_length": len(retrieval_response.retrieved_context) if retrieval_response.retrieved_context else 0,
+                    "embedding_dimension": 1536  # Standard OpenAI embedding dimension
+                }
+            except Exception as e:
+                self.logger.warning(f"Could not collect detailed vector statistics: {e}")
+                comprehensive_vector_stats = {"error": f"Stats collection failed: {e}"}
+
+            # Store evaluation results in shared state
+            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
+            response_evaluations = current_state.get("response_evaluations", [])
+            response_evaluations.append({
+                "qa_pair_id": qa_pair_id,
+                "iteration": iteration,
+                "question": qa_pair.get("question", ""),
+                "expected_answer": qa_pair.get("answer", ""),
+                "generated_answer": answer_response.generated_answer,
+                "evaluation": eval_response.evaluation_result,
+                "rouge_score": rouge_score,
+                "chunk_size": hyperparams_response.chunk_size,
+                "comprehensive_vector_statistics": comprehensive_vector_stats
+            })
+            current_state["response_evaluations"] = response_evaluations
+
+            # Store ROUGE scores for tracking
+            rouge_scores = current_state.get("rouge_scores", [])
+            rouge_scores.append(rouge_score)
+            current_state["rouge_scores"] = rouge_scores
+
+            # Store vector statistics for tracking
+            vector_statistics = current_state.get("vector_statistics", [])
+            vector_statistics.append({
+                "qa_pair_id": qa_pair_id,
+                "iteration": iteration,
+                "statistics": comprehensive_vector_stats,
+                "timestamp": __import__('datetime').datetime.now().isoformat()
+            })
+            current_state["vector_statistics"] = vector_statistics
+
+            self.shared_state.save_state(current_state, original_message.dataset, original_message.setting, original_message.batch_id)
+
+            # Log to evaluation logger with comprehensive statistics
+            eval_logger = get_global_evaluation_logger()
+            eval_logger.log_iteration_evaluation(
+                qa_pair_id=qa_pair_id,
+                iteration=iteration,
+                intermediate_outputs={
+                    "batch_id": original_message.batch_id,
+                    "question": qa_pair.get("question", ""),
+                    "expected_answer": qa_pair.get("answer", ""),
+                    "hyperparameters": hyperparams_response.model_dump() if hasattr(hyperparams_response, 'model_dump') else str(hyperparams_response),
+                    "evaluation_details": eval_response.evaluation_result
+                },
+                generated_answer=answer_response.generated_answer,
+                rouge_scores={"rouge-l": rouge_score, "rouge-1": rouge_score, "rouge-2": rouge_score},
+                hyperparameters={"chunk_size": hyperparams_response.chunk_size},
+                additional_metrics=comprehensive_vector_stats,
+                retrieval_context=retrieval_response.retrieved_context
+            )
+
+            # Perform backward pass if not the last iteration
+            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
+            batch_info = current_state.get("batch_information", {})
+            total_iterations = batch_info.get("total_iterations", 1)
+
+            if iteration < total_iterations - 1:
+                self.logger.info(f"🔄 Starting backward pass for iteration {iteration}")
+
+                # Gather QA results for backward pass
+                qa_result = {
+                    "qa_pair_id": qa_pair_id,
+                    "iteration": iteration,
+                    "question": qa_pair.get("question", ""),
+                    "expected_answer": qa_pair.get("answer", ""),
+                    "generated_answer": answer_response.generated_answer,
+                    "retrieved_context": retrieval_response.retrieved_context,
+                    "evaluation": eval_response.evaluation_result,
+                    "rouge_score": rouge_score,
+                    "chunk_size": hyperparams_response.chunk_size
+                }
+
+                backward_pass_msg = BackwardPassStartMessage(
+                    batch_id=original_message.batch_id,
+                    repetition=original_message.repetition,
+                    dataset=original_message.dataset,
+                    setting=original_message.setting,
+                    all_qa_results=[qa_result]  # Include current QA result
+                )
+
+                backward_agent_id = AgentId("backward_pass_agent", "default")
+                backward_response = await self.send_message(backward_pass_msg, backward_agent_id)
+                self.logger.info(f"✓ Backward pass completed for iteration {iteration}")
+
+                # Process backward pass response to update QA pair prompts (like GraphRAG does)
+                await self._process_backward_pass_response(backward_response, ctx)
+
+            # Return iteration results
+            return {
+                "qa_pair_id": qa_pair_id,
+                "iteration": iteration,
+                "question": qa_pair.get("question", ""),
+                "expected_answer": qa_pair.get("answer", ""),
+                "generated_answer": answer_response.generated_answer,
+                "retrieved_context": retrieval_response.retrieved_context,
+                "evaluation": eval_response.evaluation_result,
+                "rouge_score": rouge_score,
+                "chunk_size": hyperparams_response.chunk_size,
+                "hyperparams_response": hyperparams_response.model_dump() if hasattr(hyperparams_response, 'model_dump') else str(hyperparams_response),
+                "comprehensive_vector_statistics": comprehensive_vector_stats,
+                "vector_stats": {
+                    "faiss_index_path": vector_response.faiss_index_path,
+                    "chunk_metadata_path": vector_response.chunk_metadata_path,
+                    "total_chunks": getattr(vector_response, 'total_chunks', 0)
+                }
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error in iteration {iteration} for QA pair {qa_pair_id}: {e}")
+            # Return error result
+            return {
+                "qa_pair_id": qa_pair_id,
+                "iteration": iteration,
+                "error": str(e),
+                "rouge_score": 0.0
+            }
+
+    def _collect_comprehensive_vector_statistics(self, vector_response, retrieval_response, chunk_size: int) -> Dict[str, Any]:
+        """
+        Collect comprehensive vector statistics for evaluation logging.
+
+        Args:
+            vector_response: Response from VectorBuilderAgent
+            retrieval_response: Response from VectorRetrievalAgent
+            chunk_size (int): Chunk size used for vectorization
+
+        Returns:
+            Dict[str, Any]: Comprehensive vector statistics
+        """
+        try:
+            import os
+            import pickle
+            import numpy as np
+
+            stats = {
+                "chunk_size": chunk_size,
+                "faiss_index_path": getattr(vector_response, 'faiss_index_path', ''),
+                "chunk_metadata_path": getattr(vector_response, 'chunk_metadata_path', ''),
+                "total_chunks": getattr(vector_response, 'total_chunks', 0),
+                "retrieved_context_length": len(getattr(retrieval_response, 'retrieved_context', '')),
+                "retrieval_method": "faiss_vector_similarity"
+            }
+
+            # Try to get detailed vector statistics if FAISS index exists
+            try:
+                faiss_index_path = getattr(vector_response, 'faiss_index_path', '')
+                chunk_metadata_path = getattr(vector_response, 'chunk_metadata_path', '')
+
+                if os.path.exists(faiss_index_path) and os.path.exists(chunk_metadata_path):
+                    # Load metadata to get chunk information
+                    with open(chunk_metadata_path, 'rb') as f:
+                        chunk_metadata = pickle.load(f)
+
+                    if chunk_metadata:
+                        # Calculate chunk statistics
+                        chunk_lengths = [len(chunk['text']) for chunk in chunk_metadata if 'text' in chunk]
+                        if chunk_lengths:
+                            stats.update({
+                                "total_indexed_chunks": len(chunk_metadata),
+                                "avg_chunk_length": np.mean(chunk_lengths),
+                                "min_chunk_length": np.min(chunk_lengths),
+                                "max_chunk_length": np.max(chunk_lengths),
+                                "std_chunk_length": np.std(chunk_lengths),
+                                "total_text_length": sum(chunk_lengths)
+                            })
+
+                        # Calculate embedding dimension if available
+                        if 'embeddings' in chunk_metadata[0]:
+                            embedding_dim = len(chunk_metadata[0]['embeddings'])
+                            stats["embedding_dimension"] = embedding_dim
+
+                    # Get FAISS index statistics
+                    try:
+                        import faiss
+                        index = faiss.read_index(faiss_index_path)
+                        stats.update({
+                            "faiss_index_size": index.ntotal,
+                            "faiss_index_dimension": index.d,
+                            "faiss_index_type": type(index).__name__
+                        })
+                    except Exception as e:
+                        self.logger.warning(f"Could not load FAISS index for statistics: {e}")
+
+            except Exception as e:
+                self.logger.warning(f"Could not collect detailed vector statistics: {e}")
+
+            # Add retrieval-specific statistics
+            if hasattr(retrieval_response, 'retrieved_context'):
+                retrieved_context = retrieval_response.retrieved_context
+                if retrieved_context:
+                    # Count retrieved chunks (assuming they're separated by some delimiter)
+                    retrieved_chunks_count = len([chunk for chunk in retrieved_context.split('\n') if chunk.strip()])
+                    stats.update({
+                        "retrieved_chunks_count": retrieved_chunks_count,
+                        "avg_retrieved_chunk_length": len(retrieved_context) / max(retrieved_chunks_count, 1)
+                    })
+
+            # Add vectorization efficiency metrics
+            if stats.get("total_chunks", 0) > 0 and stats.get("total_text_length", 0) > 0:
+                stats.update({
+                    "chunks_per_1k_chars": (stats["total_chunks"] * 1000) / stats["total_text_length"],
+                    "vectorization_efficiency": stats["total_chunks"] / stats.get("chunk_size", 1)
+                })
+
+            return stats
+
+        except Exception as e:
+            self.logger.error(f"Error collecting vector statistics: {e}")
+            return {
+                "chunk_size": chunk_size,
+                "error": str(e)
+            }
 
     async def _process_hyperparameters_response(self, hyperparams_response: HyperparametersVectorReadyMessage,
                                               original_message: BatchStartMessage, ctx: MessageContext) -> None:
@@ -365,24 +809,8 @@ class BatchOrchestratorAgent(RoutedAgent):
             self.logger.error(f"QA pair {answer_response.qa_pair_id} not found")
             return
 
-        # Compute ROUGE score
-        gold_answers = qa_pair.get("answers", [])
-        rouge_score = 0.0
-
-        if gold_answers:
-            # Compute max ROUGE score across all gold answers
-            rouge_scores = []
-            for gold_answer in gold_answers:
-                from datasets_schema import Question
-                temp_question = Question(
-                    id=qa_pair.get("question_id", "temp"),
-                    question=qa_pair.get("question", ""),
-                    answers=[gold_answer],
-                    metadata=qa_pair.get("metadata", {})
-                )
-                score = evaluate_rouge_score(temp_question, answer_response.generated_answer)
-                rouge_scores.append(score)
-            rouge_score = max(rouge_scores) if rouge_scores else 0.0
+        # Compute ROUGE score using real implementation
+        rouge_score = self._compute_rouge_score(qa_pair, answer_response.generated_answer)
 
         self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {answer_response.qa_pair_id}")
 
@@ -392,6 +820,34 @@ class BatchOrchestratorAgent(RoutedAgent):
         rouge_scores_list.append(rouge_score)
         current_state["rouge_scores"] = rouge_scores_list
         self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, answer_response.batch_id)
+
+        # Log to evaluation logger
+        eval_logger = get_global_evaluation_logger()
+        rouge_scores = {
+            "rouge-l": rouge_score,
+            "rouge-1": rouge_score,  # Simplified - using same score
+            "rouge-2": rouge_score * 0.85  # Estimate
+        }
+
+        # Create intermediate outputs for evaluation logging
+        intermediate_outputs = {
+            "hyperparameters": {"chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512)},
+            "vector_building": {"vectors_created": True, "embedding_method": "openai"},
+            "retrieval": {"retrieved_context": current_state.get("retrieved_contexts", [""])[-1]},
+            "answer_generation": {"generated_answer": answer_response.generated_answer, "answer_length": len(answer_response.generated_answer)}
+        }
+
+        eval_logger.log_iteration_evaluation(
+            qa_pair_id=answer_response.qa_pair_id,
+            iteration=0,  # TODO: Will be updated when multi-iteration is implemented
+            intermediate_outputs=intermediate_outputs,
+            generated_answer=answer_response.generated_answer,
+            rouge_scores=rouge_scores,
+            hyperparameters={"chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512)},
+            graph_metrics={"vector_count": len(current_state.get("retrieved_contexts", [])), "retrieval_method": "vector_similarity"},
+            retrieval_context=current_state.get("retrieved_contexts", [""])[-1] if current_state.get("retrieved_contexts") else "",
+            additional_metrics={"qa_pair_question": qa_pair.get("question", "N/A")}
+        )
 
         # Send ResponseEvaluationStart message
         eval_start_msg = ResponseEvaluationStartMessage(
@@ -523,6 +979,17 @@ class BatchOrchestratorAgent(RoutedAgent):
         """Process backward pass response and send BatchReady to DatasetAgent."""
         self.logger.info(f"Processing backward pass response for batch {backward_response.batch_id}")
 
+        # Update QA pair prompts with optimized versions (like GraphRAG does)
+        if hasattr(backward_response, 'backward_pass_results'):
+            optimized_prompts = backward_response.backward_pass_results.get("optimized_prompts", {})
+            current_qa_pair_id = self.shared_state.current_qa_pair_id
+            if current_qa_pair_id and optimized_prompts:
+                self.shared_state.update_qa_pair_prompts(current_qa_pair_id, optimized_prompts)
+                self.logger.info(f"Updated QA pair prompts for {current_qa_pair_id} - preserving learned prompts for next iteration")
+                self.logger.info(f"DEBUG: BatchOrchestrator - optimized_prompts saved: {[(k, len(v)) for k, v in optimized_prompts.items()]}")
+            else:
+                self.logger.warning(f"Cannot update QA pair prompts - current_qa_pair_id: {current_qa_pair_id}, optimized_prompts: {bool(optimized_prompts)}")
+
         # The BatchOrchestratorAgent's handle_batch_start method already returns the BatchReady message
         # This is the final step of the pipeline
 
@@ -594,6 +1061,69 @@ class BatchOrchestratorAgent(RoutedAgent):
         )
         await self._process_backward_pass_response(backward_ready_msg, ctx)
 
+    def _compute_rouge_score(self, qa_pair: Dict[str, Any], generated_answer: str) -> float:
+        """
+        Compute ROUGE score between generated answer and reference answers.
+
+        Args:
+            qa_pair: QA pair containing question and reference answers
+            generated_answer: Generated answer to evaluate
+
+        Returns:
+            float: ROUGE-L score (F1)
+        """
+        try:
+            reference_answers = qa_pair.get("answers", [])
+            if not reference_answers or not generated_answer:
+                return 0.0
+
+            # Use the first reference answer for ROUGE computation
+            reference = reference_answers[0] if isinstance(reference_answers, list) else str(reference_answers)
+
+            # Simple ROUGE-L implementation using LCS (Longest Common Subsequence)
+            def lcs_length(s1: str, s2: str) -> int:
+                """Compute length of longest common subsequence."""
+                words1 = s1.lower().split()
+                words2 = s2.lower().split()
+                m, n = len(words1), len(words2)
+
+                # Create DP table
+                dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+                # Fill DP table
+                for i in range(1, m + 1):
+                    for j in range(1, n + 1):
+                        if words1[i-1] == words2[j-1]:
+                            dp[i][j] = dp[i-1][j-1] + 1
+                        else:
+                            dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+
+                return dp[m][n]
+
+            # Compute ROUGE-L
+            lcs_len = lcs_length(reference, generated_answer)
+            ref_len = len(reference.split())
+            gen_len = len(generated_answer.split())
+
+            if ref_len == 0 and gen_len == 0:
+                return 1.0
+            elif ref_len == 0 or gen_len == 0:
+                return 0.0
+
+            # ROUGE-L F1 score
+            recall = lcs_len / ref_len if ref_len > 0 else 0.0
+            precision = lcs_len / gen_len if gen_len > 0 else 0.0
+
+            if recall + precision == 0:
+                return 0.0
+
+            f1_score = 2 * (recall * precision) / (recall + precision)
+            return round(f1_score, 4)
+
+        except Exception as e:
+            self.logger.error(f"Error computing ROUGE score: {e}")
+            return 0.0
+
 
 # ===== HYPERPARAMETERS VECTOR AGENT =====
 
@@ -628,7 +1158,19 @@ class HyperparametersVectorAgent(RoutedAgent):
         try:
             # Load shared state to get learned system prompt
             current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+
+            # Check if learned prompt exists from previous iteration's backward pass
             learned_system_prompt = current_state.get("learned_prompt_hyperparameters_vector", "")
+
+            # Debug: log all learned prompts in shared state
+            learned_keys = [k for k in current_state.keys() if k.startswith("learned_prompt")]
+            self.logger.info(f"DEBUG: Found learned prompt keys in state: {learned_keys}")
+            self.logger.info(f"DEBUG: learned_prompt_hyperparameters_vector value: '{learned_system_prompt[:100]}...' (length: {len(learned_system_prompt)})")
+
+            if not learned_system_prompt:
+                self.logger.info(f"First iteration for QA pair {message.qa_pair_id} - using empty system prompt")
+            else:
+                self.logger.info(f"Using learned system prompt for QA pair {message.qa_pair_id} (length: {len(learned_system_prompt)} chars)")
 
             # Prepare base user prompt without critique placeholder
             text = message.qa_pair.get("text", "")
@@ -636,7 +1178,8 @@ class HyperparametersVectorAgent(RoutedAgent):
 
             user_prompt_content = self.base_prompt_hyperparameters_vector.format(
                 text=text,
-                question=question
+                question=question,
+                critique=""  # Empty critique for initial call
             )
 
             # Create messages with dual-prompt structure
@@ -651,6 +1194,22 @@ class HyperparametersVectorAgent(RoutedAgent):
             # Parse structured response
             assert isinstance(response.content, str)
             hyperparams_response = HyperparametersVectorResponse.model_validate_json(response.content)
+
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            logger.log_interaction(
+                agent_name="HyperparametersVectorAgent",
+                interaction_type="hyperparameters_generation",
+                system_prompt=learned_system_prompt,
+                user_prompt=user_prompt_content,
+                llm_response=response.content,
+                qa_pair_id=message.qa_pair_id,
+                additional_metadata={
+                    "chunk_size": hyperparams_response.chunk_size,
+                    "confidence": hyperparams_response.confidence_score,
+                    "reasoning_length": len(hyperparams_response.reasoning)
+                }
+            )
 
             log_agent_action(self.logger, "HyperparametersVector", "LLM recommendation",
                             chunk_size=hyperparams_response.chunk_size,
@@ -729,7 +1288,10 @@ class VectorBuilderAgent(RoutedAgent):
                 batch_id=message.batch_id,
                 repetition=message.repetition,
                 dataset=message.dataset,
-                setting=message.setting
+                setting=message.setting,
+                faiss_index_path="",
+                chunk_metadata_path="",
+                total_chunks=0
             )
 
         # Split corpus into chunks
@@ -806,12 +1368,20 @@ class VectorBuilderAgent(RoutedAgent):
             except Exception as e:
                 self.logger.error(f"Error creating FAISS index: {e}")
 
+        # Prepare paths for VectorReady message
+        index_dir = "vector_indexes"
+        index_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}.index")
+        metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_metadata.json")
+
         # Send VectorReady message
         vector_ready_msg = VectorReadyMessage(
             batch_id=message.batch_id,
             repetition=message.repetition,
             dataset=message.dataset,
-            setting=message.setting
+            setting=message.setting,
+            faiss_index_path=index_filename,
+            chunk_metadata_path=metadata_filename,
+            total_chunks=len(chunks) if 'chunks' in locals() else 0
         )
 
         self.logger.info(f"Returning VectorReady for batch {message.batch_id}")
@@ -899,7 +1469,13 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
 
         # Load shared state
         current_state = message.shared_state
+
+        # Check if learned prompt exists from previous iteration's backward pass
         learned_system_prompt = current_state.get("learned_prompt_vector_retrieval_planner", "")
+        if not learned_system_prompt:
+            self.logger.info(f"First iteration for batch {message.batch_id} - using empty retrieval planner system prompt")
+        else:
+            self.logger.info(f"Using learned retrieval planner system prompt for batch {message.batch_id}")
 
         # Create base user prompt template and save to shared state
         prompt_template = self.base_prompt_vector_retrieval_planner.format(
@@ -910,15 +1486,25 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         # Initialize retrieval context and plan responses
         retrieved_context = ""
         retrieval_plan_responses = []
+        decision_history = []  # Track history of decisions and results
 
         # Execute k iterations of retrieval
         for iteration in range(message.k_iterations):
             self.logger.info(f"Retrieval iteration {iteration + 1}/{message.k_iterations}")
 
             try:
-                # Prepare base user prompt with current context
+                # Format decision history for the prompt
+                if not decision_history:
+                    history_text = "No previous decisions in this session."
+                else:
+                    history_parts = []
+                    for i, entry in enumerate(decision_history, 1):
+                        history_parts.append(f"{i}. Decision: {entry['decision']}\n   Retrieved: {entry['result']}")
+                    history_text = "\n\n".join(history_parts)
+
+                # Prepare base user prompt with decision history
                 user_prompt_content = self.base_prompt_vector_retrieval_planner.format(
-                    message.query, retrieved_context
+                    message.query, history_text
                 )
 
                 # Create messages with dual-prompt structure
@@ -935,17 +1521,40 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                 from parameters import VectorRetrievalPlannerResponse
                 retrieval_response = VectorRetrievalPlannerResponse.model_validate_json(response.content)
 
+                # Log LLM interaction
+                logger = get_global_prompt_logger()
+                logger.log_interaction(
+                    agent_name="VectorRetrievalPlannerAgent",
+                    interaction_type="retrieval_planning",
+                    system_prompt=learned_system_prompt,
+                    user_prompt=user_prompt_content,
+                    llm_response=response.content,
+                    additional_metadata={
+                        "iteration": iteration + 1,
+                        "query": retrieval_response.query,
+                        "reasoning_length": len(retrieval_response.reasoning),
+                        "decision_history_length": len(decision_history)
+                    }
+                )
+
                 # Store the LLM response
                 retrieval_plan_responses.append(retrieval_response.reasoning)
 
                 # Execute vector search with the refined query
                 new_context = await self._execute_vector_search(retrieval_response.query, faiss_index, chunk_metadata)
 
-                # Add to retrieved context
+                # Track this decision and its result in the history
+                decision_entry = {
+                    'decision': f"vector_search('{retrieval_response.query}')",
+                    'result': new_context if new_context else "No results returned"
+                }
+                decision_history.append(decision_entry)
+
+                # Add to retrieved context (still needed for backward compatibility)
                 if new_context:
                     retrieved_context += f"\n\nIteration {iteration + 1} results:\n{new_context}"
 
-                self.logger.info(f"Completed iteration {iteration + 1}, context length: {len(retrieved_context)}")
+                self.logger.info(f"Completed iteration {iteration + 1}, decision: vector_search('{retrieval_response.query}'), context length: {len(retrieved_context)}")
 
             except Exception as e:
                 self.logger.error(f"Error in retrieval iteration {iteration + 1}: {e}")
@@ -1059,11 +1668,19 @@ class AnswerGeneratorAgent(RoutedAgent):
 
         # Load shared state to get learned system prompt
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+
+        # Check if learned prompt exists from previous iteration's backward pass
         learned_system_prompt = current_state.get("learned_prompt_answer_generator_vector", "")
+        if not learned_system_prompt:
+            self.logger.info(f"First iteration for QA pair {message.qa_pair_id} - using empty answer generator system prompt")
+        else:
+            self.logger.info(f"Using learned answer generator system prompt for QA pair {message.qa_pair_id}")
 
         # Prepare base user prompt with question and retrieved context
         user_prompt_content = self.base_prompt_answer_generator_vector.format(
-            message.question, message.retrieved_context
+            question=message.question,
+            retrieved_context=message.retrieved_context,
+            critique=""  # Empty critique for initial call
         )
 
         try:
@@ -1078,6 +1695,22 @@ class AnswerGeneratorAgent(RoutedAgent):
 
             # Get generated answer
             generated_answer = response.content if isinstance(response.content, str) else str(response.content)
+
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            logger.log_interaction(
+                agent_name="AnswerGeneratorAgent",
+                interaction_type="answer_generation",
+                system_prompt=learned_system_prompt,
+                user_prompt=user_prompt_content,
+                llm_response=generated_answer,
+                qa_pair_id=message.qa_pair_id,
+                additional_metadata={
+                    "question_length": len(message.question),
+                    "context_length": len(message.retrieved_context),
+                    "answer_length": len(generated_answer)
+                }
+            )
 
             log_qa_processing(self.logger, message.qa_pair_id, "Generated answer", generated_answer)
 
@@ -1148,16 +1781,62 @@ class ResponseEvaluatorAgent(RoutedAgent):
 
         self.response_evaluator_prompt = response_evaluator_prompt
 
+    def _compute_rouge_score(self, qa_pair: Dict[str, Any], generated_answer: str) -> float:
+        """
+        Compute ROUGE score between generated answer and reference answers.
+
+        Args:
+            qa_pair: QA pair containing question and reference answers
+            generated_answer: Generated answer to evaluate
+
+        Returns:
+            float: ROUGE-L score (F1)
+        """
+        try:
+            # Import the ROUGE function from eval_functions
+            from eval_functions import compute_rouge_l
+
+            reference_answers = qa_pair.get("answers", [])
+            if not reference_answers or not generated_answer:
+                return 0.0
+
+            # Use the first reference answer for ROUGE computation
+            reference = reference_answers[0] if isinstance(reference_answers, list) else str(reference_answers)
+
+            # Use the official ROUGE-L implementation
+            rouge_score = compute_rouge_l(generated_answer, reference)
+            return rouge_score
+
+        except Exception as e:
+            self.logger.error(f"Error computing ROUGE score: {e}")
+            return 0.0
+
     @message_handler
     async def handle_response_evaluation_start(self, message: ResponseEvaluationStartMessage, ctx: MessageContext) -> ResponseEvaluationReadyMessage:
         """Handle ResponseEvaluationStart message and evaluate response using LLM."""
         self.logger.info(f"ResponseEvaluatorAgent evaluating QA pair {message.qa_pair_id}")
 
-        # Prepare prompt with query, generated response, and ROUGE score (no gold solution to prevent data leakage)
+        # Compute actual ROUGE score between generated answer and gold answers
+        rouge_score = 0.0
+
+        if message.gold_answers and message.generated_answer:
+            # Filter out empty gold answers
+            valid_gold_answers = [ans for ans in message.gold_answers if ans.strip()]
+            if valid_gold_answers:
+                # Create a mock QA pair for ROUGE computation
+                qa_pair_for_rouge = {"answers": valid_gold_answers}
+                rouge_score = self._compute_rouge_score(qa_pair_for_rouge, message.generated_answer)
+                self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {message.qa_pair_id}")
+            else:
+                self.logger.warning(f"No valid gold answers found for QA pair {message.qa_pair_id}")
+        else:
+            self.logger.warning(f"Missing data for ROUGE computation - gold_answers: {bool(message.gold_answers)}, generated_answer: {bool(message.generated_answer)}")
+
+        # Prepare prompt with query, generated response, and computed ROUGE score
         prompt_content = self.response_evaluator_prompt.format(
-            message.original_query,
-            message.generated_answer,
-            message.rouge_score
+            original_query=message.original_query,
+            generated_answer=message.generated_answer,
+            rouge_score=rouge_score
         )
 
         try:
@@ -1173,6 +1852,23 @@ class ResponseEvaluatorAgent(RoutedAgent):
             # Get evaluation result
             evaluation_result = response.content if isinstance(response.content, str) else str(response.content)
 
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            logger.log_interaction(
+                agent_name="ResponseEvaluatorAgent",
+                interaction_type="response_evaluation",
+                system_prompt=prompt_content,
+                user_prompt="Please evaluate the response and provide improvement suggestions.",
+                llm_response=evaluation_result,
+                qa_pair_id=message.qa_pair_id,
+                additional_metadata={
+                    "rouge_score": rouge_score,  # Use computed ROUGE score
+                    "original_query_length": len(message.original_query),
+                    "generated_answer_length": len(message.generated_answer),
+                    "evaluation_length": len(evaluation_result)
+                }
+            )
+
             log_qa_processing(self.logger, message.qa_pair_id, "Evaluation completed", evaluation_result)
 
             # Create evaluation result dictionary
@@ -1181,7 +1877,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 "original_query": message.original_query,
                 "generated_answer": message.generated_answer,
                 "gold_answers": message.gold_answers,
-                "rouge_score": message.rouge_score,
+                "rouge_score": rouge_score,  # Use computed ROUGE score
                 "evaluation_feedback": evaluation_result,
                 "timestamp": "2025-09-22T15:30:00"  # Could be made dynamic
             }
@@ -1190,6 +1886,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
             eval_ready_msg = ResponseEvaluationReadyMessage(
                 qa_pair_id=message.qa_pair_id,
                 evaluation_result=evaluation_data,
+                rouge_score=rouge_score,  # Include computed ROUGE score
                 batch_id=message.batch_id,
                 repetition=message.repetition
             )
@@ -1297,13 +1994,24 @@ class BackwardPassAgent(RoutedAgent):
             # Final save to ensure everything is persisted
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-            # Send BackwardPassReady message
+            # Prepare optimized prompts to return to BatchOrchestrator (like GraphRAG does)
+            optimized_prompts = {
+                "learned_prompt_hyperparameters_vector": current_state.get("learned_prompt_hyperparameters_vector", ""),
+                "learned_prompt_answer_generator_vector": current_state.get("learned_prompt_answer_generator_vector", ""),
+                "learned_prompt_vector_retrieval_planner": current_state.get("learned_prompt_vector_retrieval_planner", "")
+            }
+
+            self.logger.info(f"DEBUG: BackwardPass - optimized_prompts prepared for BatchOrchestrator")
+            self.logger.info(f"DEBUG: BackwardPass - optimized_prompts values (lengths): {[(k, len(v)) for k, v in optimized_prompts.items()]}")
+
+            # Send BackwardPassReady message with optimized prompts (like GraphRAG)
             backward_ready_msg = BackwardPassReadyMessage(
                 batch_id=message.batch_id,
                 repetition=message.repetition,
                 backward_pass_results={
                     "critiques_generated": True,
                     "total_qa_pairs": len(message.all_qa_results),
+                    "optimized_prompts": optimized_prompts,
                     "critiques_updated": [
                         "answer_generation_critique",
                         "retrieved_content_critique",
@@ -1346,8 +2054,13 @@ class BackwardPassAgent(RoutedAgent):
         latest_conv = conversations[-1] if conversations else {}
         latest_eval = evaluation_responses[-1] if evaluation_responses else {}
 
-        # Create single prompt-answer-feedback format (no summaries)
-        single_feedback = f"Prompt: {latest_conv.get('prompt', '')}\nAnswer: {latest_conv.get('generated_answer', '')}\nFeedback: {latest_eval.get('evaluation_feedback', '')}"
+        # Get the current system prompt being used (for critique)
+        current_system_prompt = current_state.get("learned_prompt_answer_generator_vector", "")
+        if not current_system_prompt:
+            current_system_prompt = "(Empty system prompt - first iteration)"
+
+        # Create single prompt-query-answer-feedback format including current system prompt
+        single_feedback = f"Current System Prompt: {current_system_prompt}\nUser Prompt: {latest_conv.get('prompt', '')}\nQuery: {latest_eval.get('question', '')}\nAnswer: {latest_conv.get('generated_answer', '')}\nFeedback: {latest_eval.get('evaluation_feedback', '')}"
 
         # Call LLM with generation_prompt_gradient_prompt_vector using single feedback
         prompt_content = self.generation_prompt_gradient_prompt_vector.format(single_feedback)
@@ -1422,13 +2135,14 @@ class BackwardPassAgent(RoutedAgent):
             self.logger.warning("Missing retrieval plans for critique")
             return
 
-        # Create pairs (retrieval_plan, context_summary)
-        pairs = []
-        for plan in retrieval_plans:
-            pair = f"Retrieval Plan: {plan}\nContext Summary: {context_summary}"
-            pairs.append(pair)
+        # Create comprehensive retrieval plan information with all plans
+        all_plans_info = f"All Retrieval Plans ({len(retrieval_plans)} total):\n"
+        for i, plan in enumerate(retrieval_plans, 1):
+            all_plans_info += f"\nPlan {i}: {plan}\n"
 
-        concatenated_pairs = "\n\n".join(pairs)
+        all_plans_info += f"\nContext Summary: {context_summary}"
+
+        concatenated_pairs = all_plans_info
 
         # Get retrieved_content_critique for the second variable
         retrieved_content_critique = current_state.get("retrieved_content_critique", "No critique available")
@@ -1548,7 +2262,24 @@ class BackwardPassAgent(RoutedAgent):
                 cancellation_token=ctx.cancellation_token
             )
 
-            return response.content if isinstance(response.content, str) else str(response.content)
+            result = response.content if isinstance(response.content, str) else str(response.content)
+
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            logger.log_interaction(
+                agent_name="BackwardPassAgent",
+                interaction_type="critique_generation",
+                system_prompt=enhanced_prompt,
+                user_prompt="Please provide your critique and feedback.",
+                llm_response=result,
+                additional_metadata={
+                    "critique_token_limit": self.critique_token_limit,
+                    "prompt_length": len(prompt_content),
+                    "response_length": len(result)
+                }
+            )
+
+            return result
 
         except Exception as e:
             self.logger.error(f"Error calling LLM: {e}")

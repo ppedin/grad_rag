@@ -42,6 +42,7 @@ class SharedState:
             "rag_hyperparameters": {},
             "rouge_scores": [],
             "graph_statistics": {},
+            "vector_statistics": [],  # Vector statistics for VectorRAG
             "full_document_text": "",  # Document text that should persist through iterations
             "example_information": {}   # Example information that should persist through iterations
         }
@@ -205,11 +206,15 @@ class SharedState:
         self.current_qa_pair_id = qa_pair_id
         self.current_iteration = 0
         self.qa_pair_prompts[qa_pair_id] = {
-            # Initialize learned system prompts as empty for new QA pair
+            # Initialize learned system prompts as empty for new QA pair (GraphRAG)
             "learned_prompt_hyperparameters_graph": "",
             "learned_prompt_answer_generator_graph": "",
             "learned_prompt_graph_retrieval_planner": "",
             "learned_prompt_graph_builder": "",
+            # Initialize learned system prompts as empty for new QA pair (VectorRAG)
+            "learned_prompt_hyperparameters_vector": "",
+            "learned_prompt_answer_generator_vector": "",
+            "learned_prompt_vector_retrieval_planner": "",
             # Initialize critiques and prompt templates
             "hyperparameters_graph_agent_critique": "",
             "graph_builder_agent_critique": "",
@@ -265,11 +270,16 @@ class SharedState:
         if qa_pair_id in self.qa_pair_prompts:
             preserved_prompts = self.qa_pair_prompts[qa_pair_id]
 
-            # Preserve the actual learned system prompts that agents use
+            # Preserve the actual learned system prompts that agents use (GraphRAG)
             new_state["learned_prompt_hyperparameters_graph"] = preserved_prompts.get("learned_prompt_hyperparameters_graph", "")
             new_state["learned_prompt_answer_generator_graph"] = preserved_prompts.get("learned_prompt_answer_generator_graph", "")
             new_state["learned_prompt_graph_retrieval_planner"] = preserved_prompts.get("learned_prompt_graph_retrieval_planner", "")
             new_state["learned_prompt_graph_builder"] = preserved_prompts.get("learned_prompt_graph_builder", "")
+
+            # Preserve the actual learned system prompts that agents use (VectorRAG)
+            new_state["learned_prompt_hyperparameters_vector"] = preserved_prompts.get("learned_prompt_hyperparameters_vector", "")
+            new_state["learned_prompt_answer_generator_vector"] = preserved_prompts.get("learned_prompt_answer_generator_vector", "")
+            new_state["learned_prompt_vector_retrieval_planner"] = preserved_prompts.get("learned_prompt_vector_retrieval_planner", "")
 
             # Also preserve critiques and prompt templates for reference
             new_state["hyperparameters_graph_agent_critique"] = preserved_prompts.get("hyperparameters_graph_agent_critique", "")
