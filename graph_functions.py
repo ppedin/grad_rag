@@ -880,20 +880,22 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
                     "total_relationships": total_rels
                 }
 
-            # Get node type frequencies
+            # Get node type frequencies (top 15 by frequency)
             node_query = """
             MATCH (n)
             UNWIND labels(n) as label
             RETURN label, count(*) as frequency
             ORDER BY frequency DESC, label ASC
+            LIMIT 15
             """
             node_result = session.run(node_query)
 
-            # Get relationship type frequencies
+            # Get relationship type frequencies (top 15 by frequency)
             rel_query = """
             MATCH ()-[r]->()
             RETURN type(r) as rel_type, count(*) as frequency
             ORDER BY frequency DESC, rel_type ASC
+            LIMIT 15
             """
             rel_result = session.run(rel_query)
 
@@ -955,12 +957,12 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
                         entity_descriptions.append(f'{count} "{type_name}"s')
 
                 if len(entity_descriptions) == 1:
-                    description_parts.append(f"The entities consist of {entity_descriptions[0]}.")
+                    description_parts.append(f"The most frequent entity type is {entity_descriptions[0]}.")
                 elif len(entity_descriptions) == 2:
-                    description_parts.append(f"The entities consist of {entity_descriptions[0]} and {entity_descriptions[1]}.")
+                    description_parts.append(f"The most frequent entity types are {entity_descriptions[0]} and {entity_descriptions[1]}.")
                 else:
                     last_entity = entity_descriptions.pop()
-                    description_parts.append(f"The entities consist of {', '.join(entity_descriptions)}, and {last_entity}.")
+                    description_parts.append(f"The most frequent entity types are {', '.join(entity_descriptions)}, and {last_entity}.")
 
             # Relationship types description
             if rel_types:
@@ -974,22 +976,14 @@ def generate_graph_description(uri="bolt://localhost:7687", user="", password=""
                         rel_descriptions.append(f'{count} "{type_name}" relationships')
 
                 if len(rel_descriptions) == 1:
-                    description_parts.append(f"The relationships include {rel_descriptions[0]}.")
+                    description_parts.append(f"The most frequent relationship type is {rel_descriptions[0]}.")
                 elif len(rel_descriptions) == 2:
-                    description_parts.append(f"The relationships include {rel_descriptions[0]} and {rel_descriptions[1]}.")
+                    description_parts.append(f"The most frequent relationship types are {rel_descriptions[0]} and {rel_descriptions[1]}.")
                 else:
                     last_rel = rel_descriptions.pop()
-                    description_parts.append(f"The relationships include {', '.join(rel_descriptions)}, and {last_rel}.")
+                    description_parts.append(f"The most frequent relationship types are {', '.join(rel_descriptions)}, and {last_rel}.")
 
-            # Most common types
-            if node_types:
-                most_common_entity = node_types[0]
-                description_parts.append(f'The most common entity type is "{most_common_entity["type"]}" with {most_common_entity["frequency"]} instances.')
-
-            if rel_types:
-                most_common_rel = rel_types[0]
-                rel_name = most_common_rel['type'].replace("_", " ").lower()
-                description_parts.append(f'The most frequent relationship type is "{rel_name}" with {most_common_rel["frequency"]} occurrences.')
+            # Note: Individual most common types are already included in the frequency listings above
 
             # Combine into final description
             full_description = " ".join(description_parts)

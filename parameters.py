@@ -46,6 +46,8 @@ For each relationship, you will include its type, a description (why you think t
 The relationships must be among the extracted entities.
 Provide a list of triplets in your answer.
 
+Return no more than 20 entities and 30 relationships. 
+
 Text:
 {}
 
@@ -76,6 +78,8 @@ Text to analyze for refinement:
 {}
 
 Focus on finding new information not already captured in the existing graph. Only add entities, relationships, and properties that provide new value.
+
+Return no more than 20 entities and 30 relationships. 
 
 Provide the reasoning that led to your response.
 """
@@ -147,9 +151,10 @@ You must choose one of the following functions:
 - analyze_path(start_node_name, end_node_name): find the shortest path between two nodes
 - find_hub_nodes: find the top 3 hub nodes with the highest connectivity
 
-The subgraphs you retrieved so far are the following:
-
+Previous retrieval decisions in this session:
 {}
+
+IMPORTANT: Review the previous decisions above to avoid repeating the same function calls with the same arguments. Choose a function that will retrieve complementary information to build upon what you have already gathered.
 
 Choose one of the functions and specify the arguments.
 
@@ -236,7 +241,7 @@ This is the query:
 This is the information:
 {}
 
-Provide an answer to the query.
+Try to answer the query by exploiting the retrieved information, even if incomplete. Answer only with the response (no additional comment).
 """
 
 base_prompt_answer_generator_vector = """
