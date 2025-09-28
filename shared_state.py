@@ -209,7 +209,7 @@ class SharedState:
             "learned_prompt_hyperparameters_graph": "",
             "learned_prompt_answer_generator_graph": "",
             "learned_prompt_graph_retrieval_planner": "",
-            "learned_prompt_graph_refinement": "",
+            "learned_prompt_graph_builder": "",
             # Initialize critiques and prompt templates
             "hyperparameters_graph_agent_critique": "",
             "graph_builder_agent_critique": "",
@@ -269,7 +269,7 @@ class SharedState:
             new_state["learned_prompt_hyperparameters_graph"] = preserved_prompts.get("learned_prompt_hyperparameters_graph", "")
             new_state["learned_prompt_answer_generator_graph"] = preserved_prompts.get("learned_prompt_answer_generator_graph", "")
             new_state["learned_prompt_graph_retrieval_planner"] = preserved_prompts.get("learned_prompt_graph_retrieval_planner", "")
-            new_state["learned_prompt_graph_refinement"] = preserved_prompts.get("learned_prompt_graph_refinement", "")
+            new_state["learned_prompt_graph_builder"] = preserved_prompts.get("learned_prompt_graph_builder", "")
 
             # Also preserve critiques and prompt templates for reference
             new_state["hyperparameters_graph_agent_critique"] = preserved_prompts.get("hyperparameters_graph_agent_critique", "")

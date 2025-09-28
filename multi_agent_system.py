@@ -1586,8 +1586,12 @@ class GraphBuilderAgent(RoutedAgent):
             learned_system_prompt = ""
             self.logger.info(f"First repetition for batch {message.batch_id} - using empty graph creation system prompt")
         else:
-            # For subsequent iterations, use appropriate learned prompts
-            learned_system_prompt = current_state.get("learned_prompt_graph_refinement", "")
+            # For subsequent iterations, use the optimized graph builder prompt for refinement
+            learned_system_prompt = current_state.get("learned_prompt_graph_builder", "")
+            if learned_system_prompt:
+                self.logger.info(f"Using optimized graph builder system prompt for refinement in batch {message.batch_id}")
+            else:
+                self.logger.info(f"No optimized graph builder prompt available - using empty system prompt for refinement")
 
         if is_first_iteration:
             # Graph creation mode
@@ -2894,7 +2898,7 @@ class BackwardPassAgent(RoutedAgent):
                 "learned_prompt_hyperparameters_graph": current_state.get("learned_prompt_hyperparameters_graph", ""),
                 "learned_prompt_answer_generator_graph": current_state.get("learned_prompt_answer_generator_graph", ""),
                 "learned_prompt_graph_retrieval_planner": current_state.get("learned_prompt_graph_retrieval_planner", ""),
-                "learned_prompt_graph_refinement": current_state.get("learned_prompt_graph_refinement", ""),
+                "learned_prompt_graph_builder": current_state.get("learned_prompt_graph_builder", ""),
                 # Also store critiques and prompt templates for reference
                 "hyperparameters_graph_agent_critique": current_state.get("hyperparameters_graph_agent_critique", ""),
                 "graph_builder_agent_critique": current_state.get("graph_builder_agent_critique", ""),
@@ -2995,8 +2999,8 @@ class BackwardPassAgent(RoutedAgent):
         conv = conversations[0]
         eval_resp = evaluation_responses[0]
 
-        # Create the single sequence: previous prompt + answer + feedback
-        concatenated_data = f"Previous Answer Generation Prompt: {current_answer_prompt}\nGenerated Answer: {conv.get('generated_answer', '')}\nResponse Feedback: {eval_resp.get('evaluation_feedback', '')}"
+        # Create the single sequence: query + previous prompt + answer + feedback
+        concatenated_data = f"Question: {conv.get('question', '')}\nPrevious Answer Generation Prompt: {current_answer_prompt}\nGenerated Answer: {conv.get('generated_answer', '')}\nResponse Feedback: {eval_resp.get('evaluation_feedback', '')}"
 
         self.logger.info(f"Created answer generation critique sequence for iteration {current_repetition}")
 
@@ -3106,13 +3110,23 @@ class BackwardPassAgent(RoutedAgent):
             self.logger.warning("Missing retrieval plans or contexts for critique")
             return
 
-        # Create pairs (retrieval_plan, retrieved_context) with same indices
-        pairs = []
-        for i in range(min(len(retrieval_plans), len(retrieved_contexts))):
-            pair = f"Retrieval Plan: {retrieval_plans[i]}\nRetrieved Context: {retrieved_contexts[i]}"
-            pairs.append(pair)
+        # retrieval_plans is a list of reasoning strings from k iterations in the current repetition
+        # We want to show all moves in the complete plan, not just the first one
+        complete_retrieval_plan = "\n".join([f"Move {i+1}: {plan}" for i, plan in enumerate(retrieval_plans)])
 
-        concatenated_pairs = "\n\n".join(pairs)
+        # retrieved_contexts is a list of context entries, get the most recent one for this repetition
+        if retrieved_contexts:
+            latest_context_entry = retrieved_contexts[-1]  # Get the most recent context
+            if isinstance(latest_context_entry, dict):
+                retrieved_context_text = latest_context_entry.get("retrieved_context", str(latest_context_entry))
+            else:
+                retrieved_context_text = str(latest_context_entry)
+        else:
+            retrieved_context_text = "No retrieved context available"
+
+        # Create the pair showing the complete plan with all moves
+        pair = f"Retrieval Plan: {complete_retrieval_plan}\nRetrieved Context: {retrieved_context_text}"
+        concatenated_pairs = pair
 
         # Get retrieved_content_critique for the second variable
         retrieved_content_critique = current_state.get("retrieved_content_critique", "No critique available")
@@ -3232,9 +3246,13 @@ class BackwardPassAgent(RoutedAgent):
             optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
             optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
 
-            # Only update if not frozen (creation prompt is NEVER optimized - it's fixed)
-            # So we don't actually save this, but we generate it for logging purposes
-            self.logger.info("Graph creation prompt is fixed - not updating learned_prompt_graph_builder")
+            # Store the optimized graph builder prompt for use in graph refinement
+            is_frozen = self._is_prompt_frozen("graph_builder", current_state)
+            if not is_frozen:
+                current_state["learned_prompt_graph_builder"] = optimized_prompt
+                self.logger.info("Stored optimized graph builder prompt for use in refinement mode")
+            else:
+                self.logger.info("Graph builder prompt is frozen - not updating learned_prompt_graph_builder")
 
         else:
             # Subsequent iterations: optimize graph refinement prompt

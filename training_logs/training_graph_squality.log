@@ -1,448 +1,301 @@
-2025-09-28 04:13:26,788 - autogen_core.trace.dataset_agent - INFO - DatasetAgent initialized for squality (test)
-2025-09-28 04:13:26,788 - autogen_core.trace.dataset_agent - INFO - Loaded 52 documents with 260 total questions
-2025-09-28 04:13:26,788 - autogen_core.trace.dataset_agent - INFO - Generated 260 individual QA pairs for test-time training
-2025-09-28 04:13:26,788 - autogen_core.trace.dataset_agent - INFO - Repetitions per example: 5
-2025-09-28 04:13:26,788 - autogen_core.trace.dataset_agent - INFO - Received dataset processing request for squality (test)
-2025-09-28 04:13:26,791 - autogen_core.trace.dataset_agent - INFO - Starting test-time training for squality (test)
-2025-09-28 04:13:26,791 - autogen_core.trace.dataset_agent - INFO - Looking for unprocessed QA pairs. Current index: 0, Total pairs: 260
-2025-09-28 04:13:26,793 - autogen_core.trace.dataset_agent - INFO - Starting processing from QA pair 0
-2025-09-28 04:13:26,795 - autogen_core.trace.dataset_agent - INFO - Processing QA pair 1/260, iteration 1/5
-2025-09-28 04:13:26,797 - autogen_core.trace.dataset_agent - INFO - Document ID: 63521
-2025-09-28 04:13:26,797 - autogen_core.trace.dataset_agent - INFO - Question ID: 63521_q1
-2025-09-28 04:13:26,798 - autogen_core.trace.dataset_agent - INFO - Question: What is the plot of the story?
-2025-09-28 04:13:26,851 - autogen_core.trace.dataset_agent - INFO - Sending BatchStart message for QA pair 0
-2025-09-28 04:13:26,904 - autogen_core.trace.batch_orchestrator - INFO - BatchOrchestrator received BatchStart for batch 0
-2025-09-28 04:13:26,904 - autogen_core.trace.batch_orchestrator - INFO - Processing 1 QA pairs in batch 0 with 5 iterations each
-2025-09-28 04:13:26,904 - autogen_core.trace.batch_orchestrator - INFO - 
+2025-09-28 04:34:58,046 - autogen_core.trace.dataset_agent - INFO - DatasetAgent initialized for squality (test)
+2025-09-28 04:34:58,046 - autogen_core.trace.dataset_agent - INFO - Loaded 52 documents with 260 total questions
+2025-09-28 04:34:58,046 - autogen_core.trace.dataset_agent - INFO - Generated 260 individual QA pairs for test-time training
+2025-09-28 04:34:58,046 - autogen_core.trace.dataset_agent - INFO - Repetitions per example: 5
+2025-09-28 04:34:58,050 - autogen_core.trace.dataset_agent - INFO - Received dataset processing request for squality (test)
+2025-09-28 04:34:58,050 - autogen_core.trace.dataset_agent - INFO - Starting test-time training for squality (test)
+2025-09-28 04:34:58,050 - autogen_core.trace.dataset_agent - INFO - Looking for unprocessed QA pairs. Current index: 0, Total pairs: 260
+2025-09-28 04:34:58,050 - autogen_core.trace.dataset_agent - INFO - Starting processing from QA pair 0
+2025-09-28 04:34:58,050 - autogen_core.trace.dataset_agent - INFO - Processing QA pair 1/260, iteration 1/5
+2025-09-28 04:34:58,050 - autogen_core.trace.dataset_agent - INFO - Document ID: 63521
+2025-09-28 04:34:58,050 - autogen_core.trace.dataset_agent - INFO - Question ID: 63521_q1
+2025-09-28 04:34:58,050 - autogen_core.trace.dataset_agent - INFO - Question: What is the plot of the story?
+2025-09-28 04:34:58,053 - autogen_core.trace.dataset_agent - INFO - Sending BatchStart message for QA pair 0
+2025-09-28 04:34:58,073 - autogen_core.trace.batch_orchestrator - INFO - BatchOrchestrator received BatchStart for batch 0
+2025-09-28 04:34:58,077 - autogen_core.trace.batch_orchestrator - INFO - Processing 1 QA pairs in batch 0 with 5 iterations each
+2025-09-28 04:34:58,079 - autogen_core.trace.batch_orchestrator - INFO - 
 ============================================================
-2025-09-28 04:13:26,909 - autogen_core.trace.batch_orchestrator - INFO - STARTING QA PAIR: 63521_q1
-2025-09-28 04:13:26,911 - autogen_core.trace.batch_orchestrator - INFO - Question: What is the plot of the story?...
-2025-09-28 04:13:26,914 - autogen_core.trace.batch_orchestrator - INFO - Total iterations planned: 5
-2025-09-28 04:13:26,914 - autogen_core.trace.batch_orchestrator - INFO - ============================================================
-2025-09-28 04:13:26,914 - autogen_core.trace.batch_orchestrator - INFO - 
+2025-09-28 04:34:58,080 - autogen_core.trace.batch_orchestrator - INFO - STARTING QA PAIR: 63521_q1
+2025-09-28 04:34:58,080 - autogen_core.trace.batch_orchestrator - INFO - Question: What is the plot of the story?...
+2025-09-28 04:34:58,081 - autogen_core.trace.batch_orchestrator - INFO - Total iterations planned: 5
+2025-09-28 04:34:58,081 - autogen_core.trace.batch_orchestrator - INFO - ============================================================
+2025-09-28 04:34:58,081 - autogen_core.trace.batch_orchestrator - INFO - 
 --- QA Pair 63521_q1, Iteration 0/4 ---
-2025-09-28 04:13:26,918 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION DETECTED: New QA pair 63521_q1 - executing COMPLETE RESET
-2025-09-28 04:13:26,921 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION EVENT: complete_reset | QA: 63521_q1 | Iter: 0 | Details: {'transition_type': 'new_qa_pair', 'total_iterations': 5}
-2025-09-28 04:13:26,990 - autogen_core.trace.batch_orchestrator - INFO - Reset validation for complete reset: {'shared_state_reset': True, 'graph_data_handled': True, 'prompt_lifecycle_correct': True, 'processing_state_updated': True} | All passed: True
-2025-09-28 04:13:26,998 - autogen_core.trace.batch_orchestrator - INFO - Validation results for 63521_q1, iteration 0: {'qa_pair_tracking_valid': True, 'iteration_tracking_valid': True, 'shared_state_consistent': True, 'prompt_lifecycle_correct': True, 'graph_state_appropriate': True, 'data_isolation_maintained': True}
-2025-09-28 04:13:26,999 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION EVENT: iteration_start | QA: 63521_q1 | Iter: 0 | Details: {'validation_results': {'qa_pair_tracking_valid': True, 'iteration_tracking_valid': True, 'shared_state_consistent': True, 'prompt_lifecycle_correct': True, 'graph_state_appropriate': True, 'data_isolation_maintained': True}, 'processing_state': {'current_qa_pair_id': '63521_q1', 'current_iteration': 0, 'total_iterations': 5, 'qa_pair_start_time': '2025-09-28T04:13:26.946046', 'iteration_start_time': '2025-09-28T04:13:26.946046'}}
-2025-09-28 04:13:27,003 - autogen_core.trace.batch_orchestrator - INFO - Processing QA pair 63521_q1, iteration 0
-2025-09-28 04:13:27,004 - autogen_core.trace.batch_orchestrator - INFO - Step 1: Executing HyperparametersGraphAgent for 63521_q1
-2025-09-28 04:13:27,283 - autogen_core.trace.hyperparameters_graph - INFO - HyperparametersGraphAgent processing QA pair 63521_q1
-2025-09-28 04:13:27,285 - autogen_core.trace.hyperparameters_graph - INFO - First repetition for QA pair 63521_q1 - using empty system prompt
-2025-09-28 04:13:29,121 - autogen_core.trace.hyperparameters_graph - INFO - [HyperparametersGraph] LLM recommendation | chunk_size=256 | confidence=0.85 | reasoning=The provided text is relatively short and serves as an introduction to the story, setting the scene...
-2025-09-28 04:13:29,127 - autogen_core.trace.hyperparameters_graph - INFO - Returning HyperparametersGraphReady for QA pair 63521_q1
-2025-09-28 04:13:29,132 - autogen_core.trace.batch_orchestrator - INFO - Step 2: Executing GraphBuilderAgent for 63521_q1
-2025-09-28 04:13:29,246 - autogen_core.trace.graph_builder - INFO - GraphBuilderAgent processing batch 0 with chunk_size 256
-2025-09-28 04:13:29,246 - autogen_core.trace.graph_builder - INFO - Found document text in current_state['full_document_text']
-2025-09-28 04:13:29,246 - autogen_core.trace.graph_builder - INFO - Graph mode: Creation (iteration 0)
-2025-09-28 04:13:29,246 - autogen_core.trace.graph_builder - INFO - First repetition for batch 0 - using empty graph creation system prompt
-2025-09-28 04:13:29,250 - autogen_core.trace.graph_builder - INFO - Split corpus into 24 chunks for graph creation
-2025-09-28 04:13:29,250 - autogen_core.trace.graph_builder - INFO - Starting concurrent processing of 24 chunks
-2025-09-28 04:13:29,250 - autogen_core.trace.graph_builder - INFO - Processing chunk 1/24
-2025-09-28 04:13:29,250 - autogen_core.trace.graph_builder - INFO - Processing chunk 2/24
-2025-09-28 04:13:29,250 - autogen_core.trace.graph_builder - INFO - Processing chunk 3/24
-2025-09-28 04:13:29,250 - autogen_core.trace.graph_builder - INFO - Processing chunk 4/24
-2025-09-28 04:13:29,250 - autogen_core.trace.graph_builder - INFO - Processing chunk 5/24
-2025-09-28 04:13:29,250 - autogen_core.trace.graph_builder - INFO - Processing chunk 6/24
-2025-09-28 04:13:29,250 - autogen_core.trace.graph_builder - INFO - Processing chunk 7/24
-2025-09-28 04:13:29,255 - autogen_core.trace.graph_builder - INFO - Processing chunk 8/24
-2025-09-28 04:13:29,256 - autogen_core.trace.graph_builder - INFO - Processing chunk 9/24
-2025-09-28 04:13:29,256 - autogen_core.trace.graph_builder - INFO - Processing chunk 10/24
-2025-09-28 04:13:29,256 - autogen_core.trace.graph_builder - INFO - Processing chunk 11/24
-2025-09-28 04:13:29,256 - autogen_core.trace.graph_builder - INFO - Processing chunk 12/24
-2025-09-28 04:13:29,256 - autogen_core.trace.graph_builder - INFO - Processing chunk 13/24
-2025-09-28 04:13:29,256 - autogen_core.trace.graph_builder - INFO - Processing chunk 14/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 15/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 16/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 17/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 18/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 19/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 20/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 21/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 22/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 23/24
-2025-09-28 04:13:29,261 - autogen_core.trace.graph_builder - INFO - Processing chunk 24/24
-2025-09-28 04:13:31,770 - autogen_core.trace.graph_builder - INFO - Completed chunk 19/24
-2025-09-28 04:13:32,369 - autogen_core.trace.graph_builder - INFO - Completed chunk 24/24
-2025-09-28 04:13:32,465 - autogen_core.trace.graph_builder - INFO - Completed chunk 10/24
-2025-09-28 04:13:32,540 - autogen_core.trace.graph_builder - INFO - Completed chunk 5/24
-2025-09-28 04:13:32,578 - autogen_core.trace.graph_builder - INFO - Completed chunk 18/24
-2025-09-28 04:13:32,654 - autogen_core.trace.graph_builder - INFO - Completed chunk 22/24
-2025-09-28 04:13:32,749 - autogen_core.trace.graph_builder - INFO - Completed chunk 20/24
-2025-09-28 04:13:32,812 - autogen_core.trace.graph_builder - INFO - Completed chunk 21/24
-2025-09-28 04:13:32,895 - autogen_core.trace.graph_builder - INFO - Completed chunk 6/24
-2025-09-28 04:13:33,088 - autogen_core.trace.graph_builder - INFO - Completed chunk 3/24
-2025-09-28 04:13:33,090 - autogen_core.trace.graph_builder - INFO - Completed chunk 2/24
-2025-09-28 04:13:33,092 - autogen_core.trace.graph_builder - INFO - Completed chunk 9/24
-2025-09-28 04:13:33,129 - autogen_core.trace.graph_builder - INFO - Completed chunk 1/24
-2025-09-28 04:13:33,266 - autogen_core.trace.graph_builder - INFO - Completed chunk 16/24
-2025-09-28 04:13:33,436 - autogen_core.trace.graph_builder - INFO - Completed chunk 23/24
-2025-09-28 04:13:33,508 - autogen_core.trace.graph_builder - INFO - Completed chunk 17/24
-2025-09-28 04:13:33,510 - autogen_core.trace.graph_builder - INFO - Completed chunk 12/24
-2025-09-28 04:13:33,546 - autogen_core.trace.graph_builder - INFO - Completed chunk 14/24
-2025-09-28 04:13:33,718 - autogen_core.trace.graph_builder - INFO - Completed chunk 15/24
-2025-09-28 04:13:34,180 - autogen_core.trace.graph_builder - INFO - Completed chunk 7/24
-2025-09-28 04:13:34,191 - autogen_core.trace.graph_builder - INFO - Completed chunk 11/24
-2025-09-28 04:13:34,788 - autogen_core.trace.graph_builder - INFO - Completed chunk 4/24
-2025-09-28 04:13:35,333 - autogen_core.trace.graph_builder - INFO - Completed chunk 13/24
-2025-09-28 04:13:35,958 - autogen_core.trace.graph_builder - INFO - Completed chunk 8/24
-2025-09-28 04:13:35,958 - autogen_core.trace.graph_builder - INFO - Completed concurrent processing of all 24 chunks
-2025-09-28 04:13:35,958 - autogen_core.trace.graph_builder - INFO - Starting entity resolution on 188 entities
-2025-09-28 04:13:36,026 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,027 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,027 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,027 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,027 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,027 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,027 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,027 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,027 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,032 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,032 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,033 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,033 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,033 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,033 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,036 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,037 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,037 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,037 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,037 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,037 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,037 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:13:36,046 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
-2025-09-28 04:13:36,047 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
-2025-09-28 04:13:36,047 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:13:36,053 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasad' (similarity: 0.933)
-2025-09-28 04:13:36,053 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:13:36,053 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:13:36,053 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:13:36,053 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:13:36,053 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:13:36,061 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:13:36,064 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Golden skinned girl' and 'golden-skinned girl' (similarity: 0.947)
-2025-09-28 04:13:36,064 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
-2025-09-28 04:13:36,074 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
-2025-09-28 04:13:36,074 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
-2025-09-28 04:13:36,077 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
-2025-09-28 04:13:36,077 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
-2025-09-28 04:13:36,080 - autogen_core.trace.graph_builder - INFO - Merging entities: 'New York' and 'New York' (similarity: 1.000)
-2025-09-28 04:13:36,085 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,092 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,095 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,096 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,096 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,096 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,106 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,106 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,109 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,113 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,113 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,113 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
-2025-09-28 04:13:36,113 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Grath' and 'Grath' (similarity: 1.000)
-2025-09-28 04:13:36,116 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Grath' and 'Grath' (similarity: 1.000)
-2025-09-28 04:13:36,116 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Zuran' and 'Zuran' (similarity: 1.000)
-2025-09-28 04:13:36,125 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Konto' and 'Konto' (similarity: 1.000)
-2025-09-28 04:13:36,125 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Konto' and 'Konto' (similarity: 1.000)
-2025-09-28 04:13:36,127 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:13:36,129 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:13:36,129 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:13:36,129 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:13:36,129 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:13:36,129 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,129 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty One' (similarity: 1.000)
-2025-09-28 04:13:36,129 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,137 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty One' (similarity: 1.000)
-2025-09-28 04:13:36,137 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,137 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,137 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,140 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,140 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,144 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,144 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,144 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:13:36,148 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Temple of the Skull' and 'Temple of the Skull' (similarity: 1.000)
-2025-09-28 04:13:36,158 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Lake of Uzdon' and 'Lake of Uzdon' (similarity: 1.000)
-2025-09-28 04:13:36,172 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Temple of Uzdon' and 'Temple of Uzdon' (similarity: 1.000)
-2025-09-28 04:13:36,180 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Ud' and 'Ud' (similarity: 1.000)
-2025-09-28 04:13:36,213 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Stephen Dietrich' and 'Stephen Dietrich' (similarity: 1.000)
-2025-09-28 04:13:36,264 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Earth' and 'Earth' (similarity: 1.000)
-2025-09-28 04:13:36,264 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
-2025-09-28 04:13:36,264 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
-2025-09-28 04:13:36,264 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
-2025-09-28 04:13:36,264 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
-2025-09-28 04:13:36,264 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
-2025-09-28 04:13:36,277 - autogen_core.trace.graph_builder - INFO - Merging entities: 'island' and 'island' (similarity: 1.000)
-2025-09-28 04:13:36,285 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Skull' and 'Skull' (similarity: 1.000)
-2025-09-28 04:13:36,291 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'priests' (similarity: 1.000)
-2025-09-28 04:13:36,291 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'priests' (similarity: 1.000)
-2025-09-28 04:13:36,296 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'priest' (similarity: 0.957)
-2025-09-28 04:13:36,298 - autogen_core.trace.graph_builder - INFO - Merging entities: 'slave' and 'slaves' (similarity: 0.933)
-2025-09-28 04:13:36,298 - autogen_core.trace.graph_builder - INFO - Merging entities: 'slave' and 'slaves' (similarity: 0.933)
-2025-09-28 04:13:36,350 - autogen_core.trace.graph_builder - INFO - Merging entities: 'cavern' and 'cavern' (similarity: 1.000)
-2025-09-28 04:13:36,376 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Captain Dietrich' and 'Captain Dietrich' (similarity: 1.000)
-2025-09-28 04:13:36,382 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Doctor Von Mark' and 'Doctor Von Mark' (similarity: 1.000)
-2025-09-28 04:13:36,428 - autogen_core.trace.graph_builder - INFO - Saved graph to graphs\squality_test_batch_0_graph.json
-2025-09-28 04:13:37,526 - autogen_core.trace.graph_builder - INFO - First iteration: Clearing existing graph and loading new one
-2025-09-28 04:13:37,597 - autogen_core.trace.graph_builder - INFO - Graph cleared successfully: Graph cleared successfully. Remaining nodes: 0
-2025-09-28 04:13:37,724 - autogen_core.trace.graph_builder - INFO - Successfully loaded graph squality_test_batch_0_graph.json into Memgraph server
-2025-09-28 04:13:37,784 - autogen_core.trace.graph_builder - INFO - Returning GraphReady for batch 0
-2025-09-28 04:13:37,789 - autogen_core.trace.batch_orchestrator - INFO - Step 3: Executing GraphRetrievalPlannerAgent for 63521_q1
-2025-09-28 04:13:37,876 - autogen_core.trace.graph_retrieval_planner - INFO - GraphRetrievalPlannerAgent processing batch 0 for query: What is the plot of the story?
-2025-09-28 04:13:37,879 - autogen_core.trace.graph_retrieval_planner - INFO - Clearing existing graph from Memgraph before loading correct graph
-2025-09-28 04:13:37,921 - autogen_core.trace.graph_retrieval_planner - INFO - Graph cleared successfully: Graph cleared successfully. Remaining nodes: 0
-2025-09-28 04:13:37,973 - autogen_core.trace.graph_retrieval_planner - INFO - Successfully loaded correct graph squality_test_batch_0_graph.json into Memgraph for retrieval
-2025-09-28 04:13:37,973 - autogen_core.trace.graph_retrieval_planner - INFO - First repetition for batch 0 - using empty retrieval planner system prompt
-2025-09-28 04:13:37,973 - autogen_core.trace.graph_retrieval_planner - INFO - Retrieval iteration 1/3
-2025-09-28 04:13:38,947 - autogen_core.trace.graph_retrieval_planner - INFO - Completed iteration 1, context length: 2557
-2025-09-28 04:13:38,952 - autogen_core.trace.graph_retrieval_planner - INFO - Retrieval iteration 2/3
-2025-09-28 04:13:39,852 - autogen_core.trace.graph_retrieval_planner - INFO - Completed iteration 2, context length: 5190
-2025-09-28 04:13:39,853 - autogen_core.trace.graph_retrieval_planner - INFO - Retrieval iteration 3/3
-2025-09-28 04:13:40,570 - autogen_core.trace.graph_retrieval_planner - INFO - Completed iteration 3, context length: 7823
-2025-09-28 04:13:40,576 - autogen_core.trace.graph_retrieval_planner - INFO - Returning GraphRetrievalReady for batch 0
-2025-09-28 04:13:40,578 - autogen_core.trace.batch_orchestrator - INFO - Step 4: Executing AnswerGeneratorAgent for 63521_q1
-2025-09-28 04:13:40,597 - autogen_core.trace.answer_generator - INFO - AnswerGeneratorAgent processing QA pair 63521_q1
-2025-09-28 04:13:40,641 - autogen_core.trace.answer_generator - INFO - First repetition for QA pair 63521_q1 - using empty answer generator system prompt
-2025-09-28 04:13:40,949 - autogen_core.trace.answer_generator - INFO - [QA: 63521_q1] Generated answer | Content: The provided information does not contain the plot of the story. It only details relationships...
-2025-09-28 04:13:40,958 - autogen_core.trace.answer_generator - INFO - Returning AnswerGenerationReady for QA pair 63521_q1
-2025-09-28 04:13:40,959 - autogen_core.trace.batch_orchestrator - INFO - Step 5: Executing ResponseEvaluatorAgent for 63521_q1
-2025-09-28 04:13:40,988 - autogen_core.trace.response_evaluator - INFO - ResponseEvaluatorAgent evaluating QA pair 63521_q1
-2025-09-28 04:13:45,055 - autogen_core.trace.response_evaluator - INFO - [QA: 63521_q1] Evaluation completed | Content: ## Evaluation of the RAG Response:
+2025-09-28 04:34:58,082 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION DETECTED: New QA pair 63521_q1 - executing COMPLETE RESET
+2025-09-28 04:34:58,082 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION EVENT: complete_reset | QA: 63521_q1 | Iter: 0 | Details: {'transition_type': 'new_qa_pair', 'total_iterations': 5}
+2025-09-28 04:34:58,114 - autogen_core.trace.batch_orchestrator - INFO - Reset validation for complete reset: {'shared_state_reset': True, 'graph_data_handled': True, 'prompt_lifecycle_correct': True, 'processing_state_updated': True} | All passed: True
+2025-09-28 04:34:58,114 - autogen_core.trace.batch_orchestrator - INFO - Validation results for 63521_q1, iteration 0: {'qa_pair_tracking_valid': True, 'iteration_tracking_valid': True, 'shared_state_consistent': True, 'prompt_lifecycle_correct': True, 'graph_state_appropriate': True, 'data_isolation_maintained': True}
+2025-09-28 04:34:58,114 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION EVENT: iteration_start | QA: 63521_q1 | Iter: 0 | Details: {'validation_results': {'qa_pair_tracking_valid': True, 'iteration_tracking_valid': True, 'shared_state_consistent': True, 'prompt_lifecycle_correct': True, 'graph_state_appropriate': True, 'data_isolation_maintained': True}, 'processing_state': {'current_qa_pair_id': '63521_q1', 'current_iteration': 0, 'total_iterations': 5, 'qa_pair_start_time': '2025-09-28T04:34:58.101736', 'iteration_start_time': '2025-09-28T04:34:58.101736'}}
+2025-09-28 04:34:58,121 - autogen_core.trace.batch_orchestrator - INFO - Processing QA pair 63521_q1, iteration 0
+2025-09-28 04:34:58,122 - autogen_core.trace.batch_orchestrator - INFO - Step 1: Executing HyperparametersGraphAgent for 63521_q1
+2025-09-28 04:34:58,194 - autogen_core.trace.hyperparameters_graph - INFO - HyperparametersGraphAgent processing QA pair 63521_q1
+2025-09-28 04:34:58,196 - autogen_core.trace.hyperparameters_graph - INFO - First repetition for QA pair 63521_q1 - using empty system prompt
+2025-09-28 04:34:59,540 - autogen_core.trace.hyperparameters_graph - INFO - [HyperparametersGraph] LLM recommendation | chunk_size=150 | confidence=0.85 | reasoning=The provided text is relatively short and doesn't contain complex narrative structures that would...
+2025-09-28 04:34:59,544 - autogen_core.trace.hyperparameters_graph - INFO - Returning HyperparametersGraphReady for QA pair 63521_q1
+2025-09-28 04:34:59,545 - autogen_core.trace.batch_orchestrator - INFO - Step 2: Executing GraphBuilderAgent for 63521_q1
+2025-09-28 04:34:59,589 - autogen_core.trace.graph_builder - INFO - GraphBuilderAgent processing batch 0 with chunk_size 150
+2025-09-28 04:34:59,589 - autogen_core.trace.graph_builder - INFO - Found document text in current_state['full_document_text']
+2025-09-28 04:34:59,589 - autogen_core.trace.graph_builder - INFO - Graph mode: Creation (iteration 0)
+2025-09-28 04:34:59,593 - autogen_core.trace.graph_builder - INFO - First repetition for batch 0 - using empty graph creation system prompt
+2025-09-28 04:34:59,594 - autogen_core.trace.graph_builder - INFO - Split corpus into 40 chunks for graph creation
+2025-09-28 04:34:59,594 - autogen_core.trace.graph_builder - INFO - Starting concurrent processing of 40 chunks
+2025-09-28 04:34:59,596 - autogen_core.trace.graph_builder - INFO - Processing chunk 1/40
+2025-09-28 04:34:59,597 - autogen_core.trace.graph_builder - INFO - Processing chunk 2/40
+2025-09-28 04:34:59,597 - autogen_core.trace.graph_builder - INFO - Processing chunk 3/40
+2025-09-28 04:34:59,597 - autogen_core.trace.graph_builder - INFO - Processing chunk 4/40
+2025-09-28 04:34:59,598 - autogen_core.trace.graph_builder - INFO - Processing chunk 5/40
+2025-09-28 04:34:59,600 - autogen_core.trace.graph_builder - INFO - Processing chunk 6/40
+2025-09-28 04:34:59,600 - autogen_core.trace.graph_builder - INFO - Processing chunk 7/40
+2025-09-28 04:34:59,600 - autogen_core.trace.graph_builder - INFO - Processing chunk 8/40
+2025-09-28 04:34:59,611 - autogen_core.trace.graph_builder - INFO - Processing chunk 9/40
+2025-09-28 04:34:59,612 - autogen_core.trace.graph_builder - INFO - Processing chunk 10/40
+2025-09-28 04:34:59,617 - autogen_core.trace.graph_builder - INFO - Processing chunk 11/40
+2025-09-28 04:34:59,618 - autogen_core.trace.graph_builder - INFO - Processing chunk 12/40
+2025-09-28 04:34:59,618 - autogen_core.trace.graph_builder - INFO - Processing chunk 13/40
+2025-09-28 04:34:59,619 - autogen_core.trace.graph_builder - INFO - Processing chunk 14/40
+2025-09-28 04:34:59,619 - autogen_core.trace.graph_builder - INFO - Processing chunk 15/40
+2025-09-28 04:34:59,620 - autogen_core.trace.graph_builder - INFO - Processing chunk 16/40
+2025-09-28 04:34:59,621 - autogen_core.trace.graph_builder - INFO - Processing chunk 17/40
+2025-09-28 04:34:59,621 - autogen_core.trace.graph_builder - INFO - Processing chunk 18/40
+2025-09-28 04:34:59,622 - autogen_core.trace.graph_builder - INFO - Processing chunk 19/40
+2025-09-28 04:34:59,624 - autogen_core.trace.graph_builder - INFO - Processing chunk 20/40
+2025-09-28 04:34:59,625 - autogen_core.trace.graph_builder - INFO - Processing chunk 21/40
+2025-09-28 04:34:59,625 - autogen_core.trace.graph_builder - INFO - Processing chunk 22/40
+2025-09-28 04:34:59,625 - autogen_core.trace.graph_builder - INFO - Processing chunk 23/40
+2025-09-28 04:34:59,628 - autogen_core.trace.graph_builder - INFO - Processing chunk 24/40
+2025-09-28 04:34:59,632 - autogen_core.trace.graph_builder - INFO - Processing chunk 25/40
+2025-09-28 04:34:59,633 - autogen_core.trace.graph_builder - INFO - Processing chunk 26/40
+2025-09-28 04:34:59,634 - autogen_core.trace.graph_builder - INFO - Processing chunk 27/40
+2025-09-28 04:34:59,634 - autogen_core.trace.graph_builder - INFO - Processing chunk 28/40
+2025-09-28 04:34:59,634 - autogen_core.trace.graph_builder - INFO - Processing chunk 29/40
+2025-09-28 04:34:59,635 - autogen_core.trace.graph_builder - INFO - Processing chunk 30/40
+2025-09-28 04:34:59,636 - autogen_core.trace.graph_builder - INFO - Processing chunk 31/40
+2025-09-28 04:34:59,636 - autogen_core.trace.graph_builder - INFO - Processing chunk 32/40
+2025-09-28 04:34:59,639 - autogen_core.trace.graph_builder - INFO - Processing chunk 33/40
+2025-09-28 04:34:59,639 - autogen_core.trace.graph_builder - INFO - Processing chunk 34/40
+2025-09-28 04:34:59,641 - autogen_core.trace.graph_builder - INFO - Processing chunk 35/40
+2025-09-28 04:34:59,641 - autogen_core.trace.graph_builder - INFO - Processing chunk 36/40
+2025-09-28 04:34:59,641 - autogen_core.trace.graph_builder - INFO - Processing chunk 37/40
+2025-09-28 04:34:59,641 - autogen_core.trace.graph_builder - INFO - Processing chunk 38/40
+2025-09-28 04:34:59,643 - autogen_core.trace.graph_builder - INFO - Processing chunk 39/40
+2025-09-28 04:34:59,643 - autogen_core.trace.graph_builder - INFO - Processing chunk 40/40
+2025-09-28 04:35:01,994 - autogen_core.trace.graph_builder - INFO - Completed chunk 35/40
+2025-09-28 04:35:02,044 - autogen_core.trace.graph_builder - INFO - Completed chunk 28/40
+2025-09-28 04:35:02,094 - autogen_core.trace.graph_builder - INFO - Completed chunk 17/40
+2025-09-28 04:35:02,132 - autogen_core.trace.graph_builder - INFO - Completed chunk 24/40
+2025-09-28 04:35:02,240 - autogen_core.trace.graph_builder - INFO - Completed chunk 8/40
+2025-09-28 04:35:02,261 - autogen_core.trace.graph_builder - INFO - Completed chunk 16/40
+2025-09-28 04:35:02,269 - autogen_core.trace.graph_builder - INFO - Completed chunk 31/40
+2025-09-28 04:35:02,330 - autogen_core.trace.graph_builder - INFO - Completed chunk 30/40
+2025-09-28 04:35:02,434 - autogen_core.trace.graph_builder - INFO - Completed chunk 33/40
+2025-09-28 04:35:02,439 - autogen_core.trace.graph_builder - INFO - Completed chunk 38/40
+2025-09-28 04:35:02,480 - autogen_core.trace.graph_builder - INFO - Completed chunk 40/40
+2025-09-28 04:35:02,570 - autogen_core.trace.graph_builder - INFO - Completed chunk 15/40
+2025-09-28 04:35:02,710 - autogen_core.trace.graph_builder - INFO - Completed chunk 10/40
+2025-09-28 04:35:02,811 - autogen_core.trace.graph_builder - INFO - Completed chunk 7/40
+2025-09-28 04:35:02,813 - autogen_core.trace.graph_builder - INFO - Completed chunk 2/40
+2025-09-28 04:35:02,813 - autogen_core.trace.graph_builder - INFO - Completed chunk 9/40
+2025-09-28 04:35:02,813 - autogen_core.trace.graph_builder - INFO - Completed chunk 18/40
+2025-09-28 04:35:02,813 - autogen_core.trace.graph_builder - INFO - Completed chunk 25/40
+2025-09-28 04:35:02,920 - autogen_core.trace.graph_builder - INFO - Completed chunk 5/40
+2025-09-28 04:35:02,963 - autogen_core.trace.graph_builder - INFO - Completed chunk 6/40
+2025-09-28 04:35:03,032 - autogen_core.trace.graph_builder - INFO - Completed chunk 11/40
+2025-09-28 04:35:03,229 - autogen_core.trace.graph_builder - INFO - Completed chunk 36/40
+2025-09-28 04:35:03,287 - autogen_core.trace.graph_builder - INFO - Completed chunk 4/40
+2025-09-28 04:35:03,302 - autogen_core.trace.graph_builder - INFO - Completed chunk 1/40
+2025-09-28 04:35:03,358 - autogen_core.trace.graph_builder - INFO - Completed chunk 37/40
+2025-09-28 04:35:03,481 - autogen_core.trace.graph_builder - INFO - Completed chunk 32/40
+2025-09-28 04:35:03,533 - autogen_core.trace.graph_builder - INFO - Completed chunk 29/40
+2025-09-28 04:35:03,533 - autogen_core.trace.graph_builder - INFO - Completed chunk 20/40
+2025-09-28 04:35:03,596 - autogen_core.trace.graph_builder - INFO - Completed chunk 39/40
+2025-09-28 04:35:03,637 - autogen_core.trace.graph_builder - INFO - Completed chunk 13/40
+2025-09-28 04:35:03,648 - autogen_core.trace.graph_builder - INFO - Completed chunk 12/40
+2025-09-28 04:35:03,849 - autogen_core.trace.graph_builder - INFO - Completed chunk 21/40
+2025-09-28 04:35:03,857 - autogen_core.trace.graph_builder - INFO - Completed chunk 34/40
+2025-09-28 04:35:03,978 - autogen_core.trace.graph_builder - INFO - Completed chunk 3/40
+2025-09-28 04:35:04,078 - autogen_core.trace.graph_builder - INFO - Completed chunk 26/40
+2025-09-28 04:35:04,328 - autogen_core.trace.graph_builder - INFO - Completed chunk 22/40
+2025-09-28 04:35:04,339 - autogen_core.trace.graph_builder - INFO - Completed chunk 27/40
+2025-09-28 04:35:04,479 - autogen_core.trace.graph_builder - INFO - Completed chunk 19/40
+2025-09-28 04:35:04,744 - autogen_core.trace.graph_builder - INFO - Completed chunk 14/40
+2025-09-28 04:35:05,862 - autogen_core.trace.graph_builder - INFO - Completed chunk 23/40
+2025-09-28 04:35:05,862 - autogen_core.trace.graph_builder - INFO - Completed concurrent processing of all 40 chunks
+2025-09-28 04:35:05,862 - autogen_core.trace.graph_builder - INFO - Starting entity resolution on 283 entities
+2025-09-28 04:35:05,929 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,929 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,930 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,930 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,931 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,931 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,931 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,932 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,932 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,932 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,932 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,933 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,933 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,934 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,934 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,935 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,935 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,935 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,936 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,937 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,937 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,939 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,939 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,941 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,941 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,941 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,941 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,941 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,941 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,941 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,944 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,944 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,944 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,945 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,945 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,946 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
+2025-09-28 04:35:05,951 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
+2025-09-28 04:35:05,951 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
+2025-09-28 04:35:05,951 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
+2025-09-28 04:35:05,954 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
+2025-09-28 04:35:05,972 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
+2025-09-28 04:35:05,972 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasad' (similarity: 0.933)
+2025-09-28 04:35:05,972 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
+2025-09-28 04:35:05,972 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
+2025-09-28 04:35:05,972 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
+2025-09-28 04:35:05,978 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
+2025-09-28 04:35:05,980 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
+2025-09-28 04:35:05,983 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
+2025-09-28 04:35:05,983 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
+2025-09-28 04:35:05,983 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
+2025-09-28 04:35:05,983 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
+2025-09-28 04:35:05,983 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
+2025-09-28 04:35:05,987 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
+2025-09-28 04:35:05,987 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
+2025-09-28 04:35:05,987 - autogen_core.trace.graph_builder - INFO - Merging entities: 'golden skinned girl' and 'golden-skinned girl' (similarity: 0.947)
+2025-09-28 04:35:06,034 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,034 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,034 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,034 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,048 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,048 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,050 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,050 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,050 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,053 - autogen_core.trace.graph_builder - INFO - Merging entities: 'girl' and 'girl' (similarity: 1.000)
+2025-09-28 04:35:06,086 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,086 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,086 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,086 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,086 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,086 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
+2025-09-28 04:35:06,086 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Grath' and 'Grath' (similarity: 1.000)
+2025-09-28 04:35:06,094 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Grath' and 'Grath' (similarity: 1.000)
+2025-09-28 04:35:06,096 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Grath' and 'Grath' (similarity: 1.000)
+2025-09-28 04:35:06,096 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Zurans' and 'Zuran' (similarity: 0.933)
+2025-09-28 04:35:06,096 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Zurans' and 'Zuran' (similarity: 0.933)
+2025-09-28 04:35:06,107 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Konto' and 'Konto' (similarity: 1.000)
+2025-09-28 04:35:06,111 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
+2025-09-28 04:35:06,111 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
+2025-09-28 04:35:06,112 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
+2025-09-28 04:35:06,113 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
+2025-09-28 04:35:06,113 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
+2025-09-28 04:35:06,113 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty One' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty One' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,117 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Temple of the Skull' and 'Temple of the Skull' (similarity: 1.000)
+2025-09-28 04:35:06,169 - autogen_core.trace.graph_builder - INFO - Merging entities: 'the girl' and 'the girl' (similarity: 1.000)
+2025-09-28 04:35:06,180 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Lake of Uzdon' and 'Lake of Uzdon' (similarity: 1.000)
+2025-09-28 04:35:06,190 - autogen_core.trace.graph_builder - INFO - Merging entities: 'The Misty One' and 'The Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,190 - autogen_core.trace.graph_builder - INFO - Merging entities: 'The Misty One' and 'the Misty Ones' (similarity: 1.000)
+2025-09-28 04:35:06,203 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Temple of Uzdon' and 'Temple of Uzdon' (similarity: 1.000)
+2025-09-28 04:35:06,203 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Ud' and 'Ud' (similarity: 1.000)
+2025-09-28 04:35:06,203 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Ud' and 'Ud' (similarity: 1.000)
+2025-09-28 04:35:06,283 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Stephen Dietrich' and 'Stephen Dietrich' (similarity: 1.000)
+2025-09-28 04:35:06,328 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Earth' and 'Earth' (similarity: 1.000)
+2025-09-28 04:35:06,366 - autogen_core.trace.graph_builder - INFO - Merging entities: 'wall' and 'wall' (similarity: 1.000)
+2025-09-28 04:35:06,380 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
+2025-09-28 04:35:06,380 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
+2025-09-28 04:35:06,380 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
+2025-09-28 04:35:06,380 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
+2025-09-28 04:35:06,380 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
+2025-09-28 04:35:06,380 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
+2025-09-28 04:35:06,394 - autogen_core.trace.graph_builder - INFO - Merging entities: 'the island' and 'the island' (similarity: 1.000)
+2025-09-28 04:35:06,397 - autogen_core.trace.graph_builder - INFO - Merging entities: 'the island' and 'the island' (similarity: 1.000)
+2025-09-28 04:35:06,428 - autogen_core.trace.graph_builder - INFO - Merging entities: 'temple' and 'temple' (similarity: 1.000)
+2025-09-28 04:35:06,429 - autogen_core.trace.graph_builder - INFO - Merging entities: 'temple' and 'Temple' (similarity: 1.000)
+2025-09-28 04:35:06,429 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'priests' (similarity: 1.000)
+2025-09-28 04:35:06,429 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'priest' (similarity: 0.957)
+2025-09-28 04:35:06,429 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'Priest' (similarity: 0.957)
+2025-09-28 04:35:06,429 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'Priest' (similarity: 0.957)
+2025-09-28 04:35:06,429 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'priest' (similarity: 0.957)
+2025-09-28 04:35:06,429 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'Priests' (similarity: 1.000)
+2025-09-28 04:35:06,548 - autogen_core.trace.graph_builder - INFO - Merging entities: 'sword' and 'sword' (similarity: 1.000)
+2025-09-28 04:35:06,548 - autogen_core.trace.graph_builder - INFO - Merging entities: 'sword' and 'sword' (similarity: 1.000)
+2025-09-28 04:35:06,556 - autogen_core.trace.graph_builder - INFO - Merging entities: 'door' and 'door' (similarity: 1.000)
+2025-09-28 04:35:06,583 - autogen_core.trace.graph_builder - INFO - Merging entities: 'cavern' and 'Cavern' (similarity: 1.000)
+2025-09-28 04:35:06,610 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Captain Dietrich' and 'Captain Dietrich' (similarity: 1.000)
+2025-09-28 04:35:06,611 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Captain Dietrich' and 'Captain Dietrich' (similarity: 1.000)
+2025-09-28 04:35:06,611 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Doctor Von Mark' and 'Doctor Von Mark' (similarity: 1.000)
+2025-09-28 04:35:06,638 - autogen_core.trace.graph_builder - INFO - Saved graph to graphs\squality_test_batch_0_graph.json
+2025-09-28 04:35:07,408 - autogen_core.trace.graph_builder - INFO - First iteration: Clearing existing graph and loading new one
+2025-09-28 04:35:07,434 - autogen_core.trace.graph_builder - INFO - Graph cleared successfully: Graph cleared successfully. Remaining nodes: 0
+2025-09-28 04:35:07,486 - autogen_core.trace.graph_builder - INFO - Successfully loaded graph squality_test_batch_0_graph.json into Memgraph server
+2025-09-28 04:35:07,518 - autogen_core.trace.graph_builder - INFO - Returning GraphReady for batch 0
+2025-09-28 04:35:07,518 - autogen_core.trace.batch_orchestrator - INFO - Step 3: Executing GraphRetrievalPlannerAgent for 63521_q1
+2025-09-28 04:35:07,552 - autogen_core.trace.graph_retrieval_planner - INFO - GraphRetrievalPlannerAgent processing batch 0 for query: What is the plot of the story?
+2025-09-28 04:35:07,558 - autogen_core.trace.graph_retrieval_planner - INFO - Clearing existing graph from Memgraph before loading correct graph
+2025-09-28 04:35:07,596 - autogen_core.trace.graph_retrieval_planner - INFO - Graph cleared successfully: Graph cleared successfully. Remaining nodes: 0
+2025-09-28 04:35:07,637 - autogen_core.trace.graph_retrieval_planner - INFO - Successfully loaded correct graph squality_test_batch_0_graph.json into Memgraph for retrieval
+2025-09-28 04:35:07,637 - autogen_core.trace.graph_retrieval_planner - INFO - First repetition for batch 0 - using empty retrieval planner system prompt
+2025-09-28 04:35:07,637 - autogen_core.trace.graph_retrieval_planner - INFO - Retrieval iteration 1/3
+2025-09-28 04:35:08,497 - autogen_core.trace.graph_retrieval_planner - INFO - Completed iteration 1, context length: 3359
+2025-09-28 04:35:08,497 - autogen_core.trace.graph_retrieval_planner - INFO - Retrieval iteration 2/3
+2025-09-28 04:35:09,446 - autogen_core.trace.graph_retrieval_planner - INFO - Completed iteration 2, context length: 6718
+2025-09-28 04:35:09,446 - autogen_core.trace.graph_retrieval_planner - INFO - Retrieval iteration 3/3
+2025-09-28 04:35:10,242 - autogen_core.trace.graph_retrieval_planner - INFO - Completed iteration 3, context length: 10077
+2025-09-28 04:35:10,247 - autogen_core.trace.graph_retrieval_planner - INFO - Returning GraphRetrievalReady for batch 0
+2025-09-28 04:35:10,247 - autogen_core.trace.batch_orchestrator - INFO - Step 4: Executing AnswerGeneratorAgent for 63521_q1
+2025-09-28 04:35:10,262 - autogen_core.trace.answer_generator - INFO - AnswerGeneratorAgent processing QA pair 63521_q1
+2025-09-28 04:35:10,273 - autogen_core.trace.answer_generator - INFO - First repetition for QA pair 63521_q1 - using empty answer generator system prompt
+2025-09-28 04:35:10,931 - autogen_core.trace.answer_generator - INFO - [QA: 63521_q1] Generated answer | Content: The provided information does not contain details about the plot of the story. It only lists the...
+2025-09-28 04:35:10,939 - autogen_core.trace.answer_generator - INFO - Returning AnswerGenerationReady for QA pair 63521_q1
+2025-09-28 04:35:10,939 - autogen_core.trace.batch_orchestrator - INFO - Step 5: Executing ResponseEvaluatorAgent for 63521_q1
+2025-09-28 04:35:10,947 - autogen_core.trace.response_evaluator - INFO - ResponseEvaluatorAgent evaluating QA pair 63521_q1
+2025-09-28 04:35:14,112 - autogen_core.trace.response_evaluator - INFO - [QA: 63521_q1] Evaluation completed | Content: **Evaluation of the Response:**
 
-**Query:** "What is the plot of the story?"
-**Response:** "The...
-2025-09-28 04:13:45,108 - autogen_core.trace.response_evaluator - INFO - Returning ResponseEvaluationReady for QA pair 63521_q1
-2025-09-28 04:13:45,114 - autogen_core.trace.batch_orchestrator - INFO - Step 6: Executing BackwardPassAgent for 63521_q1
-2025-09-28 04:13:45,153 - autogen_core.trace.backward_pass - INFO - BackwardPassAgent processing backward pass for batch 0, repetition 0
-2025-09-28 04:13:45,210 - autogen_core.trace.backward_pass - INFO - Generating answer generation critique
-2025-09-28 04:13:45,212 - autogen_core.trace.backward_pass - INFO - Found 1 conversations and 1 evaluations for iteration 0
-2025-09-28 04:13:45,212 - autogen_core.trace.backward_pass - INFO - Created answer generation critique sequence for iteration 0
-2025-09-28 04:13:49,827 - autogen_core.trace.backward_pass - INFO - [ANSWER_GENERATOR_GRAPH] Critique generated | Status: UPDATED | Preview: Here's a critique of the previous answer generation prompt and suggestions for improvement, focusing on the identified...
-2025-09-28 04:13:49,843 - autogen_core.trace.backward_pass - INFO - Generating retrieved content critique
-2025-09-28 04:13:49,843 - autogen_core.trace.backward_pass - INFO - Found 1 conversations, 1 evaluations, 1 contexts for iteration 0
-2025-09-28 04:13:49,846 - autogen_core.trace.backward_pass - INFO - Created retrieved content critique sequence for iteration 0
-2025-09-28 04:13:49,848 - autogen_core.trace.backward_pass - INFO - Retrieved context length: 7823 characters
-2025-09-28 04:13:49,848 - autogen_core.trace.backward_pass - WARNING - Retrieved context is very large (7823 chars) - truncating to 5000 chars for gradient analysis
-2025-09-28 04:13:52,335 - autogen_core.trace.backward_pass - INFO - Retrieved content critique generated and saved
-2025-09-28 04:13:52,354 - autogen_core.trace.backward_pass - INFO - Generating retrieval plan critique
-2025-09-28 04:13:52,354 - autogen_core.trace.backward_pass - INFO - Retrieval plans: ["To understand the plot of the story, it is essential to identify the main characters. Searching for nodes of type 'Person' will help retrieve a list of all characters in the story, which can then be used to investigate their interactions and roles in the plot.", "The query asks about the plot of the story. The previous step returned a list of nodes and indicated that their connections have not been explored. To understand the plot, I need to explore the connections of the most central characters. 'Captain Dietrich' is a good starting point to explore the narrative as it is a central character. Therefore, I will use the get_neighbors function to explore the connections of 'Captain Dietrich'.", "The query asks for the plot of the story. The previous steps have explored connections between characters like Captain Dietrich, Doctor Von Mark, Gurn, and Sarna. To understand the plot, it's crucial to explore the relationships and interactions of the central characters. Captain Dietrich appears to be a key figure based on the previous results. Therefore, the next logical step is to explore his neighbors to gather more information about his role and the events he is involved in."]
-2025-09-28 04:13:52,356 - autogen_core.trace.backward_pass - INFO - Retrieved contexts: [{'retrieved_context': '\n\nIteration 1 results:\nG describes a graph among nodes Captain Dietrich, Dietrich, Doctor Karl Von Mark, Doctor Von Mark, Gene Ellerman, Golden skinned girl, Greg Weeks, Gurn, High Priest, Mary Meehan, Noork, Rold, Sarna, Stephen Dietrich, Tholon Dist, Tholon Sarna, Ud, beast men, girl, guards, invisible guards, priest of the Skull, priests, slave, slave women, temple guards, the Misty Ones, the fellows of this guard, the girl, the guardian Misty One, the other man, the priest. In this graph: The connections of Node Captain Dietrich have not been explored yet. The connections of Node Dietrich have not been explored yet. The connections of Node Doctor Karl Von Mark have not been explored yet. The connections of Node Doctor Von Mark have not been explored yet. The connections of Node Gene Ellerman have not been explored yet. The connections of Node Golden skinned girl have not been explored yet. The connections of Node Greg Weeks have not been explored yet. The connections of Node Gurn have not been explored yet. The connections of Node High Priest have not been explored yet. The connections of Node Mary Meehan have not been explored yet. The connections of Node Noork have not been explored yet. The connections of Node Rold have not been explored yet. The connections of Node Sarna have not been explored yet. The connections of Node Stephen Dietrich have not been explored yet. The connections of Node Tholon Dist have not been explored yet. The connections of Node Tholon Sarna have not been explored yet. The connections of Node Ud have not been explored yet. The connections of Node beast men have not been explored yet. The connections of Node girl have not been explored yet. The connections of Node guards have not been explored yet. The connections of Node invisible guards have not been explored yet. The connections of Node priest of the Skull have not been explored yet. The connections of Node priests have not been explored yet. The connections of Node slave have not been explored yet. The connections of Node slave women have not been explored yet. The connections of Node temple guards have not been explored yet. The connections of Node the Misty Ones have not been explored yet. The connections of Node the fellows of this guard have not been explored yet. The connections of Node the girl have not been explored yet. The connections of Node the guardian Misty One have not been explored yet. The connections of Node the other man have not been explored yet. The connections of Node the priest have not been explored yet.\n\nIteration 2 results:\nG describes a graph among nodes America, Captain Dietrich, Doctor Von Mark, Gurn, Noork, Sarna. In this graph: Node America is connected to to Captain Dietrich via FROM (relation description: Captain Dietrich states he is from America., textual evidence: I was hunting this evil man when my bird died." He smiled and his brown arm tightened around Sarna\'s golden body. "The evil man is dead. My native valley is safe. Now I can live in peace with you, Gurn, and with your sister, here in the jungle.). Node Captain Dietrich is connected to to America via FROM (relation description: Captain Dietrich states he is from America., textual evidence: I was hunting this evil man when my bird died." He smiled and his brown arm tightened around Sarna\'s golden body. "The evil man is dead. My native valley is safe. Now I can live in peace with you, Gurn, and with your sister, here in the jungle.), to Doctor Von Mark via addressed (relation description: Doctor Von Mark is speaking to Captain Dietrich and referring to him as \'Captain Dietrich\'., textual evidence: "This is something for you to remember, Captain Dietrich," he), to Gurn via ASSOCIATED_WITH (relation description: Captain Dietrich expresses a desire to live in peace with Gurn., textual evidence: Now I can live in peace with you, Gurn, and with your sister, here in the jungle.), to Noork via IDENTIFIED_AS (relation description: Captain Dietrich is addressed as Noork by Tholon Sarna., textual evidence: "It is good, Noork," smiled Tholon Sarna.), to Sarna via ASSOCIATED_WITH (relation description: Captain Dietrich\'s arm is around Sarna., textual evidence: his brown arm tightened around Sarna\'s golden body.). Node Doctor Von Mark is connected to to Captain Dietrich via addressed (relation description: Doctor Von Mark is speaking to Captain Dietrich and referring to him as \'Captain Dietrich\'., textual evidence: "This is something for you to remember, Captain Dietrich," he). Node Gurn is connected to to Captain Dietrich via ASSOCIATED_WITH (relation description: Captain Dietrich expresses a desire to live in peace with Gurn., textual evidence: Now I can live in peace with you, Gurn, and with your sister, here in the jungle.). Node Noork is connected to to Captain Dietrich via IDENTIFIED_AS (relation description: Captain Dietrich is addressed as Noork by Tholon Sarna., textual evidence: "It is good, Noork," smiled Tholon Sarna.). Node Sarna is connected to to Captain Dietrich via ASSOCIATED_WITH (relation description: Captain Dietrich\'s arm is around Sarna., textual evidence: his brown arm tightened around Sarna\'s golden body.).\n\nIteration 3 results:\nG describes a graph among nodes America, Captain Dietrich, Doctor Von Mark, Gurn, Noork, Sarna. In this graph: Node America is connected to to Captain Dietrich via FROM (relation description: Captain Dietrich states he is from America., textual evidence: I was hunting this evil man when my bird died." He smiled and his brown arm tightened around Sarna\'s golden body. "The evil man is dead. My native valley is safe. Now I can live in peace with you, Gurn, and with your sister, here in the jungle.). Node Captain Dietrich is connected to to America via FROM (relation description: Captain Dietrich states he is from America., textual evidence: I was hunting this evil man when my bird died." He smiled and his brown arm tightened around Sarna\'s golden body. "The evil man is dead. My native valley is safe. Now I can live in peace with you, Gurn, and with your sister, here in the jungle.), to Doctor Von Mark via addressed (relation description: Doctor Von Mark is speaking to Captain Dietrich and referring to him as \'Captain Dietrich\'., textual evidence: "This is something for you to remember, Captain Dietrich," he), to Gurn via ASSOCIATED_WITH (relation description: Captain Dietrich expresses a desire to live in peace with Gurn., textual evidence: Now I can live in peace with you, Gurn, and with your sister, here in the jungle.), to Noork via IDENTIFIED_AS (relation description: Captain Dietrich is addressed as Noork by Tholon Sarna., textual evidence: "It is good, Noork," smiled Tholon Sarna.), to Sarna via ASSOCIATED_WITH (relation description: Captain Dietrich\'s arm is around Sarna., textual evidence: his brown arm tightened around Sarna\'s golden body.). Node Doctor Von Mark is connected to to Captain Dietrich via addressed (relation description: Doctor Von Mark is speaking to Captain Dietrich and referring to him as \'Captain Dietrich\'., textual evidence: "This is something for you to remember, Captain Dietrich," he). Node Gurn is connected to to Captain Dietrich via ASSOCIATED_WITH (relation description: Captain Dietrich expresses a desire to live in peace with Gurn., textual evidence: Now I can live in peace with you, Gurn, and with your sister, here in the jungle.). Node Noork is connected to to Captain Dietrich via IDENTIFIED_AS (relation description: Captain Dietrich is addressed as Noork by Tholon Sarna., textual evidence: "It is good, Noork," smiled Tholon Sarna.). Node Sarna is connected to to Captain Dietrich via ASSOCIATED_WITH (relation description: Captain Dietrich\'s arm is around Sarna., textual evidence: his brown arm tightened around Sarna\'s golden body.).', 'repetition': 0, 'timestamp': '2025-09-28T04:13:40.570914', 'batch_id': 0, 'query': 'What is the plot of the story?'}]
-2025-09-28 04:13:54,475 - autogen_core.trace.backward_pass - INFO - Retrieval plan critique generated and saved
-2025-09-28 04:13:54,501 - autogen_core.trace.backward_pass - INFO - Generating retrieval planning prompt critique
-2025-09-28 04:13:59,397 - autogen_core.trace.backward_pass - INFO - [GRAPH_RETRIEVAL_PLANNER] Critique generated | Status: UPDATED | Preview: The current retrieval plans demonstrate a fundamental misunderstanding of how to extract a "plot" from a graph. The...
-2025-09-28 04:13:59,407 - autogen_core.trace.backward_pass - INFO - Generating graph critique
-2025-09-28 04:14:01,957 - autogen_core.trace.backward_pass - INFO - Graph critique generated and saved
-2025-09-28 04:14:01,975 - autogen_core.trace.backward_pass - INFO - Generating graph builder (creation) critique - first iteration
-2025-09-28 04:14:06,064 - autogen_core.trace.backward_pass - INFO - Graph creation prompt is fixed - not updating learned_prompt_graph_builder
-2025-09-28 04:14:06,078 - autogen_core.trace.backward_pass - INFO - Generating hyperparameters critique
-2025-09-28 04:14:09,642 - autogen_core.trace.backward_pass - INFO - [HYPERPARAMETERS_GRAPH] Critique generated | Status: UPDATED | Preview: The chunk size of 256 tokens, while seemingly arbitrary, significantly impacts the narrative coherence of the extracted...
-2025-09-28 04:14:09,666 - autogen_core.trace.backward_pass - INFO - Generated initial critiques for new QA pair None
-2025-09-28 04:14:09,666 - autogen_core.trace.backward_pass - INFO - Returning BackwardPassReady for batch 0
-2025-09-28 04:14:09,689 - autogen_core.trace.batch_orchestrator - INFO - ROUGE score computed: 0.0322 for 63521_q1
-2025-09-28 04:14:09,710 - autogen_core.trace.batch_orchestrator - INFO - Saved iteration 0 data for QA pair 63521_q1
-2025-09-28 04:14:09,715 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION EVENT: iteration_complete | QA: 63521_q1 | Iter: 0 | Details: {'rouge_score': 0.03219315895372233, 'has_error': False}
-2025-09-28 04:14:09,716 - autogen_core.trace.batch_orchestrator - INFO - 
---- QA Pair 63521_q1, Iteration 1/4 ---
-2025-09-28 04:14:09,721 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION DETECTED: New iteration 1 of QA pair 63521_q1 - executing PARTIAL RESET
-2025-09-28 04:14:09,721 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION EVENT: partial_reset | QA: 63521_q1 | Iter: 1 | Details: {'transition_type': 'new_iteration', 'previous_iteration': 0}
-2025-09-28 04:14:09,806 - autogen_core.trace.batch_orchestrator - INFO - Reset validation for partial reset: {'shared_state_reset': True, 'graph_data_handled': False, 'prompt_lifecycle_correct': True, 'processing_state_updated': True} | All passed: False
-2025-09-28 04:14:09,806 - autogen_core.trace.batch_orchestrator - ERROR - Partial reset validation failed for 63521_q1
-2025-09-28 04:14:09,810 - autogen_core.trace.batch_orchestrator - INFO - Validation results for 63521_q1, iteration 1: {'qa_pair_tracking_valid': True, 'iteration_tracking_valid': True, 'shared_state_consistent': True, 'prompt_lifecycle_correct': True, 'graph_state_appropriate': True, 'data_isolation_maintained': True}
-2025-09-28 04:14:09,810 - autogen_core.trace.batch_orchestrator - INFO - TRANSITION EVENT: iteration_start | QA: 63521_q1 | Iter: 1 | Details: {'validation_results': {'qa_pair_tracking_valid': True, 'iteration_tracking_valid': True, 'shared_state_consistent': True, 'prompt_lifecycle_correct': True, 'graph_state_appropriate': True, 'data_isolation_maintained': True}, 'processing_state': {'current_qa_pair_id': '63521_q1', 'current_iteration': 1, 'total_iterations': 5, 'qa_pair_start_time': '2025-09-28T04:13:26.946046', 'iteration_start_time': '2025-09-28T04:14:09.763834'}}
-2025-09-28 04:14:09,812 - autogen_core.trace.batch_orchestrator - INFO - Processing QA pair 63521_q1, iteration 1
-2025-09-28 04:14:09,812 - autogen_core.trace.batch_orchestrator - INFO - Step 1: Executing HyperparametersGraphAgent for 63521_q1
-2025-09-28 04:14:09,817 - autogen_core.trace.hyperparameters_graph - INFO - HyperparametersGraphAgent processing QA pair 63521_q1
-2025-09-28 04:14:10,861 - autogen_core.trace.hyperparameters_graph - INFO - [HyperparametersGraph] LLM recommendation | chunk_size=256 | confidence=0.90 | reasoning=The provided text introduces the setting of the story, mentioning two moons of Earth: Luna and a...
-2025-09-28 04:14:10,873 - autogen_core.trace.hyperparameters_graph - INFO - Returning HyperparametersGraphReady for QA pair 63521_q1
-2025-09-28 04:14:10,876 - autogen_core.trace.batch_orchestrator - INFO - Step 2: Executing GraphBuilderAgent for 63521_q1
-2025-09-28 04:14:10,935 - autogen_core.trace.graph_builder - INFO - GraphBuilderAgent processing batch 0 with chunk_size 256
-2025-09-28 04:14:10,939 - autogen_core.trace.graph_builder - INFO - Found document text in current_state['full_document_text']
-2025-09-28 04:14:10,939 - autogen_core.trace.graph_builder - INFO - Graph mode: Refinement (iteration 1)
-2025-09-28 04:14:10,939 - autogen_core.trace.graph_builder - INFO - Graph refinement mode: loading existing graph and refining
-2025-09-28 04:14:10,976 - autogen_core.trace.graph_builder - INFO - Split corpus into 24 chunks for graph refinement
-2025-09-28 04:14:10,976 - autogen_core.trace.graph_builder - INFO - Starting concurrent refinement processing of 24 chunks
-2025-09-28 04:14:10,978 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 1/24
-2025-09-28 04:14:10,978 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 2/24
-2025-09-28 04:14:10,978 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 3/24
-2025-09-28 04:14:10,978 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 4/24
-2025-09-28 04:14:10,978 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 5/24
-2025-09-28 04:14:10,978 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 6/24
-2025-09-28 04:14:10,983 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 7/24
-2025-09-28 04:14:10,985 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 8/24
-2025-09-28 04:14:10,986 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 9/24
-2025-09-28 04:14:10,986 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 10/24
-2025-09-28 04:14:10,986 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 11/24
-2025-09-28 04:14:10,986 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 12/24
-2025-09-28 04:14:10,986 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 13/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 14/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 15/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 16/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 17/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 18/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 19/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 20/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 21/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 22/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 23/24
-2025-09-28 04:14:10,989 - autogen_core.trace.graph_builder - INFO - Processing refinement chunk 24/24
-2025-09-28 04:14:13,562 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 22/24
-2025-09-28 04:14:13,747 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 11/24
-2025-09-28 04:14:13,750 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 14/24
-2025-09-28 04:14:13,947 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 17/24
-2025-09-28 04:14:14,008 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 6/24
-2025-09-28 04:14:14,470 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 15/24
-2025-09-28 04:14:14,476 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 19/24
-2025-09-28 04:14:14,481 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 18/24
-2025-09-28 04:14:14,768 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 9/24
-2025-09-28 04:14:14,772 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 3/24
-2025-09-28 04:14:14,971 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 10/24
-2025-09-28 04:14:14,983 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 1/24
-2025-09-28 04:14:14,991 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 23/24
-2025-09-28 04:14:15,161 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 5/24
-2025-09-28 04:14:15,163 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 24/24
-2025-09-28 04:14:15,383 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 2/24
-2025-09-28 04:14:15,391 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 7/24
-2025-09-28 04:14:15,436 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 21/24
-2025-09-28 04:14:15,683 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 4/24
-2025-09-28 04:14:15,763 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 12/24
-2025-09-28 04:14:15,970 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 16/24
-2025-09-28 04:14:16,075 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 13/24
-2025-09-28 04:14:16,810 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 8/24
-2025-09-28 04:14:17,259 - autogen_core.trace.graph_builder - INFO - Completed refinement chunk 20/24
-2025-09-28 04:14:17,259 - autogen_core.trace.graph_builder - INFO - Completed concurrent refinement processing of all 24 chunks
-2025-09-28 04:14:17,261 - autogen_core.trace.graph_builder - INFO - [GraphRefinement] LLM refinement | entities=109 | relationships=268 | triplets=268
-2025-09-28 04:14:17,270 - autogen_core.trace.graph_builder - INFO - Loaded existing graph: 94 entities, 194 relationships
-2025-09-28 04:14:17,270 - autogen_core.trace.graph_builder - INFO - EXISTING ENTITIES (94 total): Greg Weeks, Mary Meehan, Online Distributed Proofreading Team, Gene Ellerman, Noork, Luna, Sekk, Vasads, Golden skinned girl, Gurn...
-2025-09-28 04:14:17,270 - autogen_core.trace.graph_builder - INFO - NEW ENTITIES (109 total): Sekk, Noork, Vasads, Golden skinned girl, Sunken star-shaped cavity, Oval lake, Eleven radiating tips, Jungle giant, Noork, Vasads...
-2025-09-28 04:14:17,270 - autogen_core.trace.graph_builder - INFO - MERGE RESULT: 94 existing + 109 new = 203 total entities
-2025-09-28 04:14:17,270 - autogen_core.trace.graph_builder - INFO - MERGE RESULT: 194 existing + 268 new = 462 total relationships
-2025-09-28 04:14:17,270 - autogen_core.trace.graph_builder - INFO - MERGED ENTITIES SAMPLE (first 15): Greg Weeks, Mary Meehan, Online Distributed Proofreading Team, Gene Ellerman, Noork, Luna, Sekk, Vasads, Golden skinned girl, Gurn, New York, the girl, Tholon Sarna, spotted narl, Sarna...
-2025-09-28 04:14:17,270 - autogen_core.trace.graph_builder - INFO - Starting entity resolution on 203 entities
-2025-09-28 04:14:17,365 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:14:17,365 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:14:17,367 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:14:17,367 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:14:17,367 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:14:17,367 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:14:17,367 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Noork' and 'Noork' (similarity: 1.000)
-2025-09-28 04:14:17,375 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
-2025-09-28 04:14:17,379 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
-2025-09-28 04:14:17,379 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
-2025-09-28 04:14:17,379 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
-2025-09-28 04:14:17,379 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sekk' and 'Sekk' (similarity: 1.000)
-2025-09-28 04:14:17,379 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:14:17,383 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:14:17,383 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasad' (similarity: 0.933)
-2025-09-28 04:14:17,386 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:14:17,386 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:14:17,386 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:14:17,390 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:14:17,392 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Vasads' and 'Vasads' (similarity: 1.000)
-2025-09-28 04:14:17,402 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Golden skinned girl' and 'Golden skinned girl' (similarity: 1.000)
-2025-09-28 04:14:17,407 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Golden skinned girl' and 'golden-skinned girl' (similarity: 0.947)
-2025-09-28 04:14:17,410 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
-2025-09-28 04:14:17,416 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
-2025-09-28 04:14:17,419 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Gurn' and 'Gurn' (similarity: 1.000)
-2025-09-28 04:14:17,424 - autogen_core.trace.graph_builder - INFO - Merging entities: 'New York' and 'New York' (similarity: 1.000)
-2025-09-28 04:14:17,438 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
-2025-09-28 04:14:17,438 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
-2025-09-28 04:14:17,450 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Sarna' and 'Tholon Sarna' (similarity: 1.000)
-2025-09-28 04:14:17,454 - autogen_core.trace.graph_builder - INFO - Merging entities: 'spotted narl' and 'spotted narl' (similarity: 1.000)
-2025-09-28 04:14:17,460 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
-2025-09-28 04:14:17,460 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
-2025-09-28 04:14:17,465 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Sarna' and 'Sarna' (similarity: 1.000)
-2025-09-28 04:14:17,468 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Grath' and 'Grath' (similarity: 1.000)
-2025-09-28 04:14:17,470 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Grath' and 'Grath' (similarity: 1.000)
-2025-09-28 04:14:17,470 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Zuran' and 'Zurans' (similarity: 0.933)
-2025-09-28 04:14:17,470 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Zuran' and 'Zuran' (similarity: 1.000)
-2025-09-28 04:14:17,470 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Zuran' and 'Zura' (similarity: 0.900)
-2025-09-28 04:14:17,486 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Konto' and 'Konto' (similarity: 1.000)
-2025-09-28 04:14:17,493 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,493 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,493 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,493 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,493 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,493 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon' and 'Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,500 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty One' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty One' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty One' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,502 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Misty Ones' and 'Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,520 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Temple of the Skull' and 'Temple of the Skull' (similarity: 1.000)
-2025-09-28 04:14:17,523 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Temple of the Skull' and 'Temple of the Skull' (similarity: 1.000)
-2025-09-28 04:14:17,532 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Lake of Uzdon' and 'Lake of Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,536 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Lake of Uzdon' and 'Lake of Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,536 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Lake of Uzdon' and 'Lake of Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,544 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Temple of Uzdon' and 'Temple of Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,546 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Temple of Uzdon' and 'Temple of Uzdon' (similarity: 1.000)
-2025-09-28 04:14:17,638 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Nazidom' and 'Nazidom' (similarity: 1.000)
-2025-09-28 04:14:17,658 - autogen_core.trace.graph_builder - INFO - Merging entities: 'cosmic matter' and 'cosmic matter' (similarity: 1.000)
-2025-09-28 04:14:17,685 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Tholon Dist' and 'Tholon Dist' (similarity: 1.000)
-2025-09-28 04:14:17,690 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
-2025-09-28 04:14:17,690 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Rold' and 'Rold' (similarity: 1.000)
-2025-09-28 04:14:17,695 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Manak' and 'Manak' (similarity: 1.000)
-2025-09-28 04:14:17,703 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Skull' and 'Skull' (similarity: 1.000)
-2025-09-28 04:14:17,710 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priests' and 'Priest' (similarity: 0.957)
-2025-09-28 04:14:17,717 - autogen_core.trace.graph_builder - INFO - Merging entities: 'slave' and 'Slaves' (similarity: 0.933)
-2025-09-28 04:14:17,754 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Lornu' and 'Lornu' (similarity: 1.000)
-2025-09-28 04:14:17,761 - autogen_core.trace.graph_builder - INFO - Merging entities: 'temple guards' and 'temple guards' (similarity: 1.000)
-2025-09-28 04:14:17,768 - autogen_core.trace.graph_builder - INFO - Merging entities: 'slave women' and 'slave women' (similarity: 1.000)
-2025-09-28 04:14:17,775 - autogen_core.trace.graph_builder - INFO - Merging entities: 'the guardian Misty One' and 'guardian Misty One' (similarity: 0.918)
-2025-09-28 04:14:17,785 - autogen_core.trace.graph_builder - INFO - Merging entities: 'the other man' and 'the other man' (similarity: 1.000)
-2025-09-28 04:14:17,794 - autogen_core.trace.graph_builder - INFO - Merging entities: 'the fellows of this guard' and 'fellows of this guard' (similarity: 0.940)
-2025-09-28 04:14:17,803 - autogen_core.trace.graph_builder - INFO - Merging entities: 'the Misty Ones' and 'The Misty Ones' (similarity: 1.000)
-2025-09-28 04:14:17,812 - autogen_core.trace.graph_builder - INFO - Merging entities: 'upper temple' and 'upper temple' (similarity: 1.000)
-2025-09-28 04:14:17,826 - autogen_core.trace.graph_builder - INFO - Merging entities: 'prison pit' and 'prison pit' (similarity: 1.000)
-2025-09-28 04:14:17,833 - autogen_core.trace.graph_builder - INFO - Merging entities: 'brass door' and 'brass door' (similarity: 1.000)
-2025-09-28 04:14:17,839 - autogen_core.trace.graph_builder - INFO - Merging entities: 'golden people' and 'golden people' (similarity: 1.000)
-2025-09-28 04:14:17,839 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Zura's valleys' and 'Zura's valleys' (similarity: 1.000)
-2025-09-28 04:14:17,850 - autogen_core.trace.graph_builder - INFO - Merging entities: 'priest of the Skull' and 'priest of the Skull' (similarity: 1.000)
-2025-09-28 04:14:17,869 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Uzdon's window' and 'Uzdon's window' (similarity: 1.000)
-2025-09-28 04:14:17,879 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Captain Dietrich' and 'Captain Dietrich' (similarity: 1.000)
-2025-09-28 04:14:17,883 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Doctor Von Mark' and 'Doctor Von Mark' (similarity: 1.000)
-2025-09-28 04:14:17,883 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Doctor Von Mark' and 'Doctor Von Mark' (similarity: 1.000)
-2025-09-28 04:14:17,889 - autogen_core.trace.graph_builder - INFO - Merging entities: 'America' and 'America' (similarity: 1.000)
-2025-09-28 04:14:17,899 - autogen_core.trace.graph_builder - INFO - Merging entities: 'Jungle giant' and 'Jungle Giant' (similarity: 1.000)
-2025-09-28 04:14:17,942 - autogen_core.trace.graph_builder - INFO - Saved graph to graphs\squality_test_batch_0_graph.json
-2025-09-28 04:14:17,942 - autogen_core.trace.graph_builder - INFO - Refinement mode: Merging new entities and relationships into existing graph
-2025-09-28 04:14:18,002 - autogen_core.trace.graph_builder - INFO - Successfully merged graph updates into existing graph
-2025-09-28 04:14:18,041 - autogen_core.trace.graph_builder - INFO - Returning GraphReady for batch 0
-2025-09-28 04:14:18,041 - autogen_core.trace.batch_orchestrator - INFO - Step 3: Executing GraphRetrievalPlannerAgent for 63521_q1
-2025-09-28 04:14:18,081 - autogen_core.trace.graph_retrieval_planner - INFO - GraphRetrievalPlannerAgent processing batch 0 for query: What is the plot of the story?
-2025-09-28 04:14:18,082 - autogen_core.trace.graph_retrieval_planner - INFO - Clearing existing graph from Memgraph before loading correct graph
-2025-09-28 04:14:18,104 - autogen_core.trace.graph_retrieval_planner - INFO - Graph cleared successfully: Graph cleared successfully. Remaining nodes: 0
-2025-09-28 04:14:18,153 - autogen_core.trace.graph_retrieval_planner - INFO - Successfully loaded correct graph squality_test_batch_0_graph.json into Memgraph for retrieval
-2025-09-28 04:14:18,153 - autogen_core.trace.graph_retrieval_planner - INFO - Retrieval iteration 1/3
-2025-09-28 04:14:19,148 - autogen_core.trace.graph_retrieval_planner - INFO - Completed iteration 1, context length: 3909
-2025-09-28 04:14:19,151 - autogen_core.trace.graph_retrieval_planner - INFO - Retrieval iteration 2/3
-2025-09-28 04:14:20,137 - autogen_core.trace.graph_retrieval_planner - INFO - Completed iteration 2, context length: 40841
-2025-09-28 04:14:20,143 - autogen_core.trace.graph_retrieval_planner - INFO - Retrieval iteration 3/3
-2025-09-28 04:14:21,498 - autogen_core.trace.graph_retrieval_planner - INFO - Completed iteration 3, context length: 44750
-2025-09-28 04:14:21,500 - autogen_core.trace.graph_retrieval_planner - INFO - Returning GraphRetrievalReady for batch 0
-2025-09-28 04:14:21,520 - autogen_core.trace.batch_orchestrator - INFO - Step 4: Executing AnswerGeneratorAgent for 63521_q1
-2025-09-28 04:14:21,528 - autogen_core.trace.answer_generator - INFO - AnswerGeneratorAgent processing QA pair 63521_q1
-2025-09-28 04:14:22,516 - autogen_core.trace.answer_generator - INFO - [QA: 63521_q1] Generated answer | Content: I understand you're asking for the plot of the story. However, the provided information focuses on...
-2025-09-28 04:14:22,534 - autogen_core.trace.answer_generator - INFO - Returning AnswerGenerationReady for QA pair 63521_q1
-2025-09-28 04:14:22,537 - autogen_core.trace.batch_orchestrator - INFO - Step 5: Executing ResponseEvaluatorAgent for 63521_q1
-2025-09-28 04:14:22,565 - autogen_core.trace.response_evaluator - INFO - ResponseEvaluatorAgent evaluating QA pair 63521_q1
-2025-09-28 04:14:26,277 - autogen_core.trace.response_evaluator - INFO - [QA: 63521_q1] Evaluation completed | Content: The RAG system's response is **good but could be better**. It accurately identifies the limitation...
-2025-09-28 04:14:26,340 - autogen_core.trace.response_evaluator - INFO - Returning ResponseEvaluationReady for QA pair 63521_q1
-2025-09-28 04:14:26,340 - autogen_core.trace.batch_orchestrator - INFO - Step 6: Executing BackwardPassAgent for 63521_q1
-2025-09-28 04:14:26,392 - autogen_core.trace.backward_pass - INFO - BackwardPassAgent processing backward pass for batch 0, repetition 1
-2025-09-28 04:14:26,395 - autogen_core.trace.backward_pass - INFO - Generating answer generation critique
-2025-09-28 04:14:26,395 - autogen_core.trace.backward_pass - INFO - Found 1 conversations and 1 evaluations for iteration 1
-2025-09-28 04:14:26,395 - autogen_core.trace.backward_pass - INFO - Created answer generation critique sequence for iteration 1
-2025-09-28 04:14:30,743 - autogen_core.trace.backward_pass - INFO - [ANSWER_GENERATOR_GRAPH] Critique generated | Status: UPDATED | Preview: The provided prompt is generally good, effectively guiding the LLM to handle incomplete information gracefully....
-2025-09-28 04:14:30,761 - autogen_core.trace.backward_pass - INFO - Generating retrieved content critique
-2025-09-28 04:14:30,763 - autogen_core.trace.backward_pass - INFO - Found 1 conversations, 1 evaluations, 1 contexts for iteration 1
-2025-09-28 04:14:30,764 - autogen_core.trace.backward_pass - INFO - Created retrieved content critique sequence for iteration 1
-2025-09-28 04:14:30,764 - autogen_core.trace.backward_pass - INFO - Retrieved context length: 44750 characters
-2025-09-28 04:14:30,764 - autogen_core.trace.backward_pass - WARNING - Retrieved context is very large (44750 chars) - truncating to 5000 chars for gradient analysis
+The response is factually accurate based on the provided...
+2025-09-28 04:35:14,133 - autogen_core.trace.response_evaluator - INFO - Returning ResponseEvaluationReady for QA pair 63521_q1
+2025-09-28 04:35:14,133 - autogen_core.trace.batch_orchestrator - INFO - Step 6: Executing BackwardPassAgent for 63521_q1
+2025-09-28 04:35:14,154 - autogen_core.trace.backward_pass - INFO - BackwardPassAgent processing backward pass for batch 0, repetition 0
+2025-09-28 04:35:14,167 - autogen_core.trace.backward_pass - INFO - Generating answer generation critique
+2025-09-28 04:35:14,167 - autogen_core.trace.backward_pass - INFO - Found 1 conversations and 1 evaluations for iteration 0
+2025-09-28 04:35:14,167 - autogen_core.trace.backward_pass - INFO - Created answer generation critique sequence for iteration 0
+2025-09-28 04:35:17,882 - autogen_core.trace.backward_pass - INFO - [ANSWER_GENERATOR_GRAPH] Critique generated | Status: UPDATED | Preview: The current prompt is too basic and fails to guide the LLM towards generating a helpful and informative response,...
+2025-09-28 04:35:17,893 - autogen_core.trace.backward_pass - INFO - Generating retrieved content critique
+2025-09-28 04:35:17,893 - autogen_core.trace.backward_pass - INFO - Found 1 conversations, 1 evaluations, 1 contexts for iteration 0
+2025-09-28 04:35:17,893 - autogen_core.trace.backward_pass - INFO - Created retrieved content critique sequence for iteration 0
+2025-09-28 04:35:17,893 - autogen_core.trace.backward_pass - INFO - Retrieved context length: 10077 characters
+2025-09-28 04:35:17,893 - autogen_core.trace.backward_pass - WARNING - Retrieved context is very large (10077 chars) - truncating to 5000 chars for gradient analysis
+2025-09-28 04:35:20,383 - autogen_core.trace.backward_pass - INFO - Retrieved content critique generated and saved
+2025-09-28 04:35:20,387 - autogen_core.trace.backward_pass - INFO - Generating retrieval plan critique
+2025-09-28 04:35:20,387 - autogen_core.trace.backward_pass - INFO - Retrieval plans: ["The query asks for the plot of the story. To understand the plot, it is essential to identify the main characters involved. Therefore, the first step is to search for all nodes of type 'Person'.", "The user wants to know the plot of the story. Since the plot is likely to involve characters and their actions, I should start by exploring the 'Person' nodes to understand who the main characters are and their potential roles in the story. This will help in building a foundational understanding of the narrative.", "The user is asking about the plot of a story. To understand the plot, it's essential to identify the main characters involved. I will start by searching for all nodes of type 'Person' to get a list of potential characters."]
+2025-09-28 04:35:20,387 - autogen_core.trace.backward_pass - INFO - Retrieved contexts: [{'retrieved_context': '\n\nIteration 1 results:\nG describes a graph among nodes Captain Dietrich, Dietrich, Doctor Karl Von Mark, Doctor Von Mark, Gene Ellerman, Greg Weeks, Gurn, High Priest, Lornu, Mary Meehan, Noork, Rold, Sarna, Stephen Dietrich, The High Priest, The Misty One, Tholon Dist, Tholon Sarna, Ud, Von Mark, Zurans, dead man, girl, golden men of the valley cities, golden people, golden skinned girl, guards, invisible guards, men of Zura, priests, prisoners, slave women, slaves, slaves and common citizens of the island, sleeping guards, temple guards, the girl, the priests, two guards, two warriors, unseen foe, young American flier. In this graph: The connections of Node Captain Dietrich have not been explored yet. The connections of Node Dietrich have not been explored yet. The connections of Node Doctor Karl Von Mark have not been explored yet. The connections of Node Doctor Von Mark have not been explored yet. The connections of Node Gene Ellerman have not been explored yet. The connections of Node Greg Weeks have not been explored yet. The connections of Node Gurn have not been explored yet. The connections of Node High Priest have not been explored yet. The connections of Node Lornu have not been explored yet. The connections of Node Mary Meehan have not been explored yet. The connections of Node Noork have not been explored yet. The connections of Node Rold have not been explored yet. The connections of Node Sarna have not been explored yet. The connections of Node Stephen Dietrich have not been explored yet. The connections of Node The High Priest have not been explored yet. The connections of Node The Misty One have not been explored yet. The connections of Node Tholon Dist have not been explored yet. The connections of Node Tholon Sarna have not been explored yet. The connections of Node Ud have not been explored yet. The connections of Node Von Mark have not been explored yet. The connections of Node Zurans have not been explored yet. The connections of Node dead man have not been explored yet. The connections of Node girl have not been explored yet. The connections of Node golden men of the valley cities have not been explored yet. The connections of Node golden people have not been explored yet. The connections of Node golden skinned girl have not been explored yet. The connections of Node guards have not been explored yet. The connections of Node invisible guards have not been explored yet. The connections of Node men of Zura have not been explored yet. The connections of Node priests have not been explored yet. The connections of Node prisoners have not been explored yet. The connections of Node slave women have not been explored yet. The connections of Node slaves have not been explored yet. The connections of Node slaves and common citizens of the island have not been explored yet. The connections of Node sleeping guards have not been explored yet. The connections of Node temple guards have not been explored yet. The connections of Node the girl have not been explored yet. The connections of Node the priests have not been explored yet. The connections of Node two guards have not been explored yet. The connections of Node two warriors have not been explored yet. The connections of Node unseen foe have not been explored yet. The connections of Node young American flier have not been explored yet.\n\nIteration 2 results:\nG describes a graph among nodes Captain Dietrich, Dietrich, Doctor Karl Von Mark, Doctor Von Mark, Gene Ellerman, Greg Weeks, Gurn, High Priest, Lornu, Mary Meehan, Noork, Rold, Sarna, Stephen Dietrich, The High Priest, The Misty One, Tholon Dist, Tholon Sarna, Ud, Von Mark, Zurans, dead man, girl, golden men of the valley cities, golden people, golden skinned girl, guards, invisible guards, men of Zura, priests, prisoners, slave women, slaves, slaves and common citizens of the island, sleeping guards, temple guards, the girl, the priests, two guards, two warriors, unseen foe, young American flier. In this graph: The connections of Node Captain Dietrich have not been explored yet. The connections of Node Dietrich have not been explored yet. The connections of Node Doctor Karl Von Mark have not been explored yet. The connections of Node Doctor Von Mark have not been explored yet. The connections of Node Gene Ellerman have not been explored yet. The connections of Node Greg Weeks have not been explored yet. The connections of Node Gurn have not been explored yet. The connections of Node High Priest have not been explored yet. The connections of Node Lornu have not been explored yet. The connections of Node Mary Meehan have not been explored yet. The connections of Node Noork have not been explored yet. The connections of Node Rold have not been explored yet. The connections of Node Sarna have not been explored yet. The connections of Node Stephen Dietrich have not been explored yet. The connections of Node The High Priest have not been explored yet. The connections of Node The Misty One have not been explored yet. The connections of Node Tholon Dist have not been explored yet. The connections of Node Tholon Sarna have not been explored yet. The connections of Node Ud have not been explored yet. The connections of Node Von Mark have not been explored yet. The connections of Node Zurans have not been explored yet. The connections of Node dead man have not been explored yet. The connections of Node girl have not been explored yet. The connections of Node golden men of the valley cities have not been explored yet. The connections of Node golden people have not been explored yet. The connections of Node golden skinned girl have not been explored yet. The connections of Node guards have not been explored yet. The connections of Node invisible guards have not been explored yet. The connections of Node men of Zura have not been explored yet. The connections of Node priests have not been explored yet. The connections of Node prisoners have not been explored yet. The connections of Node slave women have not been explored yet. The connections of Node slaves have not been explored yet. The connections of Node slaves and common citizens of the island have not been explored yet. The connections of Node sleeping guards have not been explored yet. The connections of Node temple guards have not been explored yet. The connections of Node the girl have not been explored yet. The connections of Node the priests have not been explored yet. The connections of Node two guards have not been explored yet. The connections of Node two warriors have not been explored yet. The connections of Node unseen foe have not been explored yet. The connections of Node young American flier have not been explored yet.\n\nIteration 3 results:\nG describes a graph among nodes Captain Dietrich, Dietrich, Doctor Karl Von Mark, Doctor Von Mark, Gene Ellerman, Greg Weeks, Gurn, High Priest, Lornu, Mary Meehan, Noork, Rold, Sarna, Stephen Dietrich, The High Priest, The Misty One, Tholon Dist, Tholon Sarna, Ud, Von Mark, Zurans, dead man, girl, golden men of the valley cities, golden people, golden skinned girl, guards, invisible guards, men of Zura, priests, prisoners, slave women, slaves, slaves and common citizens of the island, sleeping guards, temple guards, the girl, the priests, two guards, two warriors, unseen foe, young American flier. In this graph: The connections of Node Captain Dietrich have not been explored yet. The connections of Node Dietrich have not been explored yet. The connections of Node Doctor Karl Von Mark have not been explored yet. The connections of Node Doctor Von Mark have not been explored yet. The connections of Node Gene Ellerman have not been explored yet. The connections of Node Greg Weeks have not been explored yet. The connections of Node Gurn have not been explored yet. The connections of Node High Priest have not been explored yet. The connections of Node Lornu have not been explored yet. The connections of Node Mary Meehan have not been explored yet. The connections of Node Noork have not been explored yet. The connections of Node Rold have not been explored yet. The connections of Node Sarna have not been explored yet. The connections of Node Stephen Dietrich have not been explored yet. The connections of Node The High Priest have not been explored yet. The connections of Node The Misty One have not been explored yet. The connections of Node Tholon Dist have not been explored yet. The connections of Node Tholon Sarna have not been explored yet. The connections of Node Ud have not been explored yet. The connections of Node Von Mark have not been explored yet. The connections of Node Zurans have not been explored yet. The connections of Node dead man have not been explored yet. The connections of Node girl have not been explored yet. The connections of Node golden men of the valley cities have not been explored yet. The connections of Node golden people have not been explored yet. The connections of Node golden skinned girl have not been explored yet. The connections of Node guards have not been explored yet. The connections of Node invisible guards have not been explored yet. The connections of Node men of Zura have not been explored yet. The connections of Node priests have not been explored yet. The connections of Node prisoners have not been explored yet. The connections of Node slave women have not been explored yet. The connections of Node slaves have not been explored yet. The connections of Node slaves and common citizens of the island have not been explored yet. The connections of Node sleeping guards have not been explored yet. The connections of Node temple guards have not been explored yet. The connections of Node the girl have not been explored yet. The connections of Node the priests have not been explored yet. The connections of Node two guards have not been explored yet. The connections of Node two warriors have not been explored yet. The connections of Node unseen foe have not been explored yet. The connections of Node young American flier have not been explored yet.', 'repetition': 0, 'timestamp': '2025-09-28T04:35:10.242044', 'batch_id': 0, 'query': 'What is the plot of the story?'}]
+2025-09-28 04:35:22,366 - autogen_core.trace.backward_pass - INFO - Retrieval plan critique generated and saved
+2025-09-28 04:35:22,381 - autogen_core.trace.backward_pass - INFO - Generating retrieval planning prompt critique
