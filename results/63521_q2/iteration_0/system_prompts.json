@@ -1,0 +1,8 @@
+{
+  "hyperparameters_graph_agent_critique": "",
+  "graph_builder_agent_critique": "",
+  "retrieval_planner_agent_critique": "",
+  "answer_generation_critique": "",
+  "graph_builder_prompt": "",
+  "retrieval_prompt": ""
+}

@@ -1,0 +1,6 @@
+{
+  "qa_pair_id": "62244_q1",
+  "iteration": 1,
+  "error": "Return type <class 'NoneType'> not in return types (<class 'multi_agent_system.GraphReadyMessage'>,)",
+  "rouge_score": 0.0
+}

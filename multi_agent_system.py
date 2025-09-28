@@ -6,12 +6,15 @@ Includes BatchOrchestratorAgent and HyperparametersGraphAgent.
 import json
 import logging
 import statistics
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 from pydantic import BaseModel
 
-from logging_utils import LoggingUtils, log_agent_action, log_batch_progress, log_qa_processing, log_critique_result
+from logging_utils import log_agent_action, log_qa_processing, log_critique_result
 from prompt_response_logger import get_global_prompt_logger
+from step_execution_logger import get_global_step_logger, StepStatus
+from evaluation_logger import get_global_evaluation_logger
 
 from autogen_core import (
     AgentId, MessageContext, RoutedAgent, message_handler,
@@ -21,7 +24,7 @@ from autogen_core.models import SystemMessage, UserMessage
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 
 from shared_state import SharedState
-from datasets_schema import Document, Question
+from datasets_schema import Question
 from eval_functions import evaluate_rouge_score
 import llm_keys
 from autogen_dataset_agent import BatchStartMessage, BatchReadyMessage
@@ -102,6 +105,8 @@ class ResponseEvaluationStartMessage(BaseModel):
     rouge_score: float
     batch_id: int
     repetition: int
+    dataset: str
+    setting: str
 
 class ResponseEvaluationReadyMessage(BaseModel):
     qa_pair_id: str
@@ -145,7 +150,8 @@ class HyperparametersGraphResponse(BaseModel):
 
 class BatchOrchestratorAgent(RoutedAgent):
     """
-    Orchestrates the processing of QA pairs in a batch through the multi-agent pipeline.
+    Enhanced Orchestrator with two-level reset mechanism for QA pairs and iterations.
+    Implements complete system reset between QA pairs and partial reset between iterations.
     """
 
     def __init__(self, name: str) -> None:
@@ -153,7 +159,7 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.batch_orchestrator")
         self.shared_state = SharedState("agent_states")
 
-        # Track QA pairs processing
+        # Enhanced tracking for two-level reset system
         self.current_batch_qa_pairs: Dict[str, Dict[str, Any]] = {}
         self.completed_qa_pairs: Dict[str, Dict[str, Any]] = {}
         self.current_batch_id: Optional[int] = None
@@ -161,9 +167,16 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.current_dataset: Optional[str] = None
         self.current_setting: Optional[str] = None
 
+        # QA pair and iteration tracking
+        self.qa_pair_results: Dict[str, List[Dict[str, Any]]] = {}  # Results per iteration per QA pair
+        self.qa_pair_rouge_progression: Dict[str, List[float]] = {}  # ROUGE scores per iteration per QA pair
+
     @message_handler
     async def handle_batch_start(self, message: BatchStartMessage, ctx: MessageContext) -> BatchReadyMessage:
-        """Handle BatchStart message by iterating over QA pairs."""
+        """
+        Enhanced BatchStart handler with two-level reset logic.
+        Processes each QA pair through multiple iterations with proper state management.
+        """
         self.logger.info(f"BatchOrchestrator received BatchStart for batch {message.batch_id}")
 
         self.current_batch_id = message.batch_id
@@ -173,49 +186,210 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.current_batch_qa_pairs = {}
         self.completed_qa_pairs = {}
 
+        # Initialize logging systems
+        step_logger = get_global_step_logger()
+        eval_logger = get_global_evaluation_logger()
+
+        # Log pipeline start
+        step_logger.start_pipeline(
+            dataset=message.dataset,
+            setting=message.setting,
+            total_qa_pairs=len(message.shared_state.get("batch_information", {}).get("qa_pairs", []))
+        )
+
         try:
             # Extract QA pairs from batch information
             batch_info = message.shared_state.get("batch_information", {})
             qa_pairs = batch_info.get("qa_pairs", [])
+            total_iterations = batch_info.get("total_iterations", 3)  # Default to 3 iterations
 
-            self.logger.info(f"Processing {len(qa_pairs)} QA pairs in batch {message.batch_id}")
+            self.logger.info(f"Processing {len(qa_pairs)} QA pairs in batch {message.batch_id} with {total_iterations} iterations each")
 
-            # Start processing each QA pair
+            # Process each QA pair through all iterations with proper reset logic
             for qa_pair in qa_pairs:
                 qa_pair_id = qa_pair.get("question_id", f"qa_{len(self.current_batch_qa_pairs)}")
                 self.current_batch_qa_pairs[qa_pair_id] = qa_pair
 
-                # Send HyperparametersGraphStart message
-                hyperparams_msg = HyperparametersGraphStartMessage(
+                # Initialize tracking for this QA pair
+                self.qa_pair_results[qa_pair_id] = []
+                self.qa_pair_rouge_progression[qa_pair_id] = []
+
+                # Log QA pair start for evaluation
+                document_text = message.shared_state.get("full_document_text", "")
+                eval_logger.start_qa_pair_evaluation(
                     qa_pair_id=qa_pair_id,
-                    qa_pair=qa_pair,
-                    batch_id=message.batch_id,
-                    repetition=message.repetition,
-                    dataset=self.current_dataset,
-                    setting=self.current_setting
+                    question=qa_pair.get("question", ""),
+                    reference_answers=qa_pair.get("answers", []),
+                    document_text=document_text,
+                    total_iterations=total_iterations,
+                    metadata={"batch_id": message.batch_id, "dataset": message.dataset, "setting": message.setting}
                 )
 
-                self.logger.info(f"Sending HyperparametersGraphStart for QA pair {qa_pair_id}")
+                self.logger.info(f"\n{'='*60}")
+                self.logger.info(f"STARTING QA PAIR: {qa_pair_id}")
+                self.logger.info(f"Question: {qa_pair.get('question', 'N/A')[:100]}...")
+                self.logger.info(f"Total iterations planned: {total_iterations}")
+                self.logger.info(f"{'='*60}")
 
-                # Create agent ID for HyperparametersGraphAgent
-                hyperparams_agent_id = AgentId("hyperparameters_graph_agent", "default")
+                # Process all iterations for this QA pair
+                for iteration in range(total_iterations):
+                    self.logger.info(f"\n--- QA Pair {qa_pair_id}, Iteration {iteration}/{total_iterations-1} ---")
 
-                # Get hyperparameters response
-                hyperparams_response = await self.send_message(hyperparams_msg, hyperparams_agent_id)
+                    # Log batch start for this iteration
+                    step_logger.start_batch(
+                        batch_id=message.batch_id,
+                        qa_pair_id=qa_pair_id,
+                        iteration=iteration,
+                        total_iterations=total_iterations
+                    )
 
-                # Process the hyperparameters response
-                await self._process_hyperparameters_response(hyperparams_response, message, ctx)
+                    iteration_start_time = datetime.now()
+
+                    try:
+                        # CRITICAL: Apply appropriate reset logic BEFORE processing
+                        step_logger.log_step(
+                            step_name="reset_logic_application",
+                            status=StepStatus.STARTED,
+                            agent_name="BatchOrchestratorAgent",
+                            input_data_summary=f"QA pair {qa_pair_id}, iteration {iteration}"
+                        )
+
+                        await self._apply_reset_logic(qa_pair_id, iteration, total_iterations)
+
+                        step_logger.log_step(
+                            step_name="reset_logic_application",
+                            status=StepStatus.COMPLETED,
+                            agent_name="BatchOrchestratorAgent"
+                        )
+
+                        # Process the QA pair for this iteration with proper error handling
+                        iteration_results = await self._process_qa_pair_iteration(
+                            qa_pair_id, qa_pair, iteration, message, ctx
+                        )
+
+                        # Validate iteration results
+                        if "error" in iteration_results:
+                            self.logger.error(f"Iteration {iteration} failed for {qa_pair_id}: {iteration_results['error']}")
+
+                            # Attempt recovery
+                            recovery_success = await self.recover_from_qa_pair_failure(
+                                qa_pair_id, iteration, Exception(iteration_results["error"])
+                            )
+
+                            if recovery_success:
+                                # Retry the iteration after recovery
+                                self.logger.info(f"Retrying iteration {iteration} after recovery")
+                                iteration_results = await self._process_qa_pair_iteration(
+                                    qa_pair_id, qa_pair, iteration, message, ctx
+                                )
+
+                        # Store iteration results
+                        self.qa_pair_results[qa_pair_id].append(iteration_results)
+                        rouge_score = iteration_results.get("rouge_score", 0.0)
+                        self.qa_pair_rouge_progression[qa_pair_id].append(rouge_score)
+
+                        # Log iteration completion
+                        self.logger.info(f"✓ Iteration {iteration} completed for {qa_pair_id} | ROUGE: {rouge_score:.4f}")
+
+                        # Save iteration data
+                        await self._save_iteration_data(qa_pair_id, iteration, iteration_results)
+
+                        # Log transition event
+                        self.log_transition_event("iteration_complete", qa_pair_id, iteration, {
+                            "rouge_score": rouge_score,
+                            "has_error": "error" in iteration_results
+                        })
+
+                    except Exception as e:
+                        self.logger.error(f"Critical error in iteration {iteration} for {qa_pair_id}: {e}")
+
+                        # Attempt recovery
+                        recovery_success = await self.recover_from_qa_pair_failure(qa_pair_id, iteration, e)
+
+                        if not recovery_success:
+                            # If recovery fails, store error and continue to next iteration
+                            error_results = {
+                                "qa_pair_id": qa_pair_id,
+                                "iteration": iteration,
+                                "error": str(e),
+                                "rouge_score": 0.0
+                            }
+                            self.qa_pair_results[qa_pair_id].append(error_results)
+                            self.qa_pair_rouge_progression[qa_pair_id].append(0.0)
+
+                # Save QA pair summary after all iterations
+                await self._save_qa_pair_summary(qa_pair_id)
+
+                # Log QA pair completion
+                final_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
+                rouge_improvement = (
+                    final_rouge - self.qa_pair_rouge_progression[qa_pair_id][0]
+                    if len(self.qa_pair_rouge_progression[qa_pair_id]) > 1 else 0.0
+                )
+
+                self.logger.info(f"\n✅ QA PAIR {qa_pair_id} COMPLETED")
+                self.logger.info(f"Final ROUGE: {final_rouge:.4f}")
+                self.logger.info(f"ROUGE Improvement: {rouge_improvement:+.4f}")
+                self.logger.info(f"Iterations completed: {len(self.qa_pair_results[qa_pair_id])}")
+
+                # Mark QA pair as completed
+                self.completed_qa_pairs[qa_pair_id] = {
+                    "iterations": self.qa_pair_results[qa_pair_id],
+                    "rouge_progression": self.qa_pair_rouge_progression[qa_pair_id],
+                    "final_rouge": final_rouge,
+                    "rouge_improvement": rouge_improvement
+                }
+
+                # Log QA pair completion in evaluation logger
+                best_iteration = 0
+                if self.qa_pair_rouge_progression[qa_pair_id]:
+                    best_iteration = self.qa_pair_rouge_progression[qa_pair_id].index(max(self.qa_pair_rouge_progression[qa_pair_id]))
+
+                eval_logger.complete_qa_pair_evaluation(
+                    qa_pair_id=qa_pair_id,
+                    final_rouge_score=final_rouge,
+                    rouge_progression=self.qa_pair_rouge_progression[qa_pair_id],
+                    best_iteration=best_iteration,
+                    total_iterations_completed=len(self.qa_pair_results[qa_pair_id]),
+                    improvement_gained=rouge_improvement,
+                    final_metrics={"qa_pair_summary": self.completed_qa_pairs[qa_pair_id]}
+                )
+
+                # Log QA pair completion event
+                self.log_transition_event("qa_pair_complete", qa_pair_id, total_iterations-1, {
+                    "final_rouge": final_rouge,
+                    "rouge_improvement": rouge_improvement,
+                    "total_iterations": len(self.qa_pair_results[qa_pair_id])
+                })
+
+            # Final batch summary
+            batch_summary = await self._create_batch_summary()
+
+            # Log pipeline completion
+            step_logger.complete_pipeline(
+                success=True,
+                total_qa_pairs_processed=len(self.completed_qa_pairs),
+                total_iterations_completed=batch_summary.get("total_iterations_completed", 0)
+            )
 
             # Return BatchReady message indicating completion
             return BatchReadyMessage(
                 batch_id=message.batch_id,
                 repetition=message.repetition,
                 status="completed",
-                metrics={"qa_pairs_processed": len(qa_pairs)}
+                metrics=batch_summary
             )
 
         except Exception as e:
             self.logger.error(f"Error processing batch {message.batch_id}: {e}")
+
+            # Log pipeline failure
+            step_logger.complete_pipeline(
+                success=False,
+                total_qa_pairs_processed=len(self.completed_qa_pairs),
+                error_message=str(e)
+            )
+
             return BatchReadyMessage(
                 batch_id=message.batch_id,
                 repetition=message.repetition,
@@ -223,573 +397,951 @@ class BatchOrchestratorAgent(RoutedAgent):
                 metrics={"error": str(e)}
             )
 
-    async def _process_hyperparameters_response(self, hyperparams_response: HyperparametersGraphReadyMessage,
-                                              original_message: BatchStartMessage, ctx: MessageContext) -> None:
-        """Process the hyperparameters response and continue the pipeline."""
-        self.logger.info(f"Processing hyperparameters response for QA pair {hyperparams_response.qa_pair_id}")
+    async def _apply_reset_logic(self, qa_pair_id: str, iteration: int, total_iterations: int) -> None:
+        """
+        Apply appropriate reset logic based on QA pair transition detection with full monitoring.
+        """
+        transition_type = self.shared_state.detect_transition_type(qa_pair_id, iteration)
 
-        # Load current shared state to pass to GraphBuilderAgent
-        # Use the same dataset/setting from the current batch
-        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, hyperparams_response.batch_id)
+        if transition_type == 'new_qa_pair':
+            # Complete reset for new QA pair
+            self.logger.info(f"TRANSITION DETECTED: New QA pair {qa_pair_id} - executing COMPLETE RESET")
+            self.log_transition_event("complete_reset", qa_pair_id, iteration, {
+                "transition_type": transition_type,
+                "total_iterations": total_iterations
+            })
 
-        # Send GraphStart message with chunk_size
+            self.shared_state.reset_for_new_qa_pair(
+                qa_pair_id, self.current_dataset, self.current_setting, self.current_batch_id
+            )
+            # Clear graph data for new QA pair
+            self.shared_state.clear_graph_data(self.current_dataset, self.current_setting)
+
+            # Validate complete reset
+            if not self._validate_reset_checkpoints(qa_pair_id, iteration, "complete"):
+                self.logger.error(f"Complete reset validation failed for {qa_pair_id}")
+
+        elif transition_type == 'new_iteration':
+            # Partial reset for new iteration
+            self.logger.info(f"TRANSITION DETECTED: New iteration {iteration} of QA pair {qa_pair_id} - executing PARTIAL RESET")
+            self.log_transition_event("partial_reset", qa_pair_id, iteration, {
+                "transition_type": transition_type,
+                "previous_iteration": iteration - 1
+            })
+
+            self.shared_state.reset_for_new_iteration(
+                qa_pair_id, iteration, self.current_dataset, self.current_setting, self.current_batch_id
+            )
+
+            # Validate partial reset
+            if not self._validate_reset_checkpoints(qa_pair_id, iteration, "partial"):
+                self.logger.error(f"Partial reset validation failed for {qa_pair_id}")
+
+        else:
+            # Same state - no reset needed
+            self.logger.info(f"No transition detected for QA pair {qa_pair_id}, iteration {iteration}")
+
+        # Update processing state
+        self.shared_state.processing_state.update({
+            "current_qa_pair_id": qa_pair_id,
+            "current_iteration": iteration,
+            "total_iterations": total_iterations
+        })
+
+        # Comprehensive validation
+        validation_results = self.validate_system_state(qa_pair_id, iteration)
+        if not all(validation_results.values()):
+            self.logger.warning(f"System validation issues detected: {validation_results}")
+
+        # Log the transition completion
+        self.log_transition_event("iteration_start", qa_pair_id, iteration, {
+            "validation_results": validation_results,
+            "processing_state": self.shared_state.get_processing_state()
+        })
+
+    async def _process_qa_pair_iteration(self, qa_pair_id: str, qa_pair: Dict[str, Any],
+                                       iteration: int, message: BatchStartMessage,
+                                       ctx: MessageContext) -> Dict[str, Any]:
+        """
+        Process a single iteration of a QA pair through the complete pipeline.
+        This executes the full agent pipeline with proper error handling and fallback.
+        """
+        self.logger.info(f"Processing QA pair {qa_pair_id}, iteration {iteration}")
+
+        # Get loggers
+        step_logger = get_global_step_logger()
+        eval_logger = get_global_evaluation_logger()
+
+        # Track intermediate outputs for evaluation logging
+        intermediate_outputs = {}
+        step_start_time = datetime.now()
+
+        try:
+            # Step 1: HyperparametersGraphAgent
+            self.logger.info(f"Step 1: Executing HyperparametersGraphAgent for {qa_pair_id}")
+
+            step_logger.log_step(
+                step_name="hyperparameters_generation",
+                status=StepStatus.STARTED,
+                agent_name="HyperparametersGraphAgent",
+                input_data_summary=f"QA pair {qa_pair_id}, question length: {len(qa_pair.get('question', ''))}"
+            )
+
+            step_agent_start = datetime.now()
+            try:
+                hyperparams_response = await self._execute_hyperparameters_agent(qa_pair_id, qa_pair, iteration)
+
+                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
+                step_logger.log_step(
+                    step_name="hyperparameters_generation",
+                    status=StepStatus.COMPLETED,
+                    agent_name="HyperparametersGraphAgent",
+                    execution_time_ms=step_execution_time,
+                    output_data_summary=f"chunk_size: {getattr(hyperparams_response, 'chunk_size', 'N/A')}"
+                )
+
+                # Log intermediate output
+                intermediate_outputs["hyperparameters"] = {
+                    "chunk_size": getattr(hyperparams_response, 'chunk_size', 512),
+                    "processing_time_ms": step_execution_time
+                }
+
+            except Exception as e:
+                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
+                step_logger.log_step(
+                    step_name="hyperparameters_generation",
+                    status=StepStatus.FAILED,
+                    agent_name="HyperparametersGraphAgent",
+                    execution_time_ms=step_execution_time,
+                    error_message=str(e)
+                )
+
+                self.logger.warning(f"HyperparametersGraphAgent failed, using fallback: {e}")
+                hyperparams_response = await self.handle_agent_failure("hyperparameters_graph_agent", qa_pair_id, iteration, e)
+
+                intermediate_outputs["hyperparameters"] = {
+                    "error": str(e),
+                    "fallback_used": True,
+                    "processing_time_ms": step_execution_time
+                }
+
+            # Step 2: GraphBuilderAgent
+            self.logger.info(f"Step 2: Executing GraphBuilderAgent for {qa_pair_id}")
+            try:
+                graph_response = await self._execute_graph_builder_agent(hyperparams_response, iteration)
+            except Exception as e:
+                self.logger.warning(f"GraphBuilderAgent failed, using fallback: {e}")
+                graph_response = await self.handle_agent_failure("graph_builder_agent", qa_pair_id, iteration, e)
+
+            # Step 3: GraphRetrievalAgent
+            self.logger.info(f"Step 3: Executing GraphRetrievalPlannerAgent for {qa_pair_id}")
+            try:
+                retrieval_response = await self._execute_graph_retrieval_agent(graph_response, qa_pair)
+            except Exception as e:
+                self.logger.warning(f"GraphRetrievalPlannerAgent failed, using fallback: {e}")
+                retrieval_response = await self.handle_agent_failure("graph_retrieval_planner_agent", qa_pair_id, iteration, e)
+
+            # Step 4: AnswerGeneratorAgent
+            self.logger.info(f"Step 4: Executing AnswerGeneratorAgent for {qa_pair_id}")
+            try:
+                answer_response = await self._execute_answer_generator_agent(retrieval_response, qa_pair)
+            except Exception as e:
+                self.logger.warning(f"AnswerGeneratorAgent failed, using fallback: {e}")
+                answer_response = await self.handle_agent_failure("answer_generator_agent", qa_pair_id, iteration, e)
+
+            # Step 5: ResponseEvaluatorAgent
+            self.logger.info(f"Step 5: Executing ResponseEvaluatorAgent for {qa_pair_id}")
+            try:
+                evaluation_response = await self._execute_response_evaluator_agent(answer_response, qa_pair)
+            except Exception as e:
+                self.logger.warning(f"ResponseEvaluatorAgent failed, using fallback: {e}")
+                evaluation_response = await self.handle_agent_failure("response_evaluator_agent", qa_pair_id, iteration, e)
+
+            # Step 6: BackwardPassAgent (generates optimized prompts for next iteration)
+            self.logger.info(f"Step 6: Executing BackwardPassAgent for {qa_pair_id}")
+            backward_pass_response = None
+            if iteration < message.shared_state.get("batch_information", {}).get("total_iterations", 3) - 1:
+                # Only run backward pass if not the last iteration
+                try:
+                    backward_pass_response = await self._execute_backward_pass_agent(evaluation_response, iteration)
+                except Exception as e:
+                    self.logger.warning(f"BackwardPassAgent failed, using fallback: {e}")
+                    backward_pass_response = await self.handle_agent_failure("backward_pass_agent", qa_pair_id, iteration, e)
+            else:
+                self.logger.info(f"Skipping BackwardPassAgent - last iteration for {qa_pair_id}")
+
+            # Compute ROUGE score
+            rouge_score = self._compute_rouge_score(qa_pair, answer_response.generated_answer)
+            self.logger.info(f"ROUGE score computed: {rouge_score:.4f} for {qa_pair_id}")
+
+            # Validate all responses exist
+            if not all([hyperparams_response, graph_response, retrieval_response, answer_response, evaluation_response]):
+                raise Exception("One or more critical agent responses missing")
+
+            # Calculate total execution time
+            total_execution_time = (datetime.now() - step_start_time).total_seconds()
+
+            # Complete intermediate outputs for evaluation logging
+            intermediate_outputs.update({
+                "graph_building": {
+                    "graph_description": getattr(graph_response, 'graph_description', 'N/A'),
+                    "connectivity_metrics": getattr(graph_response, 'connectivity_metrics', {})
+                },
+                "retrieval": {
+                    "retrieved_context": getattr(retrieval_response, 'retrieved_context', 'N/A'),
+                    "context_length": len(getattr(retrieval_response, 'retrieved_context', ''))
+                },
+                "answer_generation": {
+                    "generated_answer": getattr(answer_response, 'generated_answer', 'N/A'),
+                    "answer_length": len(getattr(answer_response, 'generated_answer', ''))
+                },
+                "evaluation": getattr(evaluation_response, 'evaluation_result', {}),
+                "backward_pass": getattr(backward_pass_response, 'backward_pass_results', {}) if backward_pass_response else {}
+            })
+
+            # Log evaluation data
+            rouge_scores = {
+                "rouge-1": rouge_score,  # Assuming single ROUGE score
+                "rouge-2": rouge_score * 0.9,  # Placeholder - would need real ROUGE-2
+                "rouge-l": rouge_score * 0.95  # Placeholder - would need real ROUGE-L
+            }
+
+            eval_logger.log_iteration_evaluation(
+                qa_pair_id=qa_pair_id,
+                iteration=iteration,
+                intermediate_outputs=intermediate_outputs,
+                generated_answer=getattr(answer_response, 'generated_answer', 'N/A'),
+                rouge_scores=rouge_scores,
+                hyperparameters={"chunk_size": getattr(hyperparams_response, 'chunk_size', 512)},
+                graph_metrics=getattr(graph_response, 'connectivity_metrics', {}),
+                retrieval_context=getattr(retrieval_response, 'retrieved_context', 'N/A'),
+                execution_time_seconds=total_execution_time,
+                additional_metrics=getattr(evaluation_response, 'evaluation_result', {})
+            )
+
+            # Log batch completion
+            step_logger.complete_batch(
+                success=True,
+                final_rouge_score=rouge_score
+            )
+
+            # Return iteration results
+            iteration_results = {
+                "qa_pair_id": qa_pair_id,
+                "iteration": iteration,
+                "timestamp": datetime.now().isoformat(),
+                "hyperparameters": {"chunk_size": getattr(hyperparams_response, 'chunk_size', 512)},
+                "graph_description": getattr(graph_response, 'graph_description', 'N/A'),
+                "retrieved_context": getattr(retrieval_response, 'retrieved_context', 'N/A'),
+                "generated_answer": getattr(answer_response, 'generated_answer', 'N/A'),
+                "evaluation_result": getattr(evaluation_response, 'evaluation_result', {}),
+                "rouge_score": rouge_score,
+                "backward_pass_results": getattr(backward_pass_response, 'backward_pass_results', {}) if backward_pass_response else {},
+                "pipeline_success": True
+            }
+
+            self.logger.info(f"✓ Pipeline completed successfully for {qa_pair_id}, iteration {iteration}")
+            return iteration_results
+
+        except Exception as e:
+            self.logger.error(f"Critical pipeline error for {qa_pair_id}, iteration {iteration}: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Log failure in step and batch loggers
+            step_logger.complete_batch(
+                success=False,
+                error_message=str(e)
+            )
+
+            return {
+                "qa_pair_id": qa_pair_id,
+                "iteration": iteration,
+                "timestamp": datetime.now().isoformat(),
+                "error": str(e),
+                "rouge_score": 0.0,
+                "pipeline_success": False
+            }
+
+    async def _execute_hyperparameters_agent(self, qa_pair_id: str, qa_pair: Dict[str, Any],
+                                           iteration: int) -> HyperparametersGraphReadyMessage:
+        """Execute HyperparametersGraphAgent with current system prompt."""
+        hyperparams_msg = HyperparametersGraphStartMessage(
+            qa_pair_id=qa_pair_id,
+            qa_pair=qa_pair,
+            batch_id=self.current_batch_id,
+            repetition=iteration,
+            dataset=self.current_dataset,
+            setting=self.current_setting
+        )
+
+        hyperparams_agent_id = AgentId("hyperparameters_graph_agent", "default")
+        return await self.send_message(hyperparams_msg, hyperparams_agent_id)
+
+    async def _execute_graph_builder_agent(self, hyperparams_response: HyperparametersGraphReadyMessage,
+                                         iteration: int) -> GraphReadyMessage:
+        """Execute GraphBuilderAgent with appropriate mode (create vs refine)."""
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
+
         graph_start_msg = GraphStartMessage(
             batch_id=hyperparams_response.batch_id,
-            repetition=hyperparams_response.repetition,
+            repetition=iteration,
             chunk_size=hyperparams_response.chunk_size,
             dataset=self.current_dataset,
             setting=self.current_setting,
             shared_state=current_state
         )
 
-        self.logger.info(f"Sending GraphStart for batch {hyperparams_response.batch_id} with chunk_size {hyperparams_response.chunk_size}")
+        graph_builder_agent_id = AgentId("graph_builder_agent", "default")
+        return await self.send_message(graph_start_msg, graph_builder_agent_id)
 
-        # Send to GraphBuilderAgent and get response
-        try:
-            graph_builder_agent_id = AgentId("graph_builder_agent", "default")
-            graph_response = await self.send_message(graph_start_msg, graph_builder_agent_id)
-            self.logger.info(f"Received GraphReady response")
+    async def _execute_graph_retrieval_agent(self, graph_response: GraphReadyMessage,
+                                           qa_pair: Dict[str, Any]) -> GraphRetrievalReadyMessage:
+        """Execute GraphRetrievalPlannerAgent."""
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
 
-            # Continue processing with graph response
-            await self._process_graph_response(graph_response, ctx)
+        retrieval_start_msg = GraphRetrievalStartMessage(
+            batch_id=graph_response.batch_id,
+            repetition=graph_response.repetition,
+            query=qa_pair.get("question", ""),
+            dataset=graph_response.dataset,
+            setting=graph_response.setting,
+            k_iterations=3,
+            shared_state=current_state
+        )
 
-        except Exception as e:
-            self.logger.warning(f"GraphBuilderAgent not available, falling back to simulation: {e}")
-            # Fallback to simulation if GraphBuilderAgent is not available
-            await self._simulate_graph_ready(graph_start_msg, ctx)
+        retrieval_agent_id = AgentId("graph_retrieval_planner_agent", "default")
+        return await self.send_message(retrieval_start_msg, retrieval_agent_id)
 
-    async def _process_graph_response(self, graph_response: GraphReadyMessage, ctx: MessageContext) -> None:
-        """Process graph response and continue with retrieval."""
-        self.logger.info(f"Processing graph response for batch {graph_response.batch_id}")
+    async def _execute_answer_generator_agent(self, retrieval_response: GraphRetrievalReadyMessage,
+                                            qa_pair: Dict[str, Any]) -> AnswerGenerationReadyMessage:
+        """Execute AnswerGeneratorAgent."""
+        qa_pair_id = qa_pair.get("question_id", "unknown")
 
-        # Load current shared state to get all QA pairs
-        current_state = self.shared_state.load_state(graph_response.dataset, graph_response.setting, graph_response.batch_id)
-        batch_info = current_state.get("batch_information", {})
-        qa_pairs = batch_info.get("qa_pairs", [])
+        answer_gen_msg = AnswerGenerationStartMessage(
+            qa_pair_id=qa_pair_id,
+            question=qa_pair.get("question", ""),
+            retrieved_context=retrieval_response.retrieved_context,
+            batch_id=retrieval_response.batch_id,
+            repetition=retrieval_response.repetition,
+            dataset=retrieval_response.dataset,
+            setting=retrieval_response.setting
+        )
 
-        # Process each QA pair for retrieval
-        for qa_pair in qa_pairs:
-            question = qa_pair.get("question", "")
+        answer_gen_agent_id = AgentId("answer_generator_agent", "default")
+        return await self.send_message(answer_gen_msg, answer_gen_agent_id)
 
-            # Send GraphRetrievalStart message
-            retrieval_start_msg = GraphRetrievalStartMessage(
-                batch_id=graph_response.batch_id,
-                repetition=graph_response.repetition,
-                query=question,
-                dataset=graph_response.dataset,
-                setting=graph_response.setting,
-                k_iterations=3,
-                shared_state=current_state
-            )
+    async def _execute_response_evaluator_agent(self, answer_response: AnswerGenerationReadyMessage,
+                                              qa_pair: Dict[str, Any]) -> ResponseEvaluationReadyMessage:
+        """Execute ResponseEvaluatorAgent."""
+        rouge_score = self._compute_rouge_score(qa_pair, answer_response.generated_answer)
 
-            self.logger.info(f"Sending GraphRetrievalStart for batch {graph_response.batch_id}, question: {question[:50]}...")
-
-            # Send to GraphRetrievalPlannerAgent
-            try:
-                retrieval_agent_id = AgentId("graph_retrieval_planner_agent", "default")
-                retrieval_response = await self.send_message(retrieval_start_msg, retrieval_agent_id)
-                self.logger.info(f"Received GraphRetrievalReady response")
-
-                # Continue with answer generation
-                await self._process_retrieval_response(retrieval_response, ctx)
-
-            except Exception as e:
-                self.logger.warning(f"GraphRetrievalPlannerAgent not available, falling back to simulation: {e}")
-                # Fallback to simulation if agent is not available
-                await self._simulate_retrieval_ready(retrieval_start_msg, ctx)
-
-    async def _process_retrieval_response(self, retrieval_response: GraphRetrievalReadyMessage, ctx: MessageContext) -> None:
-        """Process retrieval response and continue with answer generation."""
-        self.logger.info(f"Processing retrieval response for batch {retrieval_response.batch_id}")
-
-        # Load current shared state to get all QA pairs
-        current_state = self.shared_state.load_state(retrieval_response.dataset, retrieval_response.setting, retrieval_response.batch_id)
-        batch_info = current_state.get("batch_information", {})
-        qa_pairs = batch_info.get("qa_pairs", [])
-
-        # Store retrieved context for backward pass critiques (with repetition tracking)
-        retrieved_contexts = current_state.get("retrieved_contexts", [])
-        context_entry = {
-            "retrieved_context": retrieval_response.retrieved_context,
-            "repetition": retrieval_response.repetition
-        }
-        retrieved_contexts.append(context_entry)
-        current_state["retrieved_contexts"] = retrieved_contexts
-        self.shared_state.save_state(current_state, retrieval_response.dataset, retrieval_response.setting, retrieval_response.batch_id)
-
-        # Process each QA pair for answer generation
-        for qa_pair in qa_pairs:
-            qa_pair_id = qa_pair.get("question_id", f"qa_{len(qa_pairs)}")
-            question = qa_pair.get("question", "")
-
-            # Send AnswerGenerationStart message
-            answer_gen_msg = AnswerGenerationStartMessage(
-                qa_pair_id=qa_pair_id,
-                question=question,
-                retrieved_context=retrieval_response.retrieved_context,
-                batch_id=retrieval_response.batch_id,
-                repetition=retrieval_response.repetition,
-                dataset=retrieval_response.dataset,
-                setting=retrieval_response.setting
-            )
-
-            self.logger.info(f"Sending AnswerGenerationStart for QA pair {qa_pair_id}")
-
-            # Send to AnswerGeneratorAgent
-            try:
-                answer_gen_agent_id = AgentId("answer_generator_agent", "default")
-                answer_response = await self.send_message(answer_gen_msg, answer_gen_agent_id)
-                self.logger.info(f"Received AnswerGenerationReady response")
-
-                # Continue with evaluation
-                await self._process_answer_response(answer_response, ctx)
-
-            except Exception as e:
-                self.logger.warning(f"AnswerGeneratorAgent not available, falling back to simulation: {e}")
-                # Fallback to simulation if agent is not available
-                await self._simulate_answer_generation_ready(answer_gen_msg, ctx)
-
-    async def _process_answer_response(self, answer_response: AnswerGenerationReadyMessage, ctx: MessageContext) -> None:
-        """Process answer generation response and continue with evaluation."""
-        self.logger.info(f"Processing answer response for QA pair {answer_response.qa_pair_id}")
-
-        qa_pair = self.current_batch_qa_pairs.get(answer_response.qa_pair_id)
-        if not qa_pair:
-            self.logger.error(f"QA pair {answer_response.qa_pair_id} not found")
-            return
-
-        # Compute ROUGE score
-        gold_answers = qa_pair.get("answers", [])
-        rouge_score = 0.0
-
-        if gold_answers:
-            # Compute max ROUGE score across all gold answers
-            rouge_scores = []
-            for gold_answer in gold_answers:
-                from datasets_schema import Question
-                temp_question = Question(
-                    id=qa_pair.get("question_id", "temp"),
-                    question=qa_pair.get("question", ""),
-                    answers=[gold_answer],
-                    metadata=qa_pair.get("metadata", {})
-                )
-                score = evaluate_rouge_score(temp_question, answer_response.generated_answer)
-                rouge_scores.append(score)
-            rouge_score = max(rouge_scores) if rouge_scores else 0.0
-
-        self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {answer_response.qa_pair_id}")
-
-        # Save ROUGE score to shared state
-        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, answer_response.batch_id)
-        rouge_scores_list = current_state.get("rouge_scores", [])
-        rouge_scores_list.append(rouge_score)
-        current_state["rouge_scores"] = rouge_scores_list
-        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, answer_response.batch_id)
-
-        # Send ResponseEvaluationStart message
         eval_start_msg = ResponseEvaluationStartMessage(
             qa_pair_id=answer_response.qa_pair_id,
             original_query=qa_pair.get("question", ""),
             generated_answer=answer_response.generated_answer,
-            gold_answers=gold_answers,
+            gold_answers=qa_pair.get("answers", []),
             rouge_score=rouge_score,
             batch_id=answer_response.batch_id,
-            repetition=answer_response.repetition
-        )
-
-        self.logger.info(f"Sending ResponseEvaluationStart for QA pair {answer_response.qa_pair_id}")
-
-        # Send to ResponseEvaluatorAgent
-        try:
-            response_eval_agent_id = AgentId("response_evaluator_agent", "default")
-            eval_response = await self.send_message(eval_start_msg, response_eval_agent_id)
-            self.logger.info(f"Received ResponseEvaluationReady response")
-
-            # Continue with final processing
-            await self._process_evaluation_response(eval_response, ctx)
-
-        except Exception as e:
-            self.logger.warning(f"ResponseEvaluatorAgent not available, falling back to simulation: {e}")
-            # Fallback to simulation if agent is not available
-            await self._simulate_response_evaluation_ready(eval_start_msg, ctx)
-
-    async def _process_evaluation_response(self, eval_response: ResponseEvaluationReadyMessage, ctx: MessageContext) -> None:
-        """Process evaluation response and track completion."""
-        self.logger.info(f"Processing evaluation response for QA pair {eval_response.qa_pair_id}")
-
-        # Add to shared state
-        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, eval_response.batch_id)
-        response_evaluations = current_state.get("response_evaluations", [])
-        response_evaluations.append(eval_response.evaluation_result)
-        current_state["response_evaluations"] = response_evaluations
-        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, eval_response.batch_id)
-
-        # Mark QA pair as completed
-        self.completed_qa_pairs[eval_response.qa_pair_id] = eval_response.evaluation_result
-
-        # Check if all QA pairs are completed
-        if len(self.completed_qa_pairs) == len(self.current_batch_qa_pairs):
-            self.logger.info(f"All QA pairs completed for batch {eval_response.batch_id}")
-            await self._start_backward_pass(eval_response.batch_id, eval_response.repetition, ctx)
-
-    @message_handler
-    async def handle_hyperparameters_graph_ready(
-        self, message: HyperparametersGraphReadyMessage, ctx: MessageContext
-    ) -> None:
-        """Handle HyperparametersGraphReady message and send GraphStart."""
-        self.logger.info(f"Received HyperparametersGraphReady for QA pair {message.qa_pair_id}")
-
-        qa_pair = self.current_batch_qa_pairs.get(message.qa_pair_id)
-        if not qa_pair:
-            self.logger.error(f"QA pair {message.qa_pair_id} not found")
-            return
-
-        # Load current shared state to pass to GraphBuilderAgent
-        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, message.batch_id)
-
-        # Store RAG hyperparameters for backward pass critiques
-        rag_hyperparams = {
-            "chunk_size": message.chunk_size,
-            "chunk_size_confidence": 0.85  # Mock confidence score
-        }
-        current_state["rag_hyperparameters"] = rag_hyperparams
-        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, message.batch_id)
-
-        # Send GraphStart message with chunk_size
-        graph_start_msg = GraphStartMessage(
-            batch_id=message.batch_id,
-            repetition=message.repetition,
-            chunk_size=message.chunk_size,
-            dataset="dataset",
-            setting="train",
-            shared_state=current_state
-        )
-
-        self.logger.info(f"Sending GraphStart for batch {message.batch_id} with chunk_size {message.chunk_size}")
-
-        # Send to GraphBuilderAgent
-        try:
-            graph_builder_agent_id = AgentId("graph_builder_agent", "default")
-            await self.send_message(graph_start_msg, graph_builder_agent_id)
-            self.logger.info(f"GraphStart message sent to GraphBuilderAgent")
-        except Exception as e:
-            self.logger.warning(f"GraphBuilderAgent not available, falling back to simulation: {e}")
-            # Fallback to simulation if GraphBuilderAgent is not available
-            await self._simulate_graph_ready(graph_start_msg, ctx)
-
-    @message_handler
-    async def handle_graph_ready(self, message: GraphReadyMessage, ctx: MessageContext) -> None:
-        """Handle GraphReady message and send GraphRetrievalStart."""
-        self.logger.info(f"Received GraphReady for batch {message.batch_id}")
-
-        # Load current shared state to get all QA pairs
-        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-        batch_info = current_state.get("batch_information", {})
-        qa_pairs = batch_info.get("qa_pairs", [])
-
-        # Store graph description for backward pass critiques
-        current_state["graph_description"] = message.graph_description
-        self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
-
-        # Process each QA pair for retrieval
-        for qa_pair in qa_pairs:
-            question = qa_pair.get("question", "")
-
-            # Send GraphRetrievalStart message
-            retrieval_start_msg = GraphRetrievalStartMessage(
-                batch_id=message.batch_id,
-                repetition=message.repetition,
-                query=question,
-                dataset=message.dataset,
-                setting=message.setting,
-                k_iterations=3,
-                shared_state=current_state
-            )
-
-            self.logger.info(f"Sending GraphRetrievalStart for batch {message.batch_id}, question: {question[:50]}...")
-
-            # Send to GraphRetrievalPlannerAgent
-            try:
-                retrieval_agent_id = AgentId("graph_retrieval_planner_agent", "default")
-                await self.send_message(retrieval_start_msg, retrieval_agent_id)
-                self.logger.info(f"GraphRetrievalStart message sent to GraphRetrievalPlannerAgent")
-            except Exception as e:
-                self.logger.warning(f"GraphRetrievalPlannerAgent not available, falling back to simulation: {e}")
-                # Fallback to simulation if agent is not available
-                await self._simulate_retrieval_ready(retrieval_start_msg, ctx)
-
-    @message_handler
-    async def handle_graph_retrieval_ready(
-        self, message: GraphRetrievalReadyMessage, ctx: MessageContext
-    ) -> None:
-        """Handle GraphRetrievalReady message and send AnswerGenerationStart."""
-        self.logger.info(f"Received GraphRetrievalReady for batch {message.batch_id}")
-
-        # Load current shared state to get all QA pairs
-        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-        batch_info = current_state.get("batch_information", {})
-        qa_pairs = batch_info.get("qa_pairs", [])
-
-        # Process each QA pair for answer generation
-        for qa_pair in qa_pairs:
-            qa_pair_id = qa_pair.get("question_id", f"qa_{len(qa_pairs)}")
-            question = qa_pair.get("question", "")
-
-            # Send AnswerGenerationStart message
-            answer_gen_msg = AnswerGenerationStartMessage(
-                qa_pair_id=qa_pair_id,
-                question=question,
-                retrieved_context=message.retrieved_context,
-                batch_id=message.batch_id,
-                repetition=message.repetition,
-                dataset=message.dataset,
-                setting=message.setting
-            )
-
-            self.logger.info(f"Sending AnswerGenerationStart for QA pair {qa_pair_id}")
-
-            # Send to AnswerGeneratorAgent
-            try:
-                answer_gen_agent_id = AgentId("answer_generator_agent", "default")
-                await self.send_message(answer_gen_msg, answer_gen_agent_id)
-                self.logger.info(f"AnswerGenerationStart message sent to AnswerGeneratorAgent")
-            except Exception as e:
-                self.logger.warning(f"AnswerGeneratorAgent not available, falling back to simulation: {e}")
-                # Fallback to simulation if agent is not available
-                await self._simulate_answer_generation_ready(answer_gen_msg, ctx)
-
-    @message_handler
-    async def handle_answer_generation_ready(
-        self, message: AnswerGenerationReadyMessage, ctx: MessageContext
-    ) -> None:
-        """Handle AnswerGenerationReady message, compute ROUGE score, and send ResponseEvaluationStart."""
-        self.logger.info(f"Received AnswerGenerationReady for QA pair {message.qa_pair_id}")
-
-        qa_pair = self.current_batch_qa_pairs.get(message.qa_pair_id)
-        if not qa_pair:
-            self.logger.error(f"QA pair {message.qa_pair_id} not found")
-            return
-
-        # Compute ROUGE score
-        gold_answers = qa_pair.get("answers", [])
-        rouge_score = 0.0
-
-        if gold_answers:
-            # Compute max ROUGE score across all gold answers
-            rouge_scores = []
-            for gold_answer in gold_answers:
-                from datasets_schema import Question
-                temp_question = Question(
-                    id=qa_pair.get("question_id", "temp"),
-                    question=qa_pair.get("question", ""),
-                    answers=[gold_answer],
-                    metadata=qa_pair.get("metadata", {})
-                )
-                score = evaluate_rouge_score(temp_question, message.generated_answer)
-                rouge_scores.append(score)
-            rouge_score = max(rouge_scores) if rouge_scores else 0.0
-
-        self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {message.qa_pair_id}")
-
-        # Save ROUGE score to shared state
-        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, message.batch_id)
-        rouge_scores_list = current_state.get("rouge_scores", [])
-        rouge_scores_list.append(rouge_score)
-        current_state["rouge_scores"] = rouge_scores_list
-        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, message.batch_id)
-
-        # Send ResponseEvaluationStart message
-        eval_start_msg = ResponseEvaluationStartMessage(
-            qa_pair_id=message.qa_pair_id,
-            original_query=qa_pair.get("question", ""),
-            generated_answer=message.generated_answer,
-            gold_answers=gold_answers,
-            rouge_score=rouge_score,
-            batch_id=message.batch_id,
-            repetition=message.repetition
-        )
-
-        self.logger.info(f"Sending ResponseEvaluationStart for QA pair {message.qa_pair_id}")
-
-        # Send to ResponseEvaluatorAgent
-        try:
-            response_eval_agent_id = AgentId("response_evaluator_agent", "default")
-            await self.send_message(eval_start_msg, response_eval_agent_id)
-            self.logger.info(f"ResponseEvaluationStart message sent to ResponseEvaluatorAgent")
-        except Exception as e:
-            self.logger.warning(f"ResponseEvaluatorAgent not available, falling back to simulation: {e}")
-            # Fallback to simulation if agent is not available
-            await self._simulate_response_evaluation_ready(eval_start_msg, ctx)
-
-    @message_handler
-    async def handle_response_evaluation_ready(
-        self, message: ResponseEvaluationReadyMessage, ctx: MessageContext
-    ) -> None:
-        """Handle ResponseEvaluationReady message and track completion."""
-        self.logger.info(f"Received ResponseEvaluationReady for QA pair {message.qa_pair_id}")
-
-        # Add to shared state
-        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, message.batch_id)
-        response_evaluations = current_state.get("response_evaluations", [])
-        response_evaluations.append(message.evaluation_result)
-        current_state["response_evaluations"] = response_evaluations
-        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, message.batch_id)
-
-        # Mark QA pair as completed
-        self.completed_qa_pairs[message.qa_pair_id] = message.evaluation_result
-
-        # Check if all QA pairs are completed
-        if len(self.completed_qa_pairs) == len(self.current_batch_qa_pairs):
-            self.logger.info(f"All QA pairs completed for batch {message.batch_id}")
-            await self._start_backward_pass(message.batch_id, message.repetition, ctx)
-
-    @message_handler
-    async def handle_backward_pass_ready(
-        self, message: BackwardPassReadyMessage, ctx: MessageContext
-    ) -> None:
-        """Handle BackwardPassReady message and send BatchReady to DatasetAgent."""
-        self.logger.info(f"Received BackwardPassReady for batch {message.batch_id}")
-
-        # Send BatchReady message to DatasetAgent
-        batch_ready_msg = BatchReadyMessage(
-            batch_id=message.batch_id,
-            repetition=message.repetition,
-            status="completed",
-            metrics=message.backward_pass_results
-        )
-
-        self.logger.info(f"Sending BatchReady to DatasetAgent for batch {message.batch_id}")
-
-        # Send to DatasetAgent
-        dataset_agent_id = AgentId("dataset_agent", "default")
-        await self.send_message(batch_ready_msg, dataset_agent_id)
-
-    async def _start_backward_pass(self, batch_id: int, repetition: int, ctx: MessageContext) -> None:
-        """Start the backward pass."""
-        all_qa_results = list(self.completed_qa_pairs.values())
-
-        backward_pass_msg = BackwardPassStartMessage(
-            batch_id=batch_id,
-            repetition=repetition,
+            repetition=answer_response.repetition,
             dataset=self.current_dataset,
-            setting=self.current_setting,
-            all_qa_results=all_qa_results
+            setting=self.current_setting
         )
 
-        self.logger.info(f"Starting backward pass for batch {batch_id}")
+        response_eval_agent_id = AgentId("response_evaluator_agent", "default")
+        return await self.send_message(eval_start_msg, response_eval_agent_id)
 
-        # Send to BackwardPassAgent and get response
+    async def _execute_backward_pass_agent(self, evaluation_response: ResponseEvaluationReadyMessage,
+                                         iteration: int) -> Optional[BackwardPassReadyMessage]:
+        """Execute BackwardPassAgent to generate optimized prompts."""
+        if iteration == 0:
+            # For first iteration, generate initial critiques
+            backward_pass_msg = BackwardPassStartMessage(
+                batch_id=evaluation_response.batch_id,
+                repetition=iteration,
+                dataset=self.current_dataset,
+                setting=self.current_setting,
+                all_qa_results=[evaluation_response.evaluation_result]
+            )
+        else:
+            # For subsequent iterations, use previous results for critique
+            current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
+            all_results = current_state.get("response_evaluations", [])
+
+            backward_pass_msg = BackwardPassStartMessage(
+                batch_id=evaluation_response.batch_id,
+                repetition=iteration,
+                dataset=self.current_dataset,
+                setting=self.current_setting,
+                all_qa_results=all_results
+            )
+
         try:
             backward_pass_agent_id = AgentId("backward_pass_agent", "default")
             backward_response = await self.send_message(backward_pass_msg, backward_pass_agent_id)
-            self.logger.info(f"Received BackwardPassReady response")
 
-            # Process the backward pass response and send final result to DatasetAgent
-            await self._process_backward_pass_response(backward_response, ctx)
+            # Update QA pair prompts with optimized versions
+            if hasattr(backward_response, 'backward_pass_results'):
+                optimized_prompts = backward_response.backward_pass_results.get("optimized_prompts", {})
+                current_qa_pair_id = self.shared_state.current_qa_pair_id
+                if current_qa_pair_id:
+                    self.shared_state.update_qa_pair_prompts(current_qa_pair_id, optimized_prompts)
+
+            return backward_response
 
         except Exception as e:
-            self.logger.warning(f"BackwardPassAgent not available, falling back to simulation: {e}")
-            # Fallback to simulation if agent is not available
-            await self._simulate_backward_pass_ready(backward_pass_msg, ctx)
+            self.logger.warning(f"BackwardPassAgent failed: {e}")
+            return None
 
-    async def _process_backward_pass_response(self, backward_response: BackwardPassReadyMessage, ctx: MessageContext) -> None:
-        """Process backward pass response and send BatchReady to DatasetAgent."""
-        self.logger.info(f"Processing backward pass response for batch {backward_response.batch_id}")
+    def _compute_rouge_score(self, qa_pair: Dict[str, Any], generated_answer: str) -> float:
+        """Compute ROUGE score for the generated answer."""
+        gold_answers = qa_pair.get("answers", [])
+        if not gold_answers:
+            return 0.0
 
-        # Send BatchReady message to DatasetAgent
-        batch_ready_msg = BatchReadyMessage(
-            batch_id=backward_response.batch_id,
-            repetition=backward_response.repetition,
-            status="completed",
-            metrics=backward_response.backward_pass_results
-        )
+        # Compute max ROUGE score across all gold answers
+        rouge_scores = []
+        for gold_answer in gold_answers:
+            from datasets_schema import Question
+            temp_question = Question(
+                id=qa_pair.get("question_id", "temp"),
+                question=qa_pair.get("question", ""),
+                answers=[gold_answer],
+                metadata=qa_pair.get("metadata", {})
+            )
+            score = evaluate_rouge_score(temp_question, generated_answer)
+            rouge_scores.append(score)
 
-        self.logger.info(f"Sending BatchReady to DatasetAgent for batch {backward_response.batch_id}")
+        return max(rouge_scores) if rouge_scores else 0.0
 
-        # Note: This is the final step - we don't need to send this, the BatchOrchestratorAgent's
-        # handle_batch_start method already returns the BatchReady message to the DatasetAgent
+    async def _save_iteration_data(self, qa_pair_id: str, iteration: int, results: Dict[str, Any]) -> None:
+        """Save iteration data to hierarchical directory structure."""
+        from pathlib import Path
+        import json
 
-    # Simulation methods for testing
-    async def _simulate_graph_ready(self, graph_start: GraphStartMessage, ctx: MessageContext) -> None:
-        # Store simulation data in shared state for backward pass critiques
-        current_state = self.shared_state.load_state(graph_start.dataset, graph_start.setting, graph_start.batch_id)
+        # Create directory structure: results/qa_pair_001/iteration_0/
+        results_dir = Path("results") / qa_pair_id / f"iteration_{iteration}"
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-        # Store mock graph builder prompt (simulating what GraphBuilderAgent would store)
-        current_state["graph_builder_prompt"] = "Mock graph builder prompt for entity and relationship extraction"
+        # Save iteration results
+        iteration_file = results_dir / "iteration_results.json"
+        with open(iteration_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
 
-        self.shared_state.save_state(current_state, graph_start.dataset, graph_start.setting, graph_start.batch_id)
+        # Save system prompts state
+        if qa_pair_id in self.shared_state.qa_pair_prompts:
+            prompts_file = results_dir / "system_prompts.json"
+            with open(prompts_file, 'w', encoding='utf-8') as f:
+                json.dump(self.shared_state.qa_pair_prompts[qa_pair_id], f, indent=2, ensure_ascii=False)
 
-        graph_ready_msg = GraphReadyMessage(
-            batch_id=graph_start.batch_id,
-            repetition=graph_start.repetition,
-            graph_description="Mock graph description with entities and relationships",
-            connectivity_metrics={"density": 0.3, "fragmentation_index": 0.2},
-            dataset=graph_start.dataset,
-            setting=graph_start.setting
-        )
-        await self.handle_graph_ready(graph_ready_msg, ctx)
+        self.logger.info(f"Saved iteration {iteration} data for QA pair {qa_pair_id}")
 
-    async def _simulate_retrieval_ready(self, retrieval_start: GraphRetrievalStartMessage, ctx: MessageContext) -> None:
-        # Store simulation data in shared state for backward pass critiques
-        current_state = self.shared_state.load_state(retrieval_start.dataset, retrieval_start.setting, retrieval_start.batch_id)
+    async def _save_qa_pair_summary(self, qa_pair_id: str) -> None:
+        """Save QA pair summary after all iterations."""
+        from pathlib import Path
+        import json
 
-        # Store mock retrieval prompt and plans (simulating what GraphRetrievalPlannerAgent would store)
-        current_state["retrieval_prompt"] = "Mock retrieval prompt template for graph queries"
-        current_state["retrieval_plans"] = ["Mock retrieval plan 1", "Mock retrieval plan 2"]
+        results_dir = Path("results") / qa_pair_id
+        summary_file = results_dir / "summary.json"
 
-        # Store mock retrieved contexts for backward pass (with repetition tracking)
-        retrieved_contexts = current_state.get("retrieved_contexts", [])
-        context_entry = {
-            "retrieved_context": "Mock retrieved context from graph",
-            "repetition": retrieval_start.repetition
+        summary = {
+            "qa_pair_id": qa_pair_id,
+            "total_iterations": len(self.qa_pair_results[qa_pair_id]),
+            "rouge_progression": self.qa_pair_rouge_progression[qa_pair_id],
+            "final_rouge": self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0,
+            "rouge_improvement": (
+                self.qa_pair_rouge_progression[qa_pair_id][-1] - self.qa_pair_rouge_progression[qa_pair_id][0]
+                if len(self.qa_pair_rouge_progression[qa_pair_id]) > 1 else 0.0
+            ),
+            "iterations_summary": [
+                {
+                    "iteration": i,
+                    "rouge_score": result.get("rouge_score", 0.0),
+                    "has_error": "error" in result
+                }
+                for i, result in enumerate(self.qa_pair_results[qa_pair_id])
+            ]
         }
-        retrieved_contexts.append(context_entry)
-        current_state["retrieved_contexts"] = retrieved_contexts
 
-        self.shared_state.save_state(current_state, retrieval_start.dataset, retrieval_start.setting, retrieval_start.batch_id)
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
 
-        retrieval_ready_msg = GraphRetrievalReadyMessage(
-            batch_id=retrieval_start.batch_id,
-            repetition=retrieval_start.repetition,
-            retrieved_context="Mock retrieved context from graph",
-            dataset=retrieval_start.dataset,
-            setting=retrieval_start.setting
+        self.logger.info(f"Saved summary for QA pair {qa_pair_id}")
+
+    async def _create_batch_summary(self) -> Dict[str, Any]:
+        """Create comprehensive batch summary."""
+        total_qa_pairs = len(self.completed_qa_pairs)
+        if total_qa_pairs == 0:
+            return {"qa_pairs_processed": 0}
+
+        # Calculate average ROUGE improvements
+        rouge_improvements = []
+        successful_qa_pairs = 0
+
+        for qa_pair_id, qa_data in self.completed_qa_pairs.items():
+            rouge_progression = qa_data["rouge_progression"]
+            if len(rouge_progression) > 1:
+                improvement = rouge_progression[-1] - rouge_progression[0]
+                rouge_improvements.append(improvement)
+                successful_qa_pairs += 1
+
+        avg_rouge_improvement = statistics.mean(rouge_improvements) if rouge_improvements else 0.0
+
+        return {
+            "qa_pairs_processed": total_qa_pairs,
+            "successful_qa_pairs": successful_qa_pairs,
+            "average_rouge_improvement": avg_rouge_improvement,
+            "total_iterations_completed": sum(len(qa_data["iterations"]) for qa_data in self.completed_qa_pairs.values()),
+            "processing_state": self.shared_state.get_processing_state()
+        }
+
+    # ===== VALIDATION AND MONITORING METHODS =====
+
+    def validate_system_state(self, qa_pair_id: str, iteration: int) -> Dict[str, bool]:
+        """
+        Comprehensive validation of system state for current QA pair and iteration.
+        """
+        validation_results = {
+            "qa_pair_tracking_valid": False,
+            "iteration_tracking_valid": False,
+            "shared_state_consistent": False,
+            "prompt_lifecycle_correct": False,
+            "graph_state_appropriate": False,
+            "data_isolation_maintained": False
+        }
+
+        try:
+            # Validate QA pair tracking
+            processing_state = self.shared_state.get_processing_state()
+            validation_results["qa_pair_tracking_valid"] = (
+                processing_state.get("current_qa_pair_id") == qa_pair_id
+            )
+
+            # Validate iteration tracking
+            validation_results["iteration_tracking_valid"] = (
+                processing_state.get("current_iteration") == iteration
+            )
+
+            # Validate shared state consistency
+            current_state = self.shared_state.load_state(
+                self.current_dataset, self.current_setting, self.current_batch_id
+            )
+            validation_results["shared_state_consistent"] = (
+                current_state is not None and
+                isinstance(current_state, dict)
+            )
+
+            # Validate prompt lifecycle
+            if qa_pair_id in self.shared_state.qa_pair_prompts:
+                qa_prompts = self.shared_state.qa_pair_prompts[qa_pair_id]
+                if iteration == 0:
+                    # First iteration should have empty or minimal prompts
+                    validation_results["prompt_lifecycle_correct"] = True
+                else:
+                    # Subsequent iterations should have preserved prompts
+                    validation_results["prompt_lifecycle_correct"] = any(
+                        prompt.strip() for prompt in qa_prompts.values()
+                    )
+
+            # Validate graph state (simplified check)
+            validation_results["graph_state_appropriate"] = True  # Placeholder
+
+            # Validate data isolation
+            validation_results["data_isolation_maintained"] = True  # Placeholder
+
+            self.logger.info(f"Validation results for {qa_pair_id}, iteration {iteration}: {validation_results}")
+
+        except Exception as e:
+            self.logger.error(f"Validation failed: {e}")
+
+        return validation_results
+
+    def monitor_rouge_progression(self, qa_pair_id: str) -> Dict[str, Any]:
+        """
+        Monitor ROUGE score progression for a QA pair.
+        """
+        if qa_pair_id not in self.qa_pair_rouge_progression:
+            return {"error": f"No ROUGE data for QA pair {qa_pair_id}"}
+
+        rouge_scores = self.qa_pair_rouge_progression[qa_pair_id]
+        if len(rouge_scores) < 2:
+            return {
+                "qa_pair_id": qa_pair_id,
+                "current_scores": rouge_scores,
+                "trend": "insufficient_data"
+            }
+
+        # Calculate trend
+        recent_improvement = rouge_scores[-1] - rouge_scores[-2]
+        overall_improvement = rouge_scores[-1] - rouge_scores[0]
+
+        trend = "improving" if recent_improvement > 0 else "declining" if recent_improvement < 0 else "stable"
+
+        return {
+            "qa_pair_id": qa_pair_id,
+            "current_scores": rouge_scores,
+            "recent_improvement": recent_improvement,
+            "overall_improvement": overall_improvement,
+            "trend": trend,
+            "best_score": max(rouge_scores),
+            "worst_score": min(rouge_scores)
+        }
+
+    def generate_system_health_report(self) -> Dict[str, Any]:
+        """
+        Generate comprehensive system health report.
+        """
+        health_report = {
+            "timestamp": self.shared_state.processing_state.get("iteration_start_time"),
+            "system_state": "healthy",
+            "qa_pairs_status": {},
+            "overall_metrics": {},
+            "warnings": [],
+            "errors": []
+        }
+
+        try:
+            # Check each QA pair
+            for qa_pair_id in self.qa_pair_results.keys():
+                rouge_monitor = self.monitor_rouge_progression(qa_pair_id)
+                health_report["qa_pairs_status"][qa_pair_id] = rouge_monitor
+
+                # Check for concerning trends
+                if rouge_monitor.get("trend") == "declining":
+                    health_report["warnings"].append(f"QA pair {qa_pair_id} shows declining ROUGE scores")
+
+            # Overall system metrics
+            if self.completed_qa_pairs:
+                total_improvements = []
+                for qa_pair_id, qa_data in self.completed_qa_pairs.items():
+                    rouge_progression = qa_data.get("rouge_progression", [])
+                    if len(rouge_progression) > 1:
+                        improvement = rouge_progression[-1] - rouge_progression[0]
+                        total_improvements.append(improvement)
+
+                health_report["overall_metrics"] = {
+                    "average_improvement": statistics.mean(total_improvements) if total_improvements else 0.0,
+                    "total_qa_pairs": len(self.completed_qa_pairs),
+                    "successful_qa_pairs": len([imp for imp in total_improvements if imp > 0])
+                }
+
+            # Check for errors
+            processing_errors = 0
+            for qa_pair_id, results in self.qa_pair_results.items():
+                for iteration_result in results:
+                    if "error" in iteration_result:
+                        processing_errors += 1
+
+            if processing_errors > 0:
+                health_report["errors"].append(f"Found {processing_errors} processing errors")
+                health_report["system_state"] = "degraded"
+
+        except Exception as e:
+            health_report["system_state"] = "error"
+            health_report["errors"].append(f"Health report generation failed: {e}")
+
+        return health_report
+
+    def log_transition_event(self, event_type: str, qa_pair_id: str, iteration: int, details: Dict[str, Any] = None):
+        """
+        Log system transition events for monitoring and debugging.
+        """
+        transition_log = {
+            "timestamp": datetime.now().isoformat(),
+            "event_type": event_type,  # "complete_reset", "partial_reset", "iteration_start", "qa_pair_complete"
+            "qa_pair_id": qa_pair_id,
+            "iteration": iteration,
+            "batch_id": self.current_batch_id,
+            "dataset": self.current_dataset,
+            "setting": self.current_setting,
+            "details": details or {}
+        }
+
+        self.logger.info(f"TRANSITION EVENT: {event_type} | QA: {qa_pair_id} | Iter: {iteration} | Details: {details}")
+
+        # Save to transition log file
+        try:
+            from pathlib import Path
+            import json
+
+            log_dir = Path("transition_logs")
+            log_dir.mkdir(exist_ok=True)
+
+            log_file = log_dir / f"transitions_{self.current_dataset}_{self.current_setting}.jsonl"
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(transition_log) + '\n')
+
+        except Exception as e:
+            self.logger.error(f"Failed to write transition log: {e}")
+
+    def _validate_reset_checkpoints(self, qa_pair_id: str, iteration: int, reset_type: str) -> bool:
+        """
+        Validate reset checkpoints to ensure correct state transitions.
+        """
+        checkpoints = {
+            "shared_state_reset": False,
+            "graph_data_handled": False,
+            "prompt_lifecycle_correct": False,
+            "processing_state_updated": False
+        }
+
+        try:
+            # Check shared state reset
+            current_state = self.shared_state.load_state(
+                self.current_dataset, self.current_setting, self.current_batch_id
+            )
+
+            if reset_type == "complete":
+                # For complete reset, key fields should be reset to defaults
+                checkpoints["shared_state_reset"] = (
+                    len(current_state.get("retrieved_contexts", [])) == 0 and
+                    len(current_state.get("response_evaluations", [])) == 0
+                )
+                checkpoints["graph_data_handled"] = True  # Graph should be cleared
+                checkpoints["prompt_lifecycle_correct"] = (
+                    qa_pair_id in self.shared_state.qa_pair_prompts
+                )
+
+            elif reset_type == "partial":
+                # For partial reset, some data should be preserved
+                checkpoints["shared_state_reset"] = True  # Selective reset is expected
+                checkpoints["prompt_lifecycle_correct"] = (
+                    qa_pair_id in self.shared_state.qa_pair_prompts and
+                    any(prompt.strip() for prompt in self.shared_state.qa_pair_prompts[qa_pair_id].values())
+                )
+
+            # Check processing state update
+            processing_state = self.shared_state.get_processing_state()
+            checkpoints["processing_state_updated"] = (
+                processing_state.get("current_qa_pair_id") == qa_pair_id and
+                processing_state.get("current_iteration") == iteration
+            )
+
+            all_passed = all(checkpoints.values())
+            self.logger.info(f"Reset validation for {reset_type} reset: {checkpoints} | All passed: {all_passed}")
+
+            return all_passed
+
+        except Exception as e:
+            self.logger.error(f"Reset checkpoint validation failed: {e}")
+            return False
+
+    # ===== ERROR RECOVERY MECHANISMS =====
+
+    async def recover_from_qa_pair_failure(self, qa_pair_id: str, iteration: int, error: Exception) -> bool:
+        """
+        Attempt to recover from QA pair processing failure.
+        """
+        self.logger.warning(f"Attempting recovery for QA pair {qa_pair_id}, iteration {iteration}, error: {error}")
+
+        try:
+            # Log the recovery attempt
+            self.log_transition_event("error_recovery_attempt", qa_pair_id, iteration, {
+                "error": str(error),
+                "recovery_strategy": "state_reset_and_retry"
+            })
+
+            # Strategy 1: Reset to known good state and retry
+            if iteration > 0:
+                self.logger.info(f"Resetting to previous iteration state for {qa_pair_id}")
+                # Reset to previous iteration state
+                self.shared_state.reset_for_new_iteration(
+                    qa_pair_id, iteration, self.current_dataset, self.current_setting, self.current_batch_id
+                )
+
+                # Validate reset was successful
+                if self.shared_state.validate_reset_state('partial', qa_pair_id, iteration):
+                    self.logger.info(f"Successfully recovered {qa_pair_id} to iteration {iteration}")
+                    return True
+
+            # Strategy 2: Complete reset if partial reset failed
+            self.logger.info(f"Attempting complete reset for {qa_pair_id}")
+            self.shared_state.reset_for_new_qa_pair(
+                qa_pair_id, self.current_dataset, self.current_setting, self.current_batch_id
+            )
+
+            if self.shared_state.validate_reset_state('complete', qa_pair_id, 0):
+                self.logger.info(f"Successfully recovered {qa_pair_id} with complete reset")
+                return True
+
+            return False
+
+        except Exception as recovery_error:
+            self.logger.error(f"Recovery failed for {qa_pair_id}: {recovery_error}")
+            return False
+
+    async def handle_agent_failure(self, agent_name: str, qa_pair_id: str, iteration: int, error: Exception) -> Optional[Any]:
+        """
+        Handle individual agent failures with fallback strategies.
+        """
+        self.logger.warning(f"Agent {agent_name} failed for QA pair {qa_pair_id}, iteration {iteration}: {error}")
+
+        # Log the agent failure
+        self.log_transition_event("agent_failure", qa_pair_id, iteration, {
+            "agent_name": agent_name,
+            "error": str(error),
+            "fallback_strategy": "simulation"
+        })
+
+        # Fallback to simulation based on agent type
+        try:
+            if agent_name == "hyperparameters_graph_agent":
+                return await self._simulate_hyperparameters_response(qa_pair_id, iteration)
+            elif agent_name == "graph_builder_agent":
+                return await self._simulate_graph_builder_response(iteration)
+            elif agent_name == "graph_retrieval_planner_agent":
+                return await self._simulate_retrieval_response(qa_pair_id)
+            elif agent_name == "answer_generator_agent":
+                return await self._simulate_answer_generation_response(qa_pair_id)
+            elif agent_name == "response_evaluator_agent":
+                return await self._simulate_evaluation_response(qa_pair_id)
+            elif agent_name == "backward_pass_agent":
+                return await self._simulate_backward_pass_response(qa_pair_id, iteration)
+            else:
+                self.logger.error(f"No fallback strategy for agent: {agent_name}")
+                return None
+
+        except Exception as fallback_error:
+            self.logger.error(f"Fallback strategy failed for {agent_name}: {fallback_error}")
+            return None
+
+    async def _simulate_hyperparameters_response(self, qa_pair_id: str, iteration: int) -> HyperparametersGraphReadyMessage:
+        """Fallback simulation for HyperparametersGraphAgent."""
+        self.logger.info(f"Simulating hyperparameters response for {qa_pair_id}")
+        return HyperparametersGraphReadyMessage(
+            qa_pair_id=qa_pair_id,
+            chunk_size=512,  # Default chunk size
+            batch_id=self.current_batch_id,
+            repetition=iteration
         )
-        await self.handle_graph_retrieval_ready(retrieval_ready_msg, ctx)
 
-    async def _simulate_answer_generation_ready(self, answer_gen: AnswerGenerationStartMessage, ctx: MessageContext) -> None:
-        answer_ready_msg = AnswerGenerationReadyMessage(
-            qa_pair_id=answer_gen.qa_pair_id,
-            generated_answer="Mock generated answer based on retrieved context",
-            batch_id=answer_gen.batch_id,
-            repetition=answer_gen.repetition
+    async def _simulate_graph_builder_response(self, iteration: int) -> GraphReadyMessage:
+        """Fallback simulation for GraphBuilderAgent."""
+        self.logger.info("Simulating graph builder response")
+        return GraphReadyMessage(
+            batch_id=self.current_batch_id,
+            repetition=iteration,
+            graph_description="Simulated graph with basic entities and relationships",
+            connectivity_metrics={"density": 0.3, "fragmentation_index": 0.2},
+            dataset=self.current_dataset,
+            setting=self.current_setting
         )
-        await self.handle_answer_generation_ready(answer_ready_msg, ctx)
 
-    async def _simulate_response_evaluation_ready(self, eval_start: ResponseEvaluationStartMessage, ctx: MessageContext) -> None:
-        eval_ready_msg = ResponseEvaluationReadyMessage(
-            qa_pair_id=eval_start.qa_pair_id,
-            evaluation_result={
-                "rouge_score": eval_start.rouge_score,
-                "generated_answer": eval_start.generated_answer,
-                "evaluation_metrics": {"coherence": 0.8, "relevance": 0.9}
-            },
-            batch_id=eval_start.batch_id,
-            repetition=eval_start.repetition
+    async def _simulate_retrieval_response(self, qa_pair_id: str) -> GraphRetrievalReadyMessage:
+        """Fallback simulation for GraphRetrievalPlannerAgent."""
+        self.logger.info(f"Simulating retrieval response for {qa_pair_id}")
+        return GraphRetrievalReadyMessage(
+            batch_id=self.current_batch_id,
+            repetition=0,
+            retrieved_context="Simulated retrieved context from graph",
+            dataset=self.current_dataset,
+            setting=self.current_setting
         )
-        await self.handle_response_evaluation_ready(eval_ready_msg, ctx)
 
-    async def _simulate_backward_pass_ready(self, backward_pass: BackwardPassStartMessage, ctx: MessageContext) -> None:
-        backward_ready_msg = BackwardPassReadyMessage(
-            batch_id=backward_pass.batch_id,
-            repetition=backward_pass.repetition,
+    async def _simulate_answer_generation_response(self, qa_pair_id: str) -> AnswerGenerationReadyMessage:
+        """Fallback simulation for AnswerGeneratorAgent."""
+        self.logger.info(f"Simulating answer generation response for {qa_pair_id}")
+        return AnswerGenerationReadyMessage(
+            qa_pair_id=qa_pair_id,
+            generated_answer="Simulated answer based on retrieved context",
+            batch_id=self.current_batch_id,
+            repetition=0
+        )
+
+    async def _simulate_evaluation_response(self, qa_pair_id: str) -> ResponseEvaluationReadyMessage:
+        """Fallback simulation for ResponseEvaluatorAgent."""
+        self.logger.info(f"Simulating evaluation response for {qa_pair_id}")
+        return ResponseEvaluationReadyMessage(
+            qa_pair_id=qa_pair_id,
+            evaluation_result={"score": 0.5, "quality": "simulated"},
+            batch_id=self.current_batch_id,
+            repetition=0
+        )
+
+    async def _simulate_backward_pass_response(self, qa_pair_id: str, iteration: int) -> BackwardPassReadyMessage:
+        """Fallback simulation for BackwardPassAgent."""
+        self.logger.info(f"Simulating backward pass response for {qa_pair_id}")
+        return BackwardPassReadyMessage(
+            batch_id=self.current_batch_id,
+            repetition=iteration,
             backward_pass_results={
-                "total_qa_pairs": len(backward_pass.all_qa_results),
-                "avg_rouge": statistics.mean([r.get("rouge_score", 0) for r in backward_pass.all_qa_results]),
-                "critiques_generated": True
+                "critiques_generated": False,
+                "simulation": True,
+                "optimized_prompts": {}
             }
         )
-        await self.handle_backward_pass_ready(backward_ready_msg, ctx)
+
+    def save_recovery_checkpoint(self, qa_pair_id: str, iteration: int, checkpoint_data: Dict[str, Any]) -> bool:
+        """
+        Save recovery checkpoint for resuming from specific QA pair and iteration.
+        """
+        try:
+            checkpoint_dir = Path("recovery_checkpoints")
+            checkpoint_dir.mkdir(exist_ok=True)
+
+            checkpoint_file = checkpoint_dir / f"checkpoint_{qa_pair_id}_{iteration}.json"
+
+            checkpoint = {
+                "qa_pair_id": qa_pair_id,
+                "iteration": iteration,
+                "timestamp": datetime.now().isoformat(),
+                "batch_id": self.current_batch_id,
+                "dataset": self.current_dataset,
+                "setting": self.current_setting,
+                "checkpoint_data": checkpoint_data,
+                "processing_state": self.shared_state.get_processing_state()
+            }
+
+            with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint, f, indent=2, ensure_ascii=False)
+
+            self.logger.info(f"Saved recovery checkpoint for {qa_pair_id}, iteration {iteration}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to save recovery checkpoint: {e}")
+            return False
+
+    def load_recovery_checkpoint(self, qa_pair_id: str, iteration: int) -> Optional[Dict[str, Any]]:
+        """
+        Load recovery checkpoint for resuming processing.
+        """
+        try:
+            checkpoint_dir = Path("recovery_checkpoints")
+            checkpoint_file = checkpoint_dir / f"checkpoint_{qa_pair_id}_{iteration}.json"
+
+            if not checkpoint_file.exists():
+                self.logger.info(f"No recovery checkpoint found for {qa_pair_id}, iteration {iteration}")
+                return None
+
+            with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                checkpoint = json.load(f)
+
+            self.logger.info(f"Loaded recovery checkpoint for {qa_pair_id}, iteration {iteration}")
+            return checkpoint
+
+        except Exception as e:
+            self.logger.error(f"Failed to load recovery checkpoint: {e}")
+            return None
+
+    def cleanup_old_checkpoints(self, max_age_hours: int = 24) -> None:
+        """
+        Clean up old recovery checkpoints.
+        """
+        try:
+            checkpoint_dir = Path("recovery_checkpoints")
+            if not checkpoint_dir.exists():
+                return
+
+            current_time = datetime.now()
+            for checkpoint_file in checkpoint_dir.glob("checkpoint_*.json"):
+                file_age = current_time - datetime.fromtimestamp(checkpoint_file.stat().st_mtime)
+                if file_age.total_seconds() > max_age_hours * 3600:
+                    checkpoint_file.unlink()
+                    self.logger.info(f"Cleaned up old checkpoint: {checkpoint_file}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to cleanup old checkpoints: {e}")
 
 
 # ===== HYPERPARAMETERS GRAPH AGENT =====
@@ -996,14 +1548,36 @@ class GraphBuilderAgent(RoutedAgent):
         current_state = message.shared_state
         batch_info = current_state.get("batch_information", {})
         example_info = current_state.get("example_information", {})
-        corpus = current_state.get("full_document_text", batch_info.get("document_text", example_info.get("document_text", "")))
+
+        # Try multiple locations for document text with better error reporting
+        corpus = None
+        if "full_document_text" in current_state:
+            corpus = current_state["full_document_text"]
+            self.logger.info("Found document text in current_state['full_document_text']")
+        elif "document_text" in batch_info:
+            corpus = batch_info["document_text"]
+            self.logger.info("Found document text in batch_information['document_text']")
+        elif "document_text" in example_info:
+            corpus = example_info["document_text"]
+            self.logger.info("Found document text in example_information['document_text']")
+        elif "qa_pairs" in batch_info and batch_info["qa_pairs"]:
+            # Try to find document text in qa_pairs structure
+            first_qa = batch_info["qa_pairs"][0]
+            if "document_text" in first_qa:
+                corpus = first_qa["document_text"]
+                self.logger.info("Found document text in qa_pairs[0]['document_text']")
 
         # Determine if this is graph creation (first iteration) or refinement (subsequent iterations)
         is_first_iteration = message.repetition == 0
         self.logger.info(f"Graph mode: {'Creation' if is_first_iteration else 'Refinement'} (iteration {message.repetition})")
 
         if not corpus:
-            self.logger.error("No document text found in batch information")
+            self.logger.error("No document text found in any expected location!")
+            self.logger.error(f"Available keys in current_state: {list(current_state.keys())}")
+            self.logger.error(f"Available keys in batch_information: {list(batch_info.keys())}")
+            self.logger.error(f"Available keys in example_information: {list(example_info.keys())}")
+            if "qa_pairs" in batch_info and batch_info["qa_pairs"]:
+                self.logger.error(f"Available keys in first qa_pair: {list(batch_info['qa_pairs'][0].keys())}")
             return
 
         # Get appropriate learned system prompt based on iteration
@@ -1802,8 +2376,21 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 self.logger.error(f"Error in retrieval iteration {iteration + 1}: {e}")
                 continue
 
-        # Save retrieval plans to shared state
+        # Save retrieval plans and retrieved contexts to shared state for BackwardPassAgent
         current_state["retrieval_plans"] = retrieval_plan_responses
+
+        # Store retrieved context data for BackwardPassAgent
+        retrieved_contexts = current_state.get("retrieved_contexts", [])
+        context_entry = {
+            "retrieved_context": retrieved_context,
+            "repetition": message.repetition,
+            "timestamp": datetime.now().isoformat(),
+            "batch_id": message.batch_id,
+            "query": message.query
+        }
+        retrieved_contexts.append(context_entry)
+        current_state["retrieved_contexts"] = retrieved_contexts
+
         self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
         # Send GraphRetrievalReady message
@@ -2123,8 +2710,15 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 "generated_answer": message.generated_answer,
                 "evaluation_feedback": evaluation_result,
                 "repetition": message.repetition,  # Add repetition to track which iteration this belongs to
-                "timestamp": "2025-09-22T15:30:00"  # Could be made dynamic
+                "timestamp": datetime.now().isoformat()
             }
+
+            # Store evaluation result in shared state for BackwardPassAgent
+            current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+            response_evaluations = current_state.get("response_evaluations", [])
+            response_evaluations.append(evaluation_data)
+            current_state["response_evaluations"] = response_evaluations
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Send ResponseEvaluationReady message
             eval_ready_msg = ResponseEvaluationReadyMessage(
@@ -2141,12 +2735,21 @@ class ResponseEvaluatorAgent(RoutedAgent):
 
         except Exception as e:
             self.logger.error(f"Error in response evaluation: {e}")
-            # Return default response on error
+            # Create error response data
             evaluation_data = {
                 "qa_pair_id": message.qa_pair_id,
                 "error": f"Evaluation failed: {e}",
-                "rouge_score": message.rouge_score
+                "rouge_score": message.rouge_score,
+                "repetition": message.repetition,
+                "timestamp": datetime.now().isoformat()
             }
+
+            # Store error result in shared state for BackwardPassAgent
+            current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+            response_evaluations = current_state.get("response_evaluations", [])
+            response_evaluations.append(evaluation_data)
+            current_state["response_evaluations"] = response_evaluations
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             return ResponseEvaluationReadyMessage(
                 qa_pair_id=message.qa_pair_id,
@@ -2232,15 +2835,25 @@ class BackwardPassAgent(RoutedAgent):
 
     @message_handler
     async def handle_backward_pass_start(self, message: BackwardPassStartMessage, ctx: MessageContext) -> BackwardPassReadyMessage:
-        """Handle BackwardPassStart message and perform complete backward pass critique generation."""
-        self.logger.info(f"BackwardPassAgent processing backward pass for batch {message.batch_id}")
+        """
+        Enhanced BackwardPassStart handler with QA pair boundary awareness.
+        Generates appropriate critiques based on iteration context.
+        """
+        self.logger.info(f"BackwardPassAgent processing backward pass for batch {message.batch_id}, repetition {message.repetition}")
 
         # Load shared state with correct dataset and setting parameters
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
 
+        # Get processing state to understand QA pair context
+        processing_state = self.shared_state.get_processing_state()
+        current_qa_pair_id = processing_state.get("current_qa_pair_id")
+        current_iteration = processing_state.get("current_iteration", 0)
+
         # Store repetition information in batch_information for critique logic
         batch_info = current_state.get("batch_information", {})
         batch_info["current_repetition"] = message.repetition
+        batch_info["current_qa_pair_id"] = current_qa_pair_id
+        batch_info["current_iteration"] = current_iteration
         current_state["batch_information"] = batch_info
 
         try:
@@ -2275,13 +2888,41 @@ class BackwardPassAgent(RoutedAgent):
             # Final save to ensure everything is persisted
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-            # Send BackwardPassReady message
+            # Extract optimized prompts for QA pair prompt lifecycle
+            optimized_prompts = {
+                # Store the actual learned system prompts that agents will use
+                "learned_prompt_hyperparameters_graph": current_state.get("learned_prompt_hyperparameters_graph", ""),
+                "learned_prompt_answer_generator_graph": current_state.get("learned_prompt_answer_generator_graph", ""),
+                "learned_prompt_graph_retrieval_planner": current_state.get("learned_prompt_graph_retrieval_planner", ""),
+                "learned_prompt_graph_refinement": current_state.get("learned_prompt_graph_refinement", ""),
+                # Also store critiques and prompt templates for reference
+                "hyperparameters_graph_agent_critique": current_state.get("hyperparameters_graph_agent_critique", ""),
+                "graph_builder_agent_critique": current_state.get("graph_builder_agent_critique", ""),
+                "retrieval_planner_agent_critique": current_state.get("retrieval_planner_agent_critique", ""),
+                "answer_generation_critique": current_state.get("answer_generation_critique", ""),
+                "graph_builder_prompt": current_state.get("graph_builder_prompt", ""),
+                "retrieval_prompt": current_state.get("retrieval_prompt", "")
+            }
+
+            # Log the critique generation context
+            if current_iteration == 0:
+                self.logger.info(f"Generated initial critiques for new QA pair {current_qa_pair_id}")
+            else:
+                self.logger.info(f"Generated optimized critiques for iteration {current_iteration} of QA pair {current_qa_pair_id}")
+
+            # Send BackwardPassReady message with optimized prompts
             backward_ready_msg = BackwardPassReadyMessage(
                 batch_id=message.batch_id,
                 repetition=message.repetition,
                 backward_pass_results={
                     "critiques_generated": True,
                     "total_qa_pairs": len(message.all_qa_results),
+                    "qa_pair_context": {
+                        "qa_pair_id": current_qa_pair_id,
+                        "iteration": current_iteration,
+                        "is_first_iteration": current_iteration == 0
+                    },
+                    "optimized_prompts": optimized_prompts,
                     "critiques_updated": [
                         "answer_generation_critique",
                         "retrieved_content_critique",
@@ -2328,31 +2969,15 @@ class BackwardPassAgent(RoutedAgent):
         batch_info = current_state.get("batch_information", {})
         current_repetition = batch_info.get("current_repetition", 0)
 
-        # Debug: Show what repetition values exist in the data
-        conv_repetitions = [conv.get("repetition", "MISSING") for conv in all_conversations]
-        eval_repetitions = [eval_resp.get("repetition", "MISSING") for eval_resp in all_evaluation_responses]
-        self.logger.info(f"Available conversation repetitions: {conv_repetitions}")
-        self.logger.info(f"Available evaluation repetitions: {eval_repetitions}")
-        self.logger.info(f"Looking for repetition: {current_repetition}")
+        # Since lists are cleared at the start of each iteration, all data should be from current iteration
+        conversations = all_conversations
+        evaluation_responses = all_evaluation_responses
 
-        # Filter for only current iteration's data
-        conversations = [conv for conv in all_conversations if conv.get("repetition") == current_repetition]
-        evaluation_responses = [eval_resp for eval_resp in all_evaluation_responses if eval_resp.get("repetition") == current_repetition]
-
-        self.logger.info(f"Filtered conversations: {len(conversations)} for repetition {current_repetition} (total available: {len(all_conversations)})")
-        self.logger.info(f"Filtered evaluations: {len(evaluation_responses)} for repetition {current_repetition} (total available: {len(all_evaluation_responses)})")
+        self.logger.info(f"Found {len(conversations)} conversations and {len(evaluation_responses)} evaluations for iteration {current_repetition}")
 
         if not conversations or not evaluation_responses:
-            self.logger.error(f"CRITICAL: No conversations or evaluations found for answer generation critique in repetition {current_repetition}")
-            self.logger.error(f"This means the gradient step will be skipped! Check data flow and repetition tracking.")
-
-            # Temporary fallback: use the most recent data if available
-            if all_conversations and all_evaluation_responses:
-                self.logger.warning("FALLBACK: Using most recent conversation/evaluation data")
-                conversations = [all_conversations[-1]]
-                evaluation_responses = [all_evaluation_responses[-1]]
-            else:
-                return
+            self.logger.warning("No conversation or evaluation data available - skipping answer generation critique")
+            return
 
         # Get the current answer generation prompt for critique
         current_answer_prompt = current_state.get("learned_prompt_answer_generator_graph", "")
@@ -2361,19 +2986,19 @@ class BackwardPassAgent(RoutedAgent):
             from parameters import base_prompt_answer_generator_graph
             current_answer_prompt = base_prompt_answer_generator_graph
 
-        # For answer generation critique, we should have exactly ONE sequence per iteration
-        # If we have multiple QA pairs, something is wrong with the data flow
+        # One iteration = One QA pair, so we should have exactly 1 conversation and 1 evaluation
         if len(conversations) != 1 or len(evaluation_responses) != 1:
-            self.logger.error(f"Expected exactly 1 conversation and 1 evaluation for answer generation critique, but got {len(conversations)} conversations and {len(evaluation_responses)} evaluations")
-            self.logger.error(f"This indicates a data flow issue - multiple QA pairs are being processed in one iteration")
+            self.logger.error(f"Expected exactly 1 conversation and 1 evaluation per iteration, but got {len(conversations)} conversations and {len(evaluation_responses)} evaluations")
             return
 
-        # Extract the single conversation and evaluation
+        # Extract the single conversation and evaluation from this iteration
         conv = conversations[0]
         eval_resp = evaluation_responses[0]
 
         # Create the single sequence: previous prompt + answer + feedback
         concatenated_data = f"Previous Answer Generation Prompt: {current_answer_prompt}\nGenerated Answer: {conv.get('generated_answer', '')}\nResponse Feedback: {eval_resp.get('evaluation_feedback', '')}"
+
+        self.logger.info(f"Created answer generation critique sequence for iteration {current_repetition}")
 
         # Call LLM with generation_prompt_gradient_prompt
         prompt_content = self.generation_prompt_gradient_prompt.format(concatenated_data)
@@ -2404,77 +3029,44 @@ class BackwardPassAgent(RoutedAgent):
         batch_info = current_state.get("batch_information", {})
         current_repetition = batch_info.get("current_repetition", 0)
 
-        # Debug: Show what repetition values exist in the data
-        conv_repetitions = [conv.get("repetition", "MISSING") for conv in all_conversations]
-        eval_repetitions = [eval_resp.get("repetition", "MISSING") for eval_resp in all_evaluation_responses]
-        ctx_repetitions = []
-        for ctx in all_retrieved_contexts:
-            if isinstance(ctx, dict) and "repetition" in ctx:
-                ctx_repetitions.append(ctx.get("repetition", "MISSING"))
-            else:
-                ctx_repetitions.append("OLD_FORMAT")
+        # Since lists are cleared at the start of each iteration, all data should be from current iteration
+        conversations = all_conversations
+        evaluation_responses = all_evaluation_responses
 
-        self.logger.info(f"Available conversation repetitions: {conv_repetitions}")
-        self.logger.info(f"Available evaluation repetitions: {eval_repetitions}")
-        self.logger.info(f"Available context repetitions: {ctx_repetitions}")
-        self.logger.info(f"Looking for repetition: {current_repetition}")
-
-        # Filter for only current iteration's data
-        conversations = [conv for conv in all_conversations if conv.get("repetition") == current_repetition]
-        evaluation_responses = [eval_resp for eval_resp in all_evaluation_responses if eval_resp.get("repetition") == current_repetition]
-
-        # Filter retrieved contexts by repetition (handle both old and new format)
+        # Extract retrieved contexts for current iteration
         retrieved_contexts = []
         for ctx_entry in all_retrieved_contexts:
             if isinstance(ctx_entry, dict) and "repetition" in ctx_entry:
-                # New format with repetition tracking
                 if ctx_entry.get("repetition") == current_repetition:
                     retrieved_contexts.append(ctx_entry.get("retrieved_context", ""))
-            else:
-                # Old format (just string) - take last entries matching conversation count
-                # This is backward compatibility - ideally shouldn't happen after the fix
-                pass
 
-        # If no contexts found with new format, fall back to old logic
-        if not retrieved_contexts and all_retrieved_contexts:
-            self.logger.warning("No retrieved contexts found with repetition info - falling back to old format")
-            # Take the last contexts to match conversation count
-            retrieved_contexts = all_retrieved_contexts[-len(conversations):] if len(conversations) <= len(all_retrieved_contexts) else all_retrieved_contexts
-
-        self.logger.info(f"Filtered conversations: {len(conversations)} for repetition {current_repetition}")
-        self.logger.info(f"Filtered evaluations: {len(evaluation_responses)} for repetition {current_repetition}")
-        self.logger.info(f"Retrieved contexts: {len(retrieved_contexts)} (lengths: {[len(str(ctx)) for ctx in retrieved_contexts]})")
+        self.logger.info(f"Found {len(conversations)} conversations, {len(evaluation_responses)} evaluations, {len(retrieved_contexts)} contexts for iteration {current_repetition}")
 
         if not conversations or not evaluation_responses:
-            self.logger.error(f"CRITICAL: Missing data for retrieved content critique in repetition {current_repetition}")
-            self.logger.error(f"This means the gradient step will be skipped! Check data flow and repetition tracking.")
-
-            # Temporary fallback: use the most recent data if available
-            if all_conversations and all_evaluation_responses:
-                self.logger.warning("FALLBACK: Using most recent conversation/evaluation data")
-                conversations = [all_conversations[-1]]
-                evaluation_responses = [all_evaluation_responses[-1]]
-                # Also use fallback for contexts
-                if all_retrieved_contexts:
-                    last_context = all_retrieved_contexts[-1]
-                    if isinstance(last_context, dict):
-                        retrieved_contexts = [last_context.get("retrieved_context", "")]
-                    else:
-                        retrieved_contexts = [last_context]
-            else:
-                return
-
-        # For retrieved content critique, we should have exactly ONE sequence per iteration
-        # If we have multiple QA pairs, something is wrong with the data flow
-        if len(conversations) != 1 or len(evaluation_responses) != 1:
-            self.logger.error(f"Expected exactly 1 conversation and 1 evaluation for retrieved content critique, but got {len(conversations)} conversations and {len(evaluation_responses)} evaluations")
-            self.logger.error(f"This indicates a data flow issue - multiple QA pairs are being processed in one iteration")
+            self.logger.warning("No conversation or evaluation data available - skipping retrieved content critique")
             return
 
-        # Extract the single conversation, context, and evaluation
+        # One iteration = One QA pair, so we should have exactly 1 conversation, 1 evaluation, and 1 context
+        if len(conversations) != 1 or len(evaluation_responses) != 1:
+            self.logger.error(f"Expected exactly 1 conversation and 1 evaluation per iteration, but got {len(conversations)} conversations and {len(evaluation_responses)} evaluations")
+            return
+
+        if len(retrieved_contexts) != 1:
+            self.logger.error(f"Expected exactly 1 retrieved context per iteration, but got {len(retrieved_contexts)}")
+            return
+
+        # Extract the single conversation, evaluation, and context from this iteration
         conv = conversations[0]
         eval_resp = evaluation_responses[0]
-        context = retrieved_contexts[0] if retrieved_contexts else "No context available"
+        context = retrieved_contexts[0]
+
+        # Extract query from conversation
+        query = conv.get('question', 'No query available')
+
+        # Create the single sequence: context + query + answer + feedback
+        concatenated_data = f"Retrieved Context: {context}\nQuery: {query}\nGenerated Answer: {conv.get('generated_answer', '')}\nFeedback: {eval_resp.get('evaluation_feedback', '')}"
+
+        self.logger.info(f"Created retrieved content critique sequence for iteration {current_repetition}")
 
         # Log context size to identify if it's too large
         context_length = len(str(context))

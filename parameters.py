@@ -52,6 +52,7 @@ Text:
 Provide the reasoning that led to your response.
 """
 
+
 base_prompt_graph_refinement = """
 You will be given a text and an existing knowledge graph. Your goal is to refine and enhance the existing graph by:
 1. Adding new entities and relationships that are mentioned in the text but missing from the graph
@@ -264,7 +265,7 @@ The query was:
 The response was:
 {}
 
-Based on the query and the generated response, provide a detailed explanation of how the response can be improved. Focus on aspects like completeness, accuracy, relevance, clarity, and whether it fully addresses the question asked. Consider whether the response is well-structured, directly addresses the question, provides sufficient detail, and maintains factual consistency.
+Based on the query and the generated response, provide a detailed explanation of how the response can be improved.
 """
 
 

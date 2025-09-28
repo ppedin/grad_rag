@@ -1,0 +1,33 @@
+{
+  "full_document_text": "This is important document content that should persist.",
+  "example_information": {
+    "qa_index": 0,
+    "document_text": "Example doc text"
+  },
+  "batch_information": {
+    "batch_id": 1,
+    "document_text": "Batch doc text"
+  },
+  "hyperparameters_graph_agent_critique": "Some critique",
+  "graph_description": "Some graph",
+  "_metadata": {
+    "last_updated": "2025-09-28T02:48:33.972032",
+    "dataset": "test_dataset",
+    "setting": "test",
+    "batch_id": 1
+  },
+  "graph_builder_agent_critique": "",
+  "retrieval_planner_agent_critique": "",
+  "answer_generation_critique": "",
+  "response_evaluations": [],
+  "retrieved_contexts": [],
+  "conversations_answer_generation": [],
+  "retrieval_plans": [],
+  "retrieval_prompt": "",
+  "retrieval_plan_critique": "",
+  "graph_critique": "",
+  "graph_builder_prompt": "",
+  "rag_hyperparameters": {},
+  "rouge_scores": [],
+  "graph_statistics": {}
+}

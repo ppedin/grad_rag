@@ -624,7 +624,8 @@ class DatasetAgent(RoutedAgent):
         batch_info_for_orchestrator = {
             "batch_id": self.current_qa_index,
             "document_text": example_info["document_text"],
-            "qa_pairs": [qa_pair_info]  # Single QA pair in array format
+            "qa_pairs": [qa_pair_info],  # Single QA pair in array format
+            "total_iterations": self.repetitions  # Required for two-level reset logic
         }
         current_state["batch_information"] = batch_info_for_orchestrator
 
