@@ -163,7 +163,6 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.shared_state = SharedState("agent_states")
 
         # Initialize logging systems
-        initialize_prompt_logging()
         initialize_step_logging()
         initialize_evaluation_logging()
 
@@ -190,6 +189,10 @@ class BatchOrchestratorAgent(RoutedAgent):
         # Initialize step logger
         step_logger = get_global_step_logger()
         step_logger.start_pipeline(message.dataset, message.setting, len(message.shared_state.get("batch_information", {}).get("qa_pairs", [])))
+
+        # Initialize prompt logging with system-specific folder
+        system_log_dir = f"prompt_response_logs/vector_{message.dataset}_{message.setting}"
+        initialize_prompt_logging(system_log_dir)
 
         # Initialize standardized evaluation logging for VectorRAG
         if self.standardized_logger is None:

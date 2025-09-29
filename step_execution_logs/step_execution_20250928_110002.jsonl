@@ -1,2 +1,0 @@
-{"session_id": "20250928_110002", "step_id": "pipeline_start", "timestamp": "2025-09-28T11:00:02.422489", "step_type": "pipeline", "step_name": "pipeline_initialization", "status": "started", "dataset": "squality", "setting": "test", "total_qa_pairs": 1, "metadata": {}}
-{"session_id": "20250928_110002", "step_id": "batch_0_start", "timestamp": "2025-09-28T11:00:02.448098", "step_type": "batch", "step_name": "batch_processing_start", "status": "started", "batch_id": 0, "qa_pair_id": "63521_q1", "iteration": 0, "total_iterations": 2, "metadata": {}}

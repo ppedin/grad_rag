@@ -194,6 +194,11 @@ class BatchOrchestratorAgent(RoutedAgent):
         step_logger = get_global_step_logger()
         eval_logger = get_global_evaluation_logger()
 
+        # Initialize prompt logging with system-specific folder
+        system_log_dir = f"prompt_response_logs/graph_{message.dataset}_{message.setting}"
+        from prompt_response_logger import initialize_prompt_logging
+        initialize_prompt_logging(system_log_dir)
+
         # Initialize standardized evaluation logging for GraphRAG
         if self.standardized_logger is None:
             self.standardized_logger = initialize_standardized_logging(
@@ -211,9 +216,12 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Extract QA pairs from batch information
             batch_info = message.shared_state.get("batch_information", {})
             qa_pairs = batch_info.get("qa_pairs", [])
-            total_iterations = batch_info.get("total_iterations", 3)  # Default to 3 iterations
+            total_iterations = batch_info.get("total_iterations", 1)  # Total iterations for context/logging
 
-            self.logger.info(f"Processing {len(qa_pairs)} QA pairs in batch {message.batch_id} with {total_iterations} iterations each")
+            # GraphRAG system processes ONE iteration per BatchStart call (like Vector/All Context)
+            current_iteration = message.repetition
+
+            self.logger.info(f"Processing {len(qa_pairs)} QA pairs - current iteration: {current_iteration} (DatasetAgent repetition: {message.repetition})")
 
             # Process each QA pair through all iterations with proper reset logic
             for qa_pair in qa_pairs:
@@ -224,48 +232,52 @@ class BatchOrchestratorAgent(RoutedAgent):
                 self.qa_pair_results[qa_pair_id] = []
                 self.qa_pair_rouge_progression[qa_pair_id] = []
 
-                # Log QA pair start for evaluation
-                document_text = message.shared_state.get("full_document_text", "")
-                eval_logger.start_qa_pair_evaluation(
-                    qa_pair_id=qa_pair_id,
-                    question=qa_pair.get("question", ""),
-                    reference_answers=qa_pair.get("answers", []),
-                    document_text=document_text,
-                    total_iterations=total_iterations,
-                    metadata={"batch_id": message.batch_id, "dataset": message.dataset, "setting": message.setting}
-                )
-
-                # Also log to standardized logger
-                self.standardized_logger.start_qa_pair_evaluation(
-                    qa_pair_id=qa_pair_id,
-                    question=qa_pair.get("question", ""),
-                    reference_answers=qa_pair.get("answers", []),
-                    document_text=document_text,
-                    total_iterations=total_iterations,
-                    metadata={"batch_id": message.batch_id, "dataset": message.dataset, "setting": message.setting}
-                )
-
-                self.logger.info(f"\n{'='*60}")
-                self.logger.info(f"STARTING QA PAIR: {qa_pair_id}")
-                self.logger.info(f"Question: {qa_pair.get('question', 'N/A')[:100]}...")
-                self.logger.info(f"Total iterations planned: {total_iterations}")
-                self.logger.info(f"{'='*60}")
-
-                # Process all iterations for this QA pair
-                for iteration in range(total_iterations):
-                    self.logger.info(f"\n--- QA Pair {qa_pair_id}, Iteration {iteration}/{total_iterations-1} ---")
-
-                    # Log batch start for this iteration
-                    step_logger.start_batch(
-                        batch_id=message.batch_id,
+                # Log QA pair start for evaluation only on first iteration
+                if current_iteration == 0:
+                    document_text = message.shared_state.get("full_document_text", "")
+                    eval_logger.start_qa_pair_evaluation(
                         qa_pair_id=qa_pair_id,
-                        iteration=iteration,
-                        total_iterations=total_iterations
+                        question=qa_pair.get("question", ""),
+                        reference_answers=qa_pair.get("answers", []),
+                        document_text=document_text,
+                        total_iterations=total_iterations,
+                        metadata={"batch_id": message.batch_id, "dataset": message.dataset, "setting": message.setting}
                     )
 
-                    iteration_start_time = datetime.now()
+                    # Also log to standardized logger
+                    self.standardized_logger.start_qa_pair_evaluation(
+                        qa_pair_id=qa_pair_id,
+                        question=qa_pair.get("question", ""),
+                        reference_answers=qa_pair.get("answers", []),
+                        document_text=document_text,
+                        total_iterations=total_iterations,
+                        metadata={"batch_id": message.batch_id, "dataset": message.dataset, "setting": message.setting}
+                    )
 
-                    try:
+                    self.logger.info(f"\n{'='*60}")
+                    self.logger.info(f"STARTING QA PAIR: {qa_pair_id}")
+                    self.logger.info(f"Question: {qa_pair.get('question', 'N/A')[:100]}...")
+                    self.logger.info(f"Total iterations planned: {total_iterations}")
+                    self.logger.info(f"{'='*60}")
+
+                # Get current system prompt from shared state (from previous iterations)
+                current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+
+                # Process ONLY the current iteration (not all iterations)
+                iteration = current_iteration
+                self.logger.info(f"\n--- QA Pair {qa_pair_id}, Iteration {iteration}/{total_iterations-1} ---")
+
+                # Log batch start for this iteration
+                step_logger.start_batch(
+                    batch_id=message.batch_id,
+                    qa_pair_id=qa_pair_id,
+                    iteration=iteration,
+                    total_iterations=total_iterations
+                )
+
+                iteration_start_time = datetime.now()
+
+                try:
                         # CRITICAL: Apply appropriate reset logic BEFORE processing
                         step_logger.log_step(
                             step_name="reset_logic_application",
@@ -320,45 +332,47 @@ class BatchOrchestratorAgent(RoutedAgent):
                             "has_error": "error" in iteration_results
                         })
 
-                    except Exception as e:
-                        self.logger.error(f"Critical error in iteration {iteration} for {qa_pair_id}: {e}")
+                except Exception as e:
+                    self.logger.error(f"Critical error in iteration {iteration} for {qa_pair_id}: {e}")
 
-                        # Attempt recovery
-                        recovery_success = await self.recover_from_qa_pair_failure(qa_pair_id, iteration, e)
+                    # Attempt recovery
+                    recovery_success = await self.recover_from_qa_pair_failure(qa_pair_id, iteration, e)
 
-                        if not recovery_success:
-                            # If recovery fails, store error and continue to next iteration
-                            error_results = {
-                                "qa_pair_id": qa_pair_id,
-                                "iteration": iteration,
-                                "error": str(e),
-                                "rouge_score": 0.0
-                            }
-                            self.qa_pair_results[qa_pair_id].append(error_results)
-                            self.qa_pair_rouge_progression[qa_pair_id].append(0.0)
+                    if not recovery_success:
+                        # If recovery fails, store error and continue to next iteration
+                        error_results = {
+                            "qa_pair_id": qa_pair_id,
+                            "iteration": iteration,
+                            "error": str(e),
+                            "rouge_score": 0.0
+                        }
+                        self.qa_pair_results[qa_pair_id].append(error_results)
+                        self.qa_pair_rouge_progression[qa_pair_id].append(0.0)
 
-                # Save QA pair summary after all iterations
-                await self._save_qa_pair_summary(qa_pair_id)
+                # Handle completion logic only on final iteration
+                if current_iteration == total_iterations - 1:
+                    # Save QA pair summary after all iterations
+                    await self._save_qa_pair_summary(qa_pair_id)
 
-                # Log QA pair completion
-                final_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
-                rouge_improvement = (
-                    final_rouge - self.qa_pair_rouge_progression[qa_pair_id][0]
-                    if len(self.qa_pair_rouge_progression[qa_pair_id]) > 1 else 0.0
-                )
+                    # Log QA pair completion
+                    final_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
+                    rouge_improvement = (
+                        final_rouge - self.qa_pair_rouge_progression[qa_pair_id][0]
+                        if len(self.qa_pair_rouge_progression[qa_pair_id]) > 1 else 0.0
+                    )
 
-                self.logger.info(f"\n✅ QA PAIR {qa_pair_id} COMPLETED")
-                self.logger.info(f"Final ROUGE: {final_rouge:.4f}")
-                self.logger.info(f"ROUGE Improvement: {rouge_improvement:+.4f}")
-                self.logger.info(f"Iterations completed: {len(self.qa_pair_results[qa_pair_id])}")
+                    self.logger.info(f"\nSUCCESS: QA PAIR {qa_pair_id} COMPLETED")
+                    self.logger.info(f"Final ROUGE: {final_rouge:.4f}")
+                    self.logger.info(f"ROUGE Improvement: {rouge_improvement:+.4f}")
+                    self.logger.info(f"Iterations completed: {len(self.qa_pair_results[qa_pair_id])}")
 
-                # Mark QA pair as completed
-                self.completed_qa_pairs[qa_pair_id] = {
-                    "iterations": self.qa_pair_results[qa_pair_id],
-                    "rouge_progression": self.qa_pair_rouge_progression[qa_pair_id],
-                    "final_rouge": final_rouge,
-                    "rouge_improvement": rouge_improvement
-                }
+                    # Mark QA pair as completed
+                    self.completed_qa_pairs[qa_pair_id] = {
+                        "iterations": self.qa_pair_results[qa_pair_id],
+                        "rouge_progression": self.qa_pair_rouge_progression[qa_pair_id],
+                        "final_rouge": final_rouge,
+                        "rouge_improvement": rouge_improvement
+                    }
 
                 # Log QA pair completion in evaluation logger
                 best_iteration = 0
@@ -400,17 +414,14 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Final batch summary
             batch_summary = await self._create_batch_summary()
 
-            # Log pipeline completion
+            # Log pipeline completion - only 1 iteration per call now
             step_logger.complete_pipeline(
                 success=True,
-                total_qa_pairs_processed=len(self.completed_qa_pairs),
-                total_iterations_completed=batch_summary.get("total_iterations_completed", 0)
+                total_qa_pairs_processed=len(qa_pairs),
+                total_iterations_completed=1  # Only 1 iteration per call
             )
 
-            # Finalize standardized evaluation logging
-            if self.standardized_logger:
-                summary_path = self.standardized_logger.finalize_session()
-                self.logger.info(f"Standardized evaluation session finalized: {summary_path}")
+            # Finalize standardized evaluation logging only handled by DatasetAgent when all processing is complete
 
             # Return BatchReady message indicating completion
             return BatchReadyMessage(
@@ -426,7 +437,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Log pipeline failure
             step_logger.complete_pipeline(
                 success=False,
-                total_qa_pairs_processed=len(self.completed_qa_pairs),
+                total_qa_pairs_processed=len(qa_pairs),
                 error_message=str(e)
             )
 

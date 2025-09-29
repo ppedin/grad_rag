@@ -1,27 +1,15 @@
 {
   "qa_pair_id": "63521_q1",
-  "total_iterations": 3,
+  "total_iterations": 1,
   "rouge_progression": [
-    0.0326,
-    0.0963,
-    0.1383
+    0.0677
   ],
-  "final_rouge": 0.1383,
-  "rouge_improvement": 0.10570000000000002,
+  "final_rouge": 0.0677,
+  "rouge_improvement": 0.0,
   "iterations_summary": [
     {
       "iteration": 0,
-      "rouge_score": 0.0326,
-      "has_error": false
-    },
-    {
-      "iteration": 1,
-      "rouge_score": 0.0963,
-      "has_error": false
-    },
-    {
-      "iteration": 2,
-      "rouge_score": 0.1383,
+      "rouge_score": 0.0677,
       "has_error": false
     }
   ]
