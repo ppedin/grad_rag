@@ -15,6 +15,7 @@ from logging_utils import log_agent_action, log_qa_processing, log_critique_resu
 from prompt_response_logger import get_global_prompt_logger
 from step_execution_logger import get_global_step_logger, StepStatus
 from evaluation_logger import get_global_evaluation_logger
+from standardized_evaluation_logger import initialize_standardized_logging, get_standardized_logger, finalize_standardized_logging, SystemType
 
 from autogen_core import (
     AgentId, MessageContext, RoutedAgent, message_handler,
@@ -171,6 +172,9 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.qa_pair_results: Dict[str, List[Dict[str, Any]]] = {}  # Results per iteration per QA pair
         self.qa_pair_rouge_progression: Dict[str, List[float]] = {}  # ROUGE scores per iteration per QA pair
 
+        # Standardized evaluation logging
+        self.standardized_logger = None
+
     @message_handler
     async def handle_batch_start(self, message: BatchStartMessage, ctx: MessageContext) -> BatchReadyMessage:
         """
@@ -189,6 +193,12 @@ class BatchOrchestratorAgent(RoutedAgent):
         # Initialize logging systems
         step_logger = get_global_step_logger()
         eval_logger = get_global_evaluation_logger()
+
+        # Initialize standardized evaluation logging for GraphRAG
+        if self.standardized_logger is None:
+            self.standardized_logger = initialize_standardized_logging(
+                SystemType.GRAPHRAG, message.dataset, message.setting
+            )
 
         # Log pipeline start
         step_logger.start_pipeline(
@@ -217,6 +227,16 @@ class BatchOrchestratorAgent(RoutedAgent):
                 # Log QA pair start for evaluation
                 document_text = message.shared_state.get("full_document_text", "")
                 eval_logger.start_qa_pair_evaluation(
+                    qa_pair_id=qa_pair_id,
+                    question=qa_pair.get("question", ""),
+                    reference_answers=qa_pair.get("answers", []),
+                    document_text=document_text,
+                    total_iterations=total_iterations,
+                    metadata={"batch_id": message.batch_id, "dataset": message.dataset, "setting": message.setting}
+                )
+
+                # Also log to standardized logger
+                self.standardized_logger.start_qa_pair_evaluation(
                     qa_pair_id=qa_pair_id,
                     question=qa_pair.get("question", ""),
                     reference_answers=qa_pair.get("answers", []),
@@ -345,6 +365,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                 if self.qa_pair_rouge_progression[qa_pair_id]:
                     best_iteration = self.qa_pair_rouge_progression[qa_pair_id].index(max(self.qa_pair_rouge_progression[qa_pair_id]))
 
+                # Log to old evaluation logger for backward compatibility
                 eval_logger.complete_qa_pair_evaluation(
                     qa_pair_id=qa_pair_id,
                     final_rouge_score=final_rouge,
@@ -353,6 +374,20 @@ class BatchOrchestratorAgent(RoutedAgent):
                     total_iterations_completed=len(self.qa_pair_results[qa_pair_id]),
                     improvement_gained=rouge_improvement,
                     final_metrics={"qa_pair_summary": self.completed_qa_pairs[qa_pair_id]}
+                )
+
+                # Log to standardized evaluation logger
+                best_answer = None
+                if self.qa_pair_results[qa_pair_id] and best_iteration < len(self.qa_pair_results[qa_pair_id]):
+                    best_answer = self.qa_pair_results[qa_pair_id][best_iteration].get("generated_answer", None)
+
+                self.standardized_logger.complete_qa_pair_evaluation(
+                    qa_pair_id=qa_pair_id,
+                    final_rouge_score=final_rouge,
+                    rouge_progression=self.qa_pair_rouge_progression[qa_pair_id],
+                    best_iteration=best_iteration,
+                    total_iterations_completed=len(self.qa_pair_results[qa_pair_id]),
+                    best_answer=best_answer
                 )
 
                 # Log QA pair completion event
@@ -371,6 +406,11 @@ class BatchOrchestratorAgent(RoutedAgent):
                 total_qa_pairs_processed=len(self.completed_qa_pairs),
                 total_iterations_completed=batch_summary.get("total_iterations_completed", 0)
             )
+
+            # Finalize standardized evaluation logging
+            if self.standardized_logger:
+                summary_path = self.standardized_logger.finalize_session()
+                self.logger.info(f"Standardized evaluation session finalized: {summary_path}")
 
             # Return BatchReady message indicating completion
             return BatchReadyMessage(
@@ -610,6 +650,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                 "rouge-2": rouge_score * 0.85  # Estimate ROUGE-2 as typically lower than ROUGE-L
             }
 
+            # Log to old evaluation logger for backward compatibility
             eval_logger.log_iteration_evaluation(
                 qa_pair_id=qa_pair_id,
                 iteration=iteration,
@@ -628,6 +669,21 @@ class BatchOrchestratorAgent(RoutedAgent):
                     "backward_pass_available": backward_pass_response is not None,
                     "qa_pair_question": qa_pair.get("question", "N/A")
                 }
+            )
+
+            # Log to standardized evaluation logger
+            self.standardized_logger.log_iteration_evaluation(
+                qa_pair_id=qa_pair_id,
+                iteration=iteration,
+                generated_answer=getattr(answer_response, 'generated_answer', 'N/A'),
+                rouge_scores=rouge_scores,
+                intermediate_outputs=intermediate_outputs,
+                hyperparameters={
+                    "chunk_size": getattr(hyperparams_response, 'chunk_size', 512),
+                    "graph_hyperparameters": getattr(hyperparams_response, '__dict__', {})
+                },
+                execution_time_seconds=total_execution_time,
+                system_specific_metrics=comprehensive_graph_stats
             )
 
             # Log batch completion

@@ -88,3 +88,36 @@ def get_embeddings(text_chunks: List[str], model: str = "text-embedding-3-small"
 
     except Exception as e:
         raise Exception(f"Failed to get embeddings: {str(e)}")
+
+
+async def get_embeddings_async(text_chunks: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
+    """
+    Async version of get_embeddings for concurrent batch processing.
+
+    Args:
+        text_chunks (List[str]): List of text chunks to embed
+        model (str): OpenAI embedding model to use (default: text-embedding-3-small)
+
+    Returns:
+        List[List[float]]: List of embedding vectors (one for each input chunk)
+
+    Raises:
+        Exception: If the API call fails
+    """
+    import asyncio
+
+    # Run the synchronous OpenAI call in a thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+
+    def _sync_embeddings():
+        try:
+            response = client.embeddings.create(
+                input=text_chunks,
+                model=model
+            )
+            return [data.embedding for data in response.data]
+        except Exception as e:
+            raise Exception(f"Failed to get embeddings: {str(e)}")
+
+    embeddings = await loop.run_in_executor(None, _sync_embeddings)
+    return embeddings

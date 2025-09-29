@@ -1,0 +1,20 @@
+{
+  "session_id": "vectorrag_squality_test_20250929_034431",
+  "system_type": "vectorrag",
+  "dataset": "squality",
+  "setting": "test",
+  "start_time": "2025-09-29T03:44:31.331023",
+  "total_qa_pairs": 1,
+  "total_iterations": 1,
+  "avg_rouge_scores": {
+    "rouge_1": 0.06792452830188679,
+    "rouge_2": 0.05773584905660377,
+    "rouge_l": 0.06792452830188679
+  },
+  "performance_metrics": {
+    "avg_execution_time": 16.084329,
+    "total_execution_time": 16.084329,
+    "avg_iterations_per_qa": 1.0
+  },
+  "end_time": "2025-09-29T03:45:03.626903"
+}

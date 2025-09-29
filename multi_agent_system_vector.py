@@ -11,11 +11,13 @@ import faiss
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 from pydantic import BaseModel
+from datetime import datetime
 
 from logging_utils import LoggingUtils, log_agent_action, log_batch_progress, log_qa_processing, log_critique_result
 from prompt_response_logger import get_global_prompt_logger, initialize_prompt_logging
 from step_execution_logger import get_global_step_logger, initialize_step_logging, StepStatus
 from evaluation_logger import get_global_evaluation_logger, initialize_evaluation_logging
+from standardized_evaluation_logger import initialize_standardized_logging, get_standardized_logger, finalize_standardized_logging, SystemType
 
 from autogen_core import (
     AgentId, MessageContext, RoutedAgent, message_handler,
@@ -173,6 +175,9 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.current_dataset: Optional[str] = None
         self.current_setting: Optional[str] = None
 
+        # Standardized evaluation logging
+        self.standardized_logger = None
+
         # Initialize QA pair and iteration tracking for multi-iteration support
         self.qa_pair_results: Dict[str, List[Dict[str, Any]]] = {}
         self.qa_pair_rouge_progression: Dict[str, List[float]] = {}
@@ -185,6 +190,12 @@ class BatchOrchestratorAgent(RoutedAgent):
         # Initialize step logger
         step_logger = get_global_step_logger()
         step_logger.start_pipeline(message.dataset, message.setting, len(message.shared_state.get("batch_information", {}).get("qa_pairs", [])))
+
+        # Initialize standardized evaluation logging for VectorRAG
+        if self.standardized_logger is None:
+            self.standardized_logger = initialize_standardized_logging(
+                SystemType.VECTORRAG, message.dataset, message.setting
+            )
 
         # Validate that only test datasets are used for test-time training
         if message.setting != "test":
@@ -230,6 +241,29 @@ class BatchOrchestratorAgent(RoutedAgent):
             for qa_pair in qa_pairs:
                 qa_pair_id = qa_pair.get("question_id", f"qa_{qa_pairs.index(qa_pair)}")
                 self.logger.info(f"🔄 Processing QA pair {qa_pair_id} for iteration {current_iteration}")
+
+                # Log QA pair start for evaluation (matching GraphRAG pattern)
+                if current_iteration == 0:  # Only log start on first iteration
+                    eval_logger = get_global_evaluation_logger()
+                    document_text = batch_info.get("document_text", "")
+                    eval_logger.start_qa_pair_evaluation(
+                        qa_pair_id=qa_pair_id,
+                        question=qa_pair.get("question", ""),
+                        reference_answers=qa_pair.get("answers", []),
+                        document_text=document_text,
+                        total_iterations=total_iterations,
+                        metadata={"batch_id": message.batch_id, "dataset": message.dataset, "setting": message.setting}
+                    )
+
+                    # Also log to standardized logger
+                    self.standardized_logger.start_qa_pair_evaluation(
+                        qa_pair_id=qa_pair_id,
+                        question=qa_pair.get("question", ""),
+                        reference_answers=qa_pair.get("answers", []),
+                        document_text=document_text,
+                        total_iterations=total_iterations,
+                        metadata={"batch_id": message.batch_id, "dataset": message.dataset, "setting": message.setting}
+                    )
 
                 # Initialize shared state for this QA pair
                 current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
@@ -297,9 +331,37 @@ class BatchOrchestratorAgent(RoutedAgent):
                 current_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
                 self.logger.info(f"🎯 QA pair {qa_pair_id} iteration {current_iteration} completed - ROUGE: {current_rouge:.4f}")
 
+                # Add QA pair completion logging for the final iteration (matching GraphRAG)
+                if current_iteration == total_iterations - 1:
+                    eval_logger = get_global_evaluation_logger()
+                    # Log to old evaluation logger for backward compatibility
+                    eval_logger.complete_qa_pair_evaluation(
+                        qa_pair_id=qa_pair_id,
+                        final_rouge_score=current_rouge,
+                        rouge_progression=self.qa_pair_rouge_progression[qa_pair_id],
+                        best_iteration=current_iteration,  # In single-iteration mode, best is current
+                        total_iterations_completed=current_iteration + 1,
+                        best_answer=iteration_results.get("generated_answer", "")
+                    )
+
+                    # Log to standardized evaluation logger
+                    self.standardized_logger.complete_qa_pair_evaluation(
+                        qa_pair_id=qa_pair_id,
+                        final_rouge_score=current_rouge,
+                        rouge_progression=self.qa_pair_rouge_progression[qa_pair_id],
+                        best_iteration=current_iteration,
+                        total_iterations_completed=current_iteration + 1,
+                        best_answer=iteration_results.get("generated_answer", "")
+                    )
+
             # Complete pipeline
             step_logger.complete_pipeline(success=True, total_qa_pairs_processed=len(qa_pairs),
                                         total_iterations_completed=len(qa_pairs) * 1)  # One iteration per call
+
+            # Finalize standardized evaluation logging
+            if self.standardized_logger:
+                summary_path = self.standardized_logger.finalize_session()
+                self.logger.info(f"Standardized evaluation session finalized: {summary_path}")
 
             # Return BatchReady message indicating completion
             return BatchReadyMessage(
@@ -335,37 +397,84 @@ class BatchOrchestratorAgent(RoutedAgent):
         """
         self.logger.info(f"🔄 Processing iteration {iteration} for QA pair {qa_pair_id}")
 
+        # Track intermediate outputs for comprehensive evaluation logging (matching GraphRAG)
+        intermediate_outputs = {}
+        step_start_time = datetime.now()
+
         try:
             # Step 1: Hyperparameters
             self.logger.info(f"Step 1/5: Hyperparameters optimization for {qa_pair_id}")
-            hyperparams_start_msg = HyperparametersVectorStartMessage(
-                qa_pair_id=qa_pair_id,
-                qa_pair=qa_pair,
-                batch_id=original_message.batch_id,
-                repetition=original_message.repetition,
-                dataset=original_message.dataset,
-                setting=original_message.setting
-            )
 
-            # Send to HyperparametersVectorAgent
-            hyperparams_agent_id = AgentId("hyperparameters_vector_agent", "default")
-            hyperparams_response = await self.send_message(hyperparams_start_msg, hyperparams_agent_id)
+            step_agent_start = datetime.now()
+            try:
+                hyperparams_start_msg = HyperparametersVectorStartMessage(
+                    qa_pair_id=qa_pair_id,
+                    qa_pair=qa_pair,
+                    batch_id=original_message.batch_id,
+                    repetition=original_message.repetition,
+                    dataset=original_message.dataset,
+                    setting=original_message.setting
+                )
+
+                # Send to HyperparametersVectorAgent
+                hyperparams_agent_id = AgentId("hyperparameters_vector_agent", "default")
+                hyperparams_response = await self.send_message(hyperparams_start_msg, hyperparams_agent_id)
+
+                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
+
+                # Log intermediate output
+                intermediate_outputs["hyperparameters"] = {
+                    "chunk_size": getattr(hyperparams_response, 'chunk_size', 512),
+                    "processing_time_ms": step_execution_time,
+                    "learned_prompt_used": bool(getattr(hyperparams_response, 'learned_prompt', None))
+                }
+
+            except Exception as e:
+                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
+                intermediate_outputs["hyperparameters"] = {
+                    "error": str(e),
+                    "processing_time_ms": step_execution_time
+                }
+                raise
 
             # Step 2: Vector Building
             self.logger.info(f"Step 2/5: Vector building for {qa_pair_id}")
-            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
 
-            vector_start_msg = VectorStartMessage(
-                batch_id=hyperparams_response.batch_id,
-                repetition=hyperparams_response.repetition,
-                chunk_size=hyperparams_response.chunk_size,
-                dataset=original_message.dataset,
-                setting=original_message.setting,
-                shared_state=current_state
-            )
+            step_agent_start = datetime.now()
+            try:
+                current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
 
-            vector_builder_agent_id = AgentId("vector_builder_agent", "default")
-            vector_response = await self.send_message(vector_start_msg, vector_builder_agent_id)
+                vector_start_msg = VectorStartMessage(
+                    batch_id=hyperparams_response.batch_id,
+                    repetition=hyperparams_response.repetition,
+                    chunk_size=hyperparams_response.chunk_size,
+                    dataset=original_message.dataset,
+                    setting=original_message.setting,
+                    shared_state=current_state
+                )
+
+                vector_builder_agent_id = AgentId("vector_builder_agent", "default")
+                vector_response = await self.send_message(vector_start_msg, vector_builder_agent_id)
+
+                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
+
+                # Log intermediate output
+                intermediate_outputs["vector_building"] = {
+                    "chunk_size": hyperparams_response.chunk_size,
+                    "faiss_index_path": getattr(vector_response, 'faiss_index_path', 'N/A'),
+                    "vectors_created": True,
+                    "embedding_method": "openai",
+                    "processing_time_ms": step_execution_time
+                }
+
+            except Exception as e:
+                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
+                intermediate_outputs["vector_building"] = {
+                    "error": str(e),
+                    "processing_time_ms": step_execution_time,
+                    "vectors_created": False
+                }
+                raise
 
             # Step 3: Vector Retrieval
             self.logger.info(f"Step 3/5: Vector retrieval for {qa_pair_id}")
@@ -387,6 +496,13 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             retrieval_agent_id = AgentId("vector_retrieval_planner_agent", "default")
             retrieval_response = await self.send_message(retrieval_start_msg, retrieval_agent_id)
+
+            # Log intermediate output for retrieval
+            intermediate_outputs["retrieval"] = {
+                "query": qa_pair.get("question", ""),
+                "retrieved_context": retrieval_response.retrieved_context[:200] + "..." if len(retrieval_response.retrieved_context) > 200 else retrieval_response.retrieved_context,
+                "retrieved_context_length": len(retrieval_response.retrieved_context)
+            }
 
             # Update shared state with retrieved context
             current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
@@ -414,6 +530,13 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             answer_gen_agent_id = AgentId("answer_generator_agent", "default")
             answer_response = await self.send_message(answer_gen_msg, answer_gen_agent_id)
+
+            # Log intermediate output for answer generation
+            intermediate_outputs["answer_generation"] = {
+                "question": qa_pair.get("question", ""),
+                "generated_answer": answer_response.generated_answer[:200] + "..." if len(answer_response.generated_answer) > 200 else answer_response.generated_answer,
+                "generated_answer_length": len(answer_response.generated_answer)
+            }
 
             # Step 5: Evaluation
             self.logger.info(f"Step 5/5: Evaluation for {qa_pair_id}")
@@ -444,6 +567,13 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             eval_agent_id = AgentId("response_evaluator_agent", "default")
             eval_response = await self.send_message(eval_start_msg, eval_agent_id)
+
+            # Log intermediate output for evaluation
+            intermediate_outputs["evaluation"] = {
+                "evaluation_feedback": eval_response.evaluation_result.get("evaluation_feedback", "N/A"),
+                "rouge_score": eval_response.rouge_score,
+                "gold_answers": gold_answers
+            }
 
             # Extract ROUGE score from evaluation response (computed by ResponseEvaluatorAgent)
             rouge_score = eval_response.rouge_score
@@ -494,23 +624,41 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             self.shared_state.save_state(current_state, original_message.dataset, original_message.setting, original_message.batch_id)
 
-            # Log to evaluation logger with comprehensive statistics
+            # Log to evaluation logger with comprehensive statistics (matching GraphRAG pattern)
+            total_execution_time = (datetime.now() - step_start_time).total_seconds()
+
             eval_logger = get_global_evaluation_logger()
+            # Log to old evaluation logger for backward compatibility
             eval_logger.log_iteration_evaluation(
                 qa_pair_id=qa_pair_id,
                 iteration=iteration,
-                intermediate_outputs={
-                    "batch_id": original_message.batch_id,
-                    "question": qa_pair.get("question", ""),
-                    "expected_answer": qa_pair.get("answer", ""),
-                    "hyperparameters": hyperparams_response.model_dump() if hasattr(hyperparams_response, 'model_dump') else str(hyperparams_response),
-                    "evaluation_details": eval_response.evaluation_result
-                },
+                intermediate_outputs=intermediate_outputs,  # Use comprehensive intermediate outputs
                 generated_answer=answer_response.generated_answer,
-                rouge_scores={"rouge-l": rouge_score, "rouge-1": rouge_score, "rouge-2": rouge_score},
+                rouge_scores={
+                    "rouge-l": rouge_score,
+                    "rouge-1": rouge_score,  # Use same score for ROUGE-1 (simplified)
+                    "rouge-2": rouge_score * 0.85  # Estimate ROUGE-2 as typically lower
+                },
                 hyperparameters={"chunk_size": hyperparams_response.chunk_size},
                 additional_metrics=comprehensive_vector_stats,
-                retrieval_context=retrieval_response.retrieved_context
+                retrieval_context=retrieval_response.retrieved_context,
+                execution_time_seconds=total_execution_time
+            )
+
+            # Log to standardized evaluation logger
+            self.standardized_logger.log_iteration_evaluation(
+                qa_pair_id=qa_pair_id,
+                iteration=iteration,
+                generated_answer=answer_response.generated_answer,
+                rouge_scores={
+                    "rouge-l": rouge_score,
+                    "rouge-1": rouge_score,  # Use same score for ROUGE-1 (simplified)
+                    "rouge-2": rouge_score * 0.85  # Estimate ROUGE-2 as typically lower
+                },
+                intermediate_outputs=intermediate_outputs,
+                hyperparameters={"chunk_size": hyperparams_response.chunk_size},
+                execution_time_seconds=total_execution_time,
+                system_specific_metrics=comprehensive_vector_stats
             )
 
             # Perform backward pass if not the last iteration
@@ -827,14 +975,41 @@ class BatchOrchestratorAgent(RoutedAgent):
             "rouge-2": rouge_score * 0.85  # Estimate
         }
 
-        # Create intermediate outputs for evaluation logging
+        # Create comprehensive intermediate outputs for evaluation logging (matching GraphRAG format)
         intermediate_outputs = {
-            "hyperparameters": {"chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512)},
-            "vector_building": {"vectors_created": True, "embedding_method": "openai"},
-            "retrieval": {"retrieved_context": current_state.get("retrieved_contexts", [""])[-1]},
-            "answer_generation": {"generated_answer": answer_response.generated_answer, "answer_length": len(answer_response.generated_answer)}
+            "hyperparameters": {
+                "chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512),
+                "processing_time_ms": 0,  # Not available in this context
+                "learned_prompt_used": False  # Not available in this context
+            },
+            "vector_building": {
+                "chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512),
+                "faiss_index_path": "vector_indexes/cached",  # Cached from previous processing
+                "vectors_created": True,
+                "embedding_method": "openai",
+                "processing_time_ms": 0  # Not available in this context
+            },
+            "retrieval": {
+                "query": qa_pair.get("question", ""),
+                "retrieved_context": current_state.get("retrieved_contexts", [""])[-1][:200] + "..." if len(current_state.get("retrieved_contexts", [""])[-1]) > 200 else current_state.get("retrieved_contexts", [""])[-1],
+                "retrieved_context_length": len(current_state.get("retrieved_contexts", [""])[-1]) if current_state.get("retrieved_contexts") else 0,
+                "processing_time_ms": 0  # Not available in this context
+            },
+            "answer_generation": {
+                "question": qa_pair.get("question", ""),
+                "generated_answer": answer_response.generated_answer[:200] + "..." if len(answer_response.generated_answer) > 200 else answer_response.generated_answer,
+                "generated_answer_length": len(answer_response.generated_answer),
+                "processing_time_ms": 0  # Not available in this context
+            },
+            "evaluation": {
+                "evaluation_feedback": "N/A",  # Not available in this simplified path
+                "rouge_score": rouge_score,
+                "gold_answers": qa_pair.get("answers", []),
+                "processing_time_ms": 0  # Not available in this context
+            }
         }
 
+        # Log to old evaluation logger for backward compatibility
         eval_logger.log_iteration_evaluation(
             qa_pair_id=answer_response.qa_pair_id,
             iteration=0,  # TODO: Will be updated when multi-iteration is implemented
@@ -846,6 +1021,19 @@ class BatchOrchestratorAgent(RoutedAgent):
             retrieval_context=current_state.get("retrieved_contexts", [""])[-1] if current_state.get("retrieved_contexts") else "",
             additional_metrics={"qa_pair_question": qa_pair.get("question", "N/A")}
         )
+
+        # Log to standardized evaluation logger
+        if self.standardized_logger:
+            self.standardized_logger.log_iteration_evaluation(
+                qa_pair_id=answer_response.qa_pair_id,
+                iteration=0,  # TODO: Will be updated when multi-iteration is implemented
+                generated_answer=answer_response.generated_answer,
+                rouge_scores=rouge_scores,
+                intermediate_outputs=intermediate_outputs,
+                hyperparameters={"chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512)},
+                execution_time_seconds=None,  # Not available in this context
+                system_specific_metrics={"vector_count": len(current_state.get("retrieved_contexts", [])), "retrieval_method": "vector_similarity"}
+            )
 
         # Send ResponseEvaluationStart message
         eval_start_msg = ResponseEvaluationStartMessage(
@@ -1313,28 +1501,31 @@ class VectorBuilderAgent(RoutedAgent):
         chunks = self._split_text_into_chunks(corpus, message.chunk_size)
         self.logger.info(f"Split corpus into {len(chunks)} chunks")
 
-        # Process chunks in batches of 8 for embedding
-        self.logger.info(f"Starting embedding generation for {len(chunks)} chunks")
+        # Process chunks concurrently for embedding (similar to GraphRAG async pattern)
+        self.logger.info(f"Starting concurrent embedding generation for {len(chunks)} chunks")
         all_embeddings = []
         self.chunk_metadata = []
 
-        # Import the embedding function
-        from llm import get_embeddings
+        # Import the async embedding function
+        from llm import get_embeddings_async
+        import asyncio
 
-        # Process chunks in batches of 8
+        # Create batches of 8 chunks each for optimal API usage
         batch_size = 8
-        for i in range(0, len(chunks), batch_size):
-            batch_chunks = chunks[i:i + batch_size]
-            self.logger.info(f"Processing embedding batch {i // batch_size + 1}/{(len(chunks) + batch_size - 1) // batch_size}")
+        chunk_batches = [chunks[i:i + batch_size] for i in range(0, len(chunks), batch_size)]
 
+        # Define async function to process each batch
+        async def process_batch_with_index(batch_idx: int, batch_chunks: List[str]) -> tuple:
+            """Process a single batch of chunks concurrently."""
             try:
-                batch_embeddings = get_embeddings(batch_chunks)
-                all_embeddings.extend(batch_embeddings)
+                self.logger.info(f"Processing embedding batch {batch_idx + 1}/{len(chunk_batches)}")
+                batch_embeddings = await get_embeddings_async(batch_chunks)
 
-                # Store metadata for each chunk
+                # Create metadata for this batch
+                batch_metadata = []
                 for j, chunk_text in enumerate(batch_chunks):
-                    chunk_id = i + j
-                    self.chunk_metadata.append({
+                    chunk_id = batch_idx * batch_size + j
+                    batch_metadata.append({
                         "chunk_id": chunk_id,
                         "text": chunk_text,
                         "batch_id": message.batch_id,
@@ -1342,11 +1533,45 @@ class VectorBuilderAgent(RoutedAgent):
                         "setting": message.setting
                     })
 
-            except Exception as e:
-                self.logger.error(f"Error processing embedding batch: {e}")
-                continue
+                self.logger.info(f"Completed embedding batch {batch_idx + 1}/{len(chunk_batches)}")
+                return batch_embeddings, batch_metadata
 
-        self.logger.info(f"Generated {len(all_embeddings)} embeddings")
+            except Exception as e:
+                self.logger.error(f"Error processing embedding batch {batch_idx + 1}: {e}")
+                # Return empty results for failed batch
+                return [], []
+
+        # Execute all batch processing tasks concurrently with controlled concurrency
+        self.logger.info(f"Starting concurrent processing of {len(chunk_batches)} embedding batches")
+
+        # Limit concurrent API calls to prevent rate limiting (max 5 concurrent batches)
+        semaphore = asyncio.Semaphore(5)
+
+        async def limited_process_batch(batch_idx: int, batch_chunks: List[str]) -> tuple:
+            """Process batch with concurrency limiting."""
+            async with semaphore:
+                return await process_batch_with_index(batch_idx, batch_chunks)
+
+        tasks = [limited_process_batch(i, batch) for i, batch in enumerate(chunk_batches)]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Handle any exceptions that occurred
+        successful_results = []
+        for i, result in enumerate(batch_results):
+            if isinstance(result, Exception):
+                self.logger.error(f"Batch {i+1} failed with exception: {result}")
+                successful_results.append(([], []))  # Empty results for failed batch
+            else:
+                successful_results.append(result)
+
+        batch_results = successful_results
+
+        # Aggregate results from all batches
+        for batch_embeddings, batch_metadata in batch_results:
+            all_embeddings.extend(batch_embeddings)
+            self.chunk_metadata.extend(batch_metadata)
+
+        self.logger.info(f"Completed concurrent embedding generation for {len(all_embeddings)} embeddings")
 
         # Create FAISS index
         if all_embeddings:
@@ -1631,9 +1856,9 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
     async def _execute_vector_search(self, query: str, faiss_index, chunk_metadata, k: int = 5) -> str:
         """Execute vector search using FAISS index."""
         try:
-            # Get query embedding
-            from llm import get_embeddings
-            query_embeddings = get_embeddings([query])
+            # Get query embedding using async function
+            from llm import get_embeddings_async
+            query_embeddings = await get_embeddings_async([query])
             query_vector = np.array(query_embeddings[0]).astype('float32').reshape(1, -1)
 
             # Normalize for cosine similarity

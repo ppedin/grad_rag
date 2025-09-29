@@ -24,3 +24,12 @@ validate_*
 frozen_prompts/
 training_logs/
 vector_indexes/
+agent_logs/
+agent_states/
+evaluation_logs/
+frozen_prompts/
+prompt_response_logs/
+step_execution_logs/
+test_agent_states/
+training_logs/
+transition_logs/
