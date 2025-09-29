@@ -202,6 +202,19 @@ class SharedState:
         fresh_state["example_information"] = current_state.get("example_information", {})
         fresh_state["batch_information"] = current_state.get("batch_information", {})
 
+        # CRITICAL FIX: Explicitly clear all learned prompt keys to prevent leakage between QA pairs
+        learned_prompt_keys = [
+            "learned_prompt_hyperparameters_vector",
+            "learned_prompt_answer_generator_vector",
+            "learned_prompt_vector_retrieval_planner",
+            "learned_prompt_hyperparameters_graph",
+            "learned_prompt_answer_generator_graph",
+            "learned_prompt_graph_retrieval_planner",
+            "learned_prompt_graph_builder"
+        ]
+        for key in learned_prompt_keys:
+            fresh_state[key] = ""
+
         # Reset QA pair level tracking
         self.current_qa_pair_id = qa_pair_id
         self.current_iteration = 0

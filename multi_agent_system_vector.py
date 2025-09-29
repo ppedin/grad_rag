@@ -214,9 +214,11 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             self.logger.info(f"Initialized tracking for {len(self.current_batch_qa_pairs)} QA pairs")
 
-            # Get total iterations from batch information
-            total_iterations = batch_info.get("total_iterations", 1)
-            self.logger.info(f"Processing {len(qa_pairs)} QA pairs with {total_iterations} iterations each")
+            # FIXED: Use message.repetition as current iteration instead of processing multiple iterations
+            # The DatasetAgent calls us once per repetition, so we should process exactly one iteration
+            current_iteration = message.repetition
+            total_iterations = batch_info.get("total_iterations", 1)  # Keep for logging context
+            self.logger.info(f"Processing {len(qa_pairs)} QA pairs - current iteration: {current_iteration} (DatasetAgent repetition: {message.repetition})")
 
             # Initialize tracking for multi-iteration processing
             for qa_pair in qa_pairs:
@@ -224,16 +226,16 @@ class BatchOrchestratorAgent(RoutedAgent):
                 self.qa_pair_results[qa_pair_id] = []
                 self.qa_pair_rouge_progression[qa_pair_id] = []
 
-            # Process each QA pair with multiple iterations
+            # Process each QA pair for the current iteration only (DatasetAgent handles repetitions)
             for qa_pair in qa_pairs:
                 qa_pair_id = qa_pair.get("question_id", f"qa_{qa_pairs.index(qa_pair)}")
-                self.logger.info(f"🔄 Starting QA pair {qa_pair_id} with {total_iterations} iterations")
+                self.logger.info(f"🔄 Processing QA pair {qa_pair_id} for iteration {current_iteration}")
 
                 # Initialize shared state for this QA pair
                 current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
 
                 # Determine if this is a new QA pair or new iteration
-                transition_type = self.shared_state.detect_transition_type(qa_pair_id, 0)
+                transition_type = self.shared_state.detect_transition_type(qa_pair_id, current_iteration)
 
                 if transition_type == 'new_qa_pair':
                     # Complete reset for new QA pair
@@ -241,69 +243,63 @@ class BatchOrchestratorAgent(RoutedAgent):
                     current_state["batch_information"] = batch_info
                     current_state["full_document_text"] = batch_info.get("document_text", "")
                     self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+                elif transition_type == 'new_iteration':
+                    # Partial reset for new iteration of same QA pair
+                    current_state = self.shared_state.reset_for_new_iteration(qa_pair_id, current_iteration, message.dataset, message.setting, message.batch_id)
+                    current_state["batch_information"] = batch_info
+                    current_state["full_document_text"] = batch_info.get("document_text", "")
+                    self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-                # Process multiple iterations for this QA pair
-                for iteration in range(total_iterations):
-                    self.logger.info(f"📊 Processing QA pair {qa_pair_id}, iteration {iteration}")
+                # Process the current iteration only
+                self.logger.info(f"📊 Processing QA pair {qa_pair_id}, iteration {current_iteration}")
 
-                    try:
-                        # Start batch for this iteration
-                        step_logger = get_global_step_logger()
-                        step_logger.start_batch(message.batch_id, qa_pair_id, iteration, total_iterations)
+                try:
+                    # Start batch for this iteration
+                    step_logger = get_global_step_logger()
+                    step_logger.start_batch(message.batch_id, qa_pair_id, current_iteration, total_iterations)
 
-                        # If not the first iteration, perform partial reset
-                        if iteration > 0:
-                            current_state = self.shared_state.reset_for_new_iteration(qa_pair_id, iteration, message.dataset, message.setting, message.batch_id)
-                            current_state["batch_information"] = batch_info
-                            current_state["full_document_text"] = batch_info.get("document_text", "")
-                            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+                    # Process this iteration
+                    iteration_results = await self._process_qa_pair_iteration(qa_pair_id, qa_pair, current_iteration, message, ctx)
 
-                        # Process this iteration
-                        iteration_results = await self._process_qa_pair_iteration(qa_pair_id, qa_pair, iteration, message, ctx)
+                    # Store iteration results
+                    if qa_pair_id not in self.qa_pair_results:
+                        self.qa_pair_results[qa_pair_id] = []
+                        self.qa_pair_rouge_progression[qa_pair_id] = []
 
-                        # Store iteration results
-                        self.qa_pair_results[qa_pair_id].append(iteration_results)
-                        rouge_score = iteration_results.get("rouge_score", 0.0)
-                        self.qa_pair_rouge_progression[qa_pair_id].append(rouge_score)
+                    self.qa_pair_results[qa_pair_id].append(iteration_results)
+                    rouge_score = iteration_results.get("rouge_score", 0.0)
+                    self.qa_pair_rouge_progression[qa_pair_id].append(rouge_score)
 
-                        self.logger.info(f"✓ Iteration {iteration} completed for {qa_pair_id} | ROUGE: {rouge_score:.4f}")
+                    self.logger.info(f"✓ Iteration {current_iteration} completed for {qa_pair_id} | ROUGE: {rouge_score:.4f}")
 
-                        # Complete batch for this iteration
-                        step_logger.complete_batch(success=True, final_rouge_score=rouge_score)
+                    # Complete batch for this iteration
+                    step_logger.complete_batch(success=True, final_rouge_score=rouge_score)
 
-                    except Exception as e:
-                        self.logger.error(f"Critical error in iteration {iteration} for {qa_pair_id}: {e}")
-                        # Store error results
-                        error_results = {
-                            "qa_pair_id": qa_pair_id,
-                            "iteration": iteration,
-                            "error": str(e),
-                            "rouge_score": 0.0
-                        }
-                        self.qa_pair_results[qa_pair_id].append(error_results)
-                        self.qa_pair_rouge_progression[qa_pair_id].append(0.0)
+                except Exception as e:
+                    self.logger.error(f"Critical error in iteration {current_iteration} for {qa_pair_id}: {e}")
+                    # Store error results
+                    if qa_pair_id not in self.qa_pair_results:
+                        self.qa_pair_results[qa_pair_id] = []
+                        self.qa_pair_rouge_progression[qa_pair_id] = []
 
-                        step_logger.complete_batch(success=False, error_message=str(e))
+                    error_results = {
+                        "qa_pair_id": qa_pair_id,
+                        "iteration": current_iteration,
+                        "error": str(e),
+                        "rouge_score": 0.0
+                    }
+                    self.qa_pair_results[qa_pair_id].append(error_results)
+                    self.qa_pair_rouge_progression[qa_pair_id].append(0.0)
 
-                # Complete QA pair processing
-                final_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
-                rouge_improvement = (
-                    self.qa_pair_rouge_progression[qa_pair_id][-1] - self.qa_pair_rouge_progression[qa_pair_id][0]
-                    if len(self.qa_pair_rouge_progression[qa_pair_id]) > 1 else 0.0
-                )
+                    step_logger.complete_batch(success=False, error_message=str(e))
 
-                self.completed_qa_pairs[qa_pair_id] = {
-                    "iterations": self.qa_pair_results[qa_pair_id],
-                    "rouge_progression": self.qa_pair_rouge_progression[qa_pair_id],
-                    "final_rouge": final_rouge,
-                    "rouge_improvement": rouge_improvement
-                }
-
-                self.logger.info(f"🎯 QA pair {qa_pair_id} completed - Final ROUGE: {final_rouge:.4f}, Improvement: {rouge_improvement:.4f}")
+                # Log iteration completion (DatasetAgent handles overall QA pair completion tracking)
+                current_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
+                self.logger.info(f"🎯 QA pair {qa_pair_id} iteration {current_iteration} completed - ROUGE: {current_rouge:.4f}")
 
             # Complete pipeline
             step_logger.complete_pipeline(success=True, total_qa_pairs_processed=len(qa_pairs),
-                                        total_iterations_completed=len(qa_pairs) * total_iterations)
+                                        total_iterations_completed=len(qa_pairs) * 1)  # One iteration per call
 
             # Return BatchReady message indicating completion
             return BatchReadyMessage(
@@ -518,10 +514,12 @@ class BatchOrchestratorAgent(RoutedAgent):
             )
 
             # Perform backward pass if not the last iteration
+            # Since DatasetAgent handles repetitions, we should run backward pass for all iterations except the last
             current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
             batch_info = current_state.get("batch_information", {})
             total_iterations = batch_info.get("total_iterations", 1)
 
+            # Run backward pass for iterations 0 to (total_iterations - 2), skip for last iteration
             if iteration < total_iterations - 1:
                 self.logger.info(f"🔄 Starting backward pass for iteration {iteration}")
 
@@ -985,8 +983,15 @@ class BatchOrchestratorAgent(RoutedAgent):
             current_qa_pair_id = self.shared_state.current_qa_pair_id
             if current_qa_pair_id and optimized_prompts:
                 self.shared_state.update_qa_pair_prompts(current_qa_pair_id, optimized_prompts)
+
+                # CRITICAL FIX: Save optimized prompts to persistent state for next DatasetAgent call
+                current_state = self.shared_state.load_state(backward_response.dataset, backward_response.setting, backward_response.batch_id)
+                for prompt_key, prompt_value in optimized_prompts.items():
+                    current_state[prompt_key] = prompt_value
+                self.shared_state.save_state(current_state, backward_response.dataset, backward_response.setting, backward_response.batch_id)
+
                 self.logger.info(f"Updated QA pair prompts for {current_qa_pair_id} - preserving learned prompts for next iteration")
-                self.logger.info(f"DEBUG: BatchOrchestrator - optimized_prompts saved: {[(k, len(v)) for k, v in optimized_prompts.items()]}")
+                self.logger.info(f"DEBUG: BatchOrchestrator - optimized_prompts saved to persistent state: {[(k, len(v)) for k, v in optimized_prompts.items()]}")
             else:
                 self.logger.warning(f"Cannot update QA pair prompts - current_qa_pair_id: {current_qa_pair_id}, optimized_prompts: {bool(optimized_prompts)}")
 
@@ -1137,12 +1142,22 @@ class HyperparametersVectorAgent(RoutedAgent):
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.hyperparameters_vector")
         self.shared_state = SharedState("agent_states")
 
-        # Initialize OpenAI model client with structured output
+        # Initialize Gemini model client with structured output
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY,
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            },
             response_format=HyperparametersVectorResponse
         )
+
+
 
         # Base prompt for hyperparameters determination
         from parameters import base_prompt_hyperparameters_vector
@@ -1440,10 +1455,18 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         # Import response formats and prompts
         from parameters import base_prompt_vector_retrieval_planner, VectorRetrievalPlannerResponse
 
-        # Initialize OpenAI model client with structured output
+        # Initialize Gemini model client with structured output
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY,
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            },
             response_format=VectorRetrievalPlannerResponse
         )
 
@@ -1653,10 +1676,18 @@ class AnswerGeneratorAgent(RoutedAgent):
         # Import prompts
         from parameters import base_prompt_answer_generator_vector
 
-        # Initialize OpenAI model client for simple text response
+        # Initialize Gemini model client with structured output
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            }
         )
 
         self.base_prompt_answer_generator_vector = base_prompt_answer_generator_vector
@@ -1773,11 +1804,21 @@ class ResponseEvaluatorAgent(RoutedAgent):
         # Import prompts
         from parameters import response_evaluator_prompt
 
-        # Initialize OpenAI model client for simple text response
+        # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY
+            model="gemini-2.5-flash-lite",
+            max_tokens=1024,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            }
         )
+
 
         self.response_evaluator_prompt = response_evaluator_prompt
 
@@ -1944,10 +1985,19 @@ class BackwardPassAgent(RoutedAgent):
             hyperparameters_vector_agent_prompt_optimizer
         )
 
-        # Initialize OpenAI model client for simple text response
+        # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY
+            model="gemini-2.5-flash-lite",
+            max_tokens=512,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            }
         )
 
         # Store all vector-specific gradient prompts
@@ -2328,10 +2378,18 @@ class SummarizerAgent(RoutedAgent):
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.summarizer")
         self.shared_state = SharedState("agent_states")
 
-        # Initialize OpenAI model client for text summarization
+        # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
-            model="gpt-4o-mini",
-            api_key=llm_keys.OPENAI_KEY
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": True,
+                "json_output": True,
+                "family": "unknown",
+                "structured_output": True,
+            }
         )
 
         # Base prompt for context summarization
