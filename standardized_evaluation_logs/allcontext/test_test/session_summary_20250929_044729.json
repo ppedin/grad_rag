@@ -1,0 +1,20 @@
+{
+  "session_id": "allcontext_test_test_20250929_044729",
+  "system_type": "allcontext",
+  "dataset": "test",
+  "setting": "test",
+  "start_time": "2025-09-29T04:47:29.392232",
+  "total_qa_pairs": 2,
+  "total_iterations": 6,
+  "avg_rouge_scores": {
+    "rouge_1": 0.24963076139546733,
+    "rouge_2": 0.21218614718614717,
+    "rouge_l": 0.24963076139546733
+  },
+  "performance_metrics": {
+    "avg_execution_time": 17.653728166666664,
+    "total_execution_time": 105.92236899999999,
+    "avg_iterations_per_qa": 3.0
+  },
+  "end_time": "2025-09-29T04:49:15.375857"
+}

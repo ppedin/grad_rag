@@ -1,0 +1,20 @@
+{
+  "session_id": "allcontext_squality_test_20250929_085643",
+  "system_type": "allcontext",
+  "dataset": "squality",
+  "setting": "test",
+  "start_time": "2025-09-29T08:56:43.405394",
+  "total_qa_pairs": 1,
+  "total_iterations": 2,
+  "avg_rouge_scores": {
+    "rouge_1": 0.1947416129462704,
+    "rouge_2": 0.16553037100432982,
+    "rouge_l": 0.1947416129462704
+  },
+  "performance_metrics": {
+    "avg_execution_time": 34.7796015,
+    "total_execution_time": 69.559203,
+    "avg_iterations_per_qa": 2.0
+  },
+  "end_time": "2025-09-29T08:57:52.997103"
+}

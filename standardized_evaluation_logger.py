@@ -19,6 +19,7 @@ class SystemType(Enum):
     """RAG system types."""
     GRAPHRAG = "graphrag"
     VECTORRAG = "vectorrag"
+    ALLCONTEXT = "allcontext"
 
 
 class StandardizedEvaluationLogger:

@@ -2,16 +2,16 @@
 
 ## Overview
 
-The Standardized Evaluation Logging System provides a unified format for automatic analysis and comparison of GraphRAG and VectorRAG systems. Each system gets its own folder with consistent data structures for seamless automated processing.
+The Standardized Evaluation Logging System provides a unified format for automatic analysis and comparison of GraphRAG, VectorRAG, and All-Context systems. Each system gets its own folder with consistent data structures for seamless automated processing.
 
 ## Features
 
-- **System-specific folder structure**: Separate directories for GraphRAG and VectorRAG
-- **Unified JSON schema**: Consistent format across both systems for automatic analysis
+- **System-specific folder structure**: Separate directories for GraphRAG, VectorRAG, and All-Context
+- **Unified JSON schema**: Consistent format across all systems for automatic analysis
 - **Comprehensive intermediate outputs tracking**: All agent outputs and processing steps
 - **ROUGE score standardization**: Consistent metric calculation and formatting
 - **Execution time and performance metrics**: Detailed timing and performance data
-- **System-specific metrics**: Graph statistics for GraphRAG, vector statistics for VectorRAG
+- **System-specific metrics**: Graph statistics for GraphRAG, vector statistics for VectorRAG, prompt optimization for All-Context
 
 ## Directory Structure
 
@@ -22,7 +22,12 @@ standardized_evaluation_logs/
 │       ├── qa_pairs_{timestamp}.jsonl          # QA pair start/completion entries
 │       ├── iterations_{timestamp}.jsonl        # Iteration evaluation entries
 │       └── session_summary_{timestamp}.json    # Session summary statistics
-└── vectorrag/
+├── vectorrag/
+│   └── {dataset}_{setting}/
+│       ├── qa_pairs_{timestamp}.jsonl
+│       ├── iterations_{timestamp}.jsonl
+│       └── session_summary_{timestamp}.json
+└── allcontext/
     └── {dataset}_{setting}/
         ├── qa_pairs_{timestamp}.jsonl
         ├── iterations_{timestamp}.jsonl
@@ -118,6 +123,60 @@ standardized_evaluation_logs/
 }
 ```
 
+#### All-Context System Example
+
+```json
+{
+    "session_id": "allcontext_squality_test_20250929_030657",
+    "system_type": "allcontext",
+    "dataset": "squality",
+    "setting": "test",
+    "timestamp": "2025-09-29T03:07:32.987654",
+    "entry_type": "iteration_evaluation",
+    "qa_pair_id": "qa_1",
+    "iteration": 0,
+    "iteration_number": 1,
+    "generated_answer": "Based on the full document provided...",
+    "generated_answer_length": 312,
+    "rouge_scores": {
+        "rouge_1": 0.58,
+        "rouge_2": 0.44,
+        "rouge_l": 0.58
+    },
+    "execution_time_seconds": 15.67,
+    "hyperparameters": {
+        "system_prompt": "You are an expert analyst. Focus on accuracy and completeness.",
+        "document_length": 15000
+    },
+    "intermediate_outputs": {
+        "answer_generation": {
+            "system_prompt": "You are an expert analyst...",
+            "system_prompt_length": 85,
+            "document_length": 15000,
+            "generated_answer": "Based on the full document provided...",
+            "processing_time_ms": 5400
+        },
+        "evaluation": {
+            "evaluation_feedback": "The answer demonstrates good comprehension...",
+            "rouge_score": 0.58,
+            "processing_time_ms": 3200
+        },
+        "prompt_critique": {
+            "current_prompt": "You are an expert analyst...",
+            "optimized_prompt": "You are a detail-oriented analyst. When answering questions...",
+            "critique_feedback": "The current prompt could be more specific about...",
+            "processing_time_ms": 4100
+        }
+    },
+    "system_specific_metrics": {
+        "system_prompt_length": 85,
+        "document_length": 15000,
+        "prompt_optimization_performed": true,
+        "iteration_type": "with_prompt_optimization"
+    }
+}
+```
+
 ### Session Summary (`session_summary_{timestamp}.json`)
 
 ```json
@@ -147,14 +206,14 @@ standardized_evaluation_logs/
 
 ### Basic Integration
 
-Both GraphRAG and VectorRAG systems are already integrated with the standardized logger. The logger is automatically initialized when batch processing starts:
+All three systems (GraphRAG, VectorRAG, and All-Context) are already integrated with the standardized logger. The logger is automatically initialized when batch processing starts:
 
 ```python
 from standardized_evaluation_logger import SystemType, initialize_standardized_logging
 
-# Automatic initialization in both systems
+# Automatic initialization in all systems
 logger = initialize_standardized_logging(
-    SystemType.GRAPHRAG,  # or SystemType.VECTORRAG
+    SystemType.GRAPHRAG,  # or SystemType.VECTORRAG or SystemType.ALLCONTEXT
     dataset="squality",
     setting="test"
 )
@@ -259,9 +318,9 @@ analyze_system_performance("vectorrag", "squality", "test")
 
 ```python
 def compare_systems(dataset, setting):
-    """Compare GraphRAG vs VectorRAG performance."""
+    """Compare GraphRAG vs VectorRAG vs All-Context performance."""
 
-    systems = ["graphrag", "vectorrag"]
+    systems = ["graphrag", "vectorrag", "allcontext"]
     results = {}
 
     for system in systems:
@@ -276,13 +335,16 @@ def compare_systems(dataset, setting):
                 results[system] = json.load(f)
 
     # Compare results
-    if len(results) == 2:
+    if len(results) >= 2:
         print("System Comparison:")
         print("-" * 50)
         for metric in ["avg_rouge_scores", "performance_metrics"]:
             print(f"\n{metric.upper()}:")
             for system in systems:
-                print(f"  {system}: {results[system].get(metric, {})}")
+                if system in results:
+                    print(f"  {system}: {results[system].get(metric, {})}")
+                else:
+                    print(f"  {system}: No data available")
 
 # Usage
 compare_systems("squality", "test")
@@ -334,10 +396,10 @@ analyze_qa_pair_progression("graphrag", "squality", "test")
 
 ## Key Benefits
 
-1. **Automatic Integration**: Both GraphRAG and VectorRAG automatically use the standardized logger
+1. **Automatic Integration**: All three systems (GraphRAG, VectorRAG, All-Context) automatically use the standardized logger
 2. **Consistent Format**: All data follows the same schema for easy automated analysis
 3. **Comprehensive Data**: Captures all intermediate outputs, metrics, and timing information
-4. **System Separation**: Clean separation between GraphRAG and VectorRAG data
+4. **System Separation**: Clean separation between GraphRAG, VectorRAG, and All-Context data
 5. **Performance Tracking**: Built-in calculation of averages and progression metrics
 6. **Extensible**: Easy to add new metrics or analysis scripts
 
@@ -345,6 +407,16 @@ analyze_qa_pair_progression("graphrag", "squality", "test")
 
 - **GraphRAG logs**: `standardized_evaluation_logs/graphrag/{dataset}_{setting}/`
 - **VectorRAG logs**: `standardized_evaluation_logs/vectorrag/{dataset}_{setting}/`
+- **All-Context logs**: `standardized_evaluation_logs/allcontext/{dataset}_{setting}/`
 - **Session summaries**: Auto-generated at the end of each evaluation session
 
-The standardized evaluation logging system provides a robust foundation for automated analysis and comparison of GraphRAG and VectorRAG performance across different datasets and settings.
+## All-Context System Features
+
+The All-Context system has unique characteristics that are captured in the standardized logs:
+
+- **No RAG**: Uses entire document in prompt, no retrieval step
+- **Prompt Evolution**: Tracks system prompt optimization across iterations
+- **Direct Context**: Full document provided to answer generation
+- **Iterative Improvement**: Prompt critique and optimization for better performance
+
+The standardized evaluation logging system provides a robust foundation for automated analysis and comparison of GraphRAG, VectorRAG, and All-Context performance across different datasets and settings.

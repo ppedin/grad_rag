@@ -1,0 +1,20 @@
+{
+  "session_id": "allcontext_test_test_20250929_043259",
+  "system_type": "allcontext",
+  "dataset": "test",
+  "setting": "test",
+  "start_time": "2025-09-29T04:32:59.581987",
+  "total_qa_pairs": 1,
+  "total_iterations": 0,
+  "avg_rouge_scores": {
+    "rouge_1": 0.0,
+    "rouge_2": 0.0,
+    "rouge_l": 0.0
+  },
+  "performance_metrics": {
+    "avg_execution_time": 0.0,
+    "total_execution_time": 0.0,
+    "avg_iterations_per_qa": 0.0
+  },
+  "end_time": "2025-09-29T04:33:01.055839"
+}
