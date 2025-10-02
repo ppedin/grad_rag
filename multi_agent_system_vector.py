@@ -70,7 +70,7 @@ class VectorRetrievalStartMessage(BaseModel):
     query: str
     dataset: str
     setting: str
-    k_iterations: int = 3
+    k_iterations: int = 5
     shared_state: Dict[str, Any]
 
 class VectorRetrievalReadyMessage(BaseModel):
@@ -493,7 +493,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                 query=qa_pair.get("question", ""),
                 dataset=original_message.dataset,
                 setting=original_message.setting,
-                k_iterations=3,
+                k_iterations=5,
                 shared_state=current_state
             )
 
@@ -883,7 +883,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                 query=question,
                 dataset=vector_response.dataset,
                 setting=vector_response.setting,
-                k_iterations=3,
+                k_iterations=5,
                 shared_state=current_state
             )
 

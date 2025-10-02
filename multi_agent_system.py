@@ -31,6 +31,90 @@ import llm_keys
 from autogen_dataset_agent import BatchStartMessage, BatchReadyMessage
 
 
+# ===== LOGGING CONFIGURATION =====
+
+def configure_logging_for_performance(disable_prompt_logs: bool = False):
+    """Configure logging to reduce console output and improve performance.
+
+    Args:
+        disable_prompt_logs: If True, also disable prompt/response logging
+    """
+
+    # First, completely disable INFO and DEBUG logging globally
+    logging.disable(logging.INFO)
+
+    # Get the root logger and remove all console handlers
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.ERROR)
+
+    # Remove all console handlers from root logger (this is key!)
+    for handler in root_logger.handlers[:]:
+        if isinstance(handler, logging.StreamHandler) and handler.stream.name in ('<stderr>', '<stdout>'):
+            root_logger.removeHandler(handler)
+
+    # Configure specific loggers that we know about
+    loggers_to_quiet = [
+        TRACE_LOGGER_NAME,
+        'autogen_core',
+        'autogen_ext',
+        'httpx',
+        'openai',
+        'urllib3',
+        'asyncio',
+        'aiohttp',
+        'requests'
+    ]
+
+    for logger_name in loggers_to_quiet:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False  # Don't propagate to parent
+
+        # Remove all console handlers
+        for handler in logger.handlers[:]:
+            if isinstance(handler, logging.StreamHandler):
+                logger.removeHandler(handler)
+
+    # Optionally disable prompt/response logging for maximum performance
+    if disable_prompt_logs:
+        from prompt_response_logger import disable_prompt_logging
+        disable_prompt_logging()
+
+def suppress_console_logging():
+    """Additional function to call when you want to completely suppress console output."""
+    # This is a more aggressive approach
+    logging.disable(logging.CRITICAL)  # Disable everything except CRITICAL
+
+# Function to re-enable logging if needed for debugging
+def enable_console_logging():
+    """Re-enable console logging for debugging."""
+    logging.disable(logging.NOTSET)  # Re-enable all logging
+
+def disable_prompt_response_logging():
+    """Disable prompt/response logging specifically."""
+    from prompt_response_logger import disable_prompt_logging
+    disable_prompt_logging()
+
+def enable_prompt_response_logging():
+    """Re-enable prompt/response logging."""
+    from prompt_response_logger import enable_prompt_logging
+    enable_prompt_logging()
+
+# Configure logging on module import
+configure_logging_for_performance()
+
+# Export the logging control functions so they can be used by other modules
+__all__ = [
+    'configure_logging_for_performance',
+    'suppress_console_logging',
+    'enable_console_logging',
+    'disable_prompt_response_logging',
+    'enable_prompt_response_logging',
+    'BatchOrchestratorAgent',
+    'HyperparametersGraphAgent'
+]
+
+
 # ===== MESSAGE TYPES =====
 
 # Import shared messages from DatasetAgent to avoid duplication
@@ -175,12 +259,16 @@ class BatchOrchestratorAgent(RoutedAgent):
         # Standardized evaluation logging
         self.standardized_logger = None
 
+
     @message_handler
     async def handle_batch_start(self, message: BatchStartMessage, ctx: MessageContext) -> BatchReadyMessage:
         """
         Enhanced BatchStart handler with two-level reset logic.
         Processes each QA pair through multiple iterations with proper state management.
         """
+        # Ensure console logging is suppressed (in case other modules enabled it)
+        suppress_console_logging()
+
         self.logger.info(f"BatchOrchestrator received BatchStart for batch {message.batch_id}")
 
         self.current_batch_id = message.batch_id
@@ -1533,6 +1621,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             return {"connectivity_metrics": {}}
 
 
+
 # ===== HYPERPARAMETERS GRAPH AGENT =====
 
 class HyperparametersGraphAgent(RoutedAgent):
@@ -1872,61 +1961,33 @@ class GraphBuilderAgent(RoutedAgent):
         except Exception as e:
             self.logger.error(f"Error saving graph file: {e}")
 
-        # Load graph into Memgraph server
+        # Graph is now saved to JSON file - no Memgraph loading needed for community-based retrieval
+        self.logger.info(f"Graph building completed. JSON file saved at {graph_filename}")
+        self.logger.info(f"Graph contains {len(all_entities)} entities and {len(all_relationships)} relationships")
+
+        # Generate simple graph description and connectivity metrics
         try:
-            from graph_functions import load_graph_from_json_flexible, clear_graph, merge_graph_incremental
-            import os
+            # Create simple graph description based on NetworkX statistics
+            graph_description = f"Knowledge graph with {len(all_entities)} entities and {len(all_relationships)} relationships. "
 
-            if is_first_iteration:
-                # For first iteration, clear existing graph and load new one
-                self.logger.info("First iteration: Clearing existing graph and loading new one")
-                clear_result = clear_graph()
-                if clear_result.get("status") == "success":
-                    self.logger.info(f"Graph cleared successfully: {clear_result.get('message')}")
-                else:
-                    self.logger.warning(f"Failed to clear graph: {clear_result.get('message')}")
-
-                # Use the filename relative to the mounted volume
-                graph_file_basename = os.path.basename(graph_filename)
-                load_result = load_graph_from_json_flexible(graph_file_basename)
-
-                if load_result.get("status") == "success":
-                    self.logger.info(f"Successfully loaded graph {graph_file_basename} into Memgraph server")
-                else:
-                    self.logger.error(f"Failed to load graph: {load_result.get('message')}")
-            else:
-                # For refinement, merge new entities/relationships into existing graph
-                self.logger.info("Refinement mode: Merging new entities and relationships into existing graph")
-                graph_file_basename = os.path.basename(graph_filename)
-
-                # Try to use incremental merge if function exists, otherwise fallback to replace
-                try:
-                    merge_result = merge_graph_incremental(graph_file_basename)
-                    if merge_result.get("status") == "success":
-                        self.logger.info(f"Successfully merged graph updates into existing graph")
-                    else:
-                        self.logger.warning(f"Merge failed, falling back to full replace: {merge_result.get('message')}")
-                        load_result = load_graph_from_json_flexible(graph_file_basename)
-                except Exception as merge_error:
-                    self.logger.warning(f"Incremental merge not available, using full replace: {merge_error}")
-                    load_result = load_graph_from_json_flexible(graph_file_basename)
-
-        except Exception as e:
-            self.logger.error(f"Error loading graph into Memgraph: {e}")
-
-        # Generate graph description and connectivity metrics
-        try:
-            from graph_functions import generate_graph_description
-            graph_description_result = generate_graph_description()
-
-            graph_description = graph_description_result.get("description", "")
+            # Basic connectivity metrics
             connectivity_metrics = {
-                "density": graph_description_result.get("density", 0.0),
-                "fragmentation_index": graph_description_result.get("fragmentation_index", 0.0),
-                "largest_component_size": graph_description_result.get("largest_component_size", 0),
-                "total_nodes": graph_description_result.get("total_nodes", 0),
-                "total_relationships": graph_description_result.get("total_relationships", 0)
+                "total_nodes": len(all_entities),
+                "total_relationships": len(all_relationships),
+                "density": 0.0,  # Will be calculated during community detection
+                "fragmentation_index": 0.0,
+                "largest_component_size": 0
             }
+
+            # Add entity type distribution to description
+            entity_types = {}
+            for entity in all_entities:
+                entity_type = entity.type or "Unknown"
+                entity_types[entity_type] = entity_types.get(entity_type, 0) + 1
+
+            if entity_types:
+                type_desc = ", ".join([f"{count} {etype}" for etype, count in sorted(entity_types.items(), key=lambda x: x[1], reverse=True)[:5]])
+                graph_description += f"Main entity types: {type_desc}."
 
             # Save to shared state
             current_state["graph_description"] = graph_description
@@ -1937,7 +1998,10 @@ class GraphBuilderAgent(RoutedAgent):
         except Exception as e:
             self.logger.error(f"Error generating graph description: {e}")
             graph_description = "Graph description generation failed"
-            connectivity_metrics = {}
+            connectivity_metrics = {
+                "total_nodes": len(all_entities) if all_entities else 0,
+                "total_relationships": len(all_relationships) if all_relationships else 0
+            }
 
         # Send GraphReady message
         graph_ready_msg = GraphReadyMessage(
@@ -2023,13 +2087,20 @@ class GraphBuilderAgent(RoutedAgent):
             node_id = node_id_counter
             node_id_counter += 1
 
+            # Start with basic properties
+            properties = {
+                "name": entity.name,
+                "type": entity.type
+            }
+
+            # Add entity properties to node properties
+            for prop in entity.properties:
+                properties[prop.key] = prop.value
+
             node = {
                 "id": node_id,
                 "labels": [entity.type],
-                "properties": {
-                    "name": entity.name,
-                    "type": entity.type
-                },
+                "properties": properties,
                 "type": "node"
             }
             memgraph_items.append(node)
@@ -2425,7 +2496,7 @@ class GraphBuilderAgent(RoutedAgent):
 
 class GraphRetrievalPlannerAgent(RoutedAgent):
     """
-    Agent that plans and executes graph retrieval strategies using iterative LLM calls.
+    Agent that uses community-based retrieval with iterative query refinement.
     """
 
     def __init__(self, name: str) -> None:
@@ -2436,7 +2507,7 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
         # Import response formats and prompts
         from parameters import base_prompt_graph_retrieval_planner, GraphRetrievalPlannerResponse
 
-        # Initialize Gemini model client with structured output
+        # Initialize LLM client for query refinement with structured output
         self.model_client = OpenAIChatCompletionClient(
             model="gemini-2.5-flash-lite",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -2451,87 +2522,111 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
             response_format=GraphRetrievalPlannerResponse
         )
 
+        # Initialize LLM client for community summarization
+        self.summarizer_client = OpenAIChatCompletionClient(
+            model="gemini-2.5-flash-lite",
+            max_tokens=500,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": False,
+                "json_output": False,
+                "family": "unknown",
+            }
+        )
+
         self.base_prompt_graph_retrieval_planner = base_prompt_graph_retrieval_planner
+
+        # Initialize community graph manager
+        self.community_manager = None
+        self.current_graph_file = None
 
     @message_handler
     async def handle_graph_retrieval_start(self, message: GraphRetrievalStartMessage, ctx: MessageContext) -> GraphRetrievalReadyMessage:
-        """Handle GraphRetrievalStart message and execute iterative retrieval."""
+        """Handle GraphRetrievalStart message using iterative community-based retrieval."""
         self.logger.info(f"GraphRetrievalPlannerAgent processing batch {message.batch_id} for query: {message.query}")
 
-        # Ensure the correct graph is loaded in Memgraph
-        import os
-        graphs_dir = "graphs"
-        graph_filename = os.path.join(graphs_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_graph.json")
+        try:
+            # Load and process graph with community detection
+            import os
+            graphs_dir = "graphs"
+            graph_filename = os.path.join(graphs_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_graph.json")
 
-        if os.path.exists(graph_filename):
-            try:
-                from graph_functions import load_graph_from_json_flexible, clear_graph
-
-                # Clear existing graph to ensure we have the correct one loaded
-                self.logger.info("Clearing existing graph from Memgraph before loading correct graph")
-                clear_result = clear_graph()
-                if clear_result.get("status") == "success":
-                    self.logger.info(f"Graph cleared successfully: {clear_result.get('message')}")
-                else:
-                    self.logger.warning(f"Failed to clear graph: {clear_result.get('message')}")
-
-                # Use the filename relative to the mounted volume
-                graph_file_basename = os.path.basename(graph_filename)
-                load_result = load_graph_from_json_flexible(graph_file_basename)
-
-                if load_result.get("status") == "success":
-                    self.logger.info(f"Successfully loaded correct graph {graph_file_basename} into Memgraph for retrieval")
-                else:
-                    self.logger.error(f"Failed to load graph: {load_result.get('message')}")
-            except Exception as e:
-                self.logger.error(f"Error loading graph {graph_filename}: {e}")
-        else:
-            self.logger.warning(f"Graph file {graph_filename} not found for retrieval")
-
-        # Load shared state
-        current_state = message.shared_state
-
-        # For first repetition (repetition=0), start with empty system prompt to avoid data leakage
-        if message.repetition == 0:
-            learned_system_prompt = ""
-            self.logger.info(f"First repetition for batch {message.batch_id} - using empty retrieval planner system prompt")
-        else:
-            learned_system_prompt = current_state.get("learned_prompt_graph_retrieval_planner", "")
-
-        # Get graph description from shared state
-        graph_description = current_state.get("graph_description", "")
-
-        # Create retrieval prompt template and save to shared state (without critique)
-        prompt_template = self.base_prompt_graph_retrieval_planner.format(
-            message.query, graph_description, "{RETRIEVED_CONTEXT}"
-        )
-        current_state["retrieval_prompt"] = prompt_template
-
-        # Initialize retrieval context and plan responses
-        retrieved_context = ""
-        retrieval_plan_responses = []
-        decision_history = []  # Track history of decisions and results
-
-        # Execute k iterations of retrieval
-        for iteration in range(message.k_iterations):
-            self.logger.info(f"Retrieval iteration {iteration + 1}/{message.k_iterations}")
-
-            try:
-                # Format decision history for the prompt
-                if not decision_history:
-                    history_text = "No previous decisions in this session."
-                else:
-                    history_parts = []
-                    for i, entry in enumerate(decision_history, 1):
-                        history_parts.append(f"{i}. Decision: {entry['decision']}\n   Retrieved: {entry['result']}")
-                    history_text = "\n\n".join(history_parts)
-
-                # Prepare prompt with decision history (without critique)
-                prompt_content = self.base_prompt_graph_retrieval_planner.format(
-                    message.query, graph_description, history_text
+            if not os.path.exists(graph_filename):
+                self.logger.error(f"Graph file {graph_filename} not found")
+                return GraphRetrievalReadyMessage(
+                    batch_id=message.batch_id,
+                    repetition=message.repetition,
+                    retrieved_context="Error: Graph file not found",
+                    dataset=message.dataset,
+                    setting=message.setting
                 )
 
-                # Call LLM to get next retrieval step using learned system prompt
+            # Load or reuse community manager
+            if self.community_manager is None or self.current_graph_file != graph_filename:
+                self.logger.info(f"Loading and processing graph: {graph_filename}")
+
+                from community_graph_utils import load_and_process_graph
+
+                self.community_manager = await load_and_process_graph(
+                    graph_filename,
+                    self.summarizer_client,
+                    embedding_model=None  # Use TF-IDF fallback
+                )
+
+                if self.community_manager is None:
+                    self.logger.error("Failed to load and process graph")
+                    return GraphRetrievalReadyMessage(
+                        batch_id=message.batch_id,
+                        repetition=message.repetition,
+                        retrieved_context="Error: Failed to process graph",
+                        dataset=message.dataset,
+                        setting=message.setting
+                    )
+
+                self.current_graph_file = graph_filename
+                self.logger.info(f"Successfully processed graph with {len(self.community_manager.communities)} communities")
+
+            # Load shared state
+            current_state = message.shared_state
+
+            # For first repetition (repetition=0), start with empty system prompt to avoid data leakage
+            if message.repetition == 0:
+                learned_system_prompt = ""
+                self.logger.info(f"First repetition for batch {message.batch_id} - using empty retrieval planner system prompt")
+            else:
+                learned_system_prompt = current_state.get("learned_prompt_graph_retrieval_planner", "")
+
+            # Create retrieval prompt template and save to shared state
+            prompt_template = self.base_prompt_graph_retrieval_planner.format(
+                message.query, "{RETRIEVED_CONTEXT}"
+            )
+            current_state["retrieval_prompt"] = prompt_template
+
+            # Initialize retrieval context and plan responses
+            retrieved_context = ""
+            retrieval_plan_responses = []
+
+            # One-shot community selection
+            try:
+                # Get all available community titles
+                community_titles = self.community_manager.get_all_community_titles()
+
+                # Format community titles for the prompt
+                if community_titles:
+                    titles_text = "\n".join([f"Community {cid}: {title}" for cid, title in community_titles.items()])
+                else:
+                    self.logger.error("No community titles available")
+                    titles_text = "No communities available"
+
+                # Prepare prompt with community titles
+                prompt_content = self.base_prompt_graph_retrieval_planner.format(
+                    message.query, titles_text
+                )
+
+                # Call LLM to select communities using learned system prompt
+                from autogen_core.models import SystemMessage, UserMessage
                 system_message = SystemMessage(content=learned_system_prompt)
                 user_message = UserMessage(content=prompt_content, source="user")
 
@@ -2544,17 +2639,15 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 logger = get_global_prompt_logger()
                 logger.log_interaction(
                     agent_name="GraphRetrievalPlannerAgent",
-                    interaction_type="retrieval_planning",
+                    interaction_type="community_selection",
                     system_prompt=learned_system_prompt,
                     user_prompt=prompt_content,
                     llm_response=response.content if isinstance(response.content, str) else str(response.content),
                     batch_id=message.batch_id,
-                    iteration=iteration + 1,
+                    iteration=1,
                     additional_metadata={
                         "query": message.query,
-                        "k_iterations": message.k_iterations,
-                        "current_context_length": len(retrieved_context),
-                        "graph_description_length": len(graph_description)
+                        "available_communities": len(community_titles)
                     }
                 )
 
@@ -2566,156 +2659,99 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 # Store the LLM response
                 retrieval_plan_responses.append(retrieval_response.reasoning)
 
-                # Execute the function call and retrieve context
-                new_context = await self._execute_retrieval_function(retrieval_response)
+                # Retrieve the selected communities
+                retrieved_context = await self._retrieve_selected_communities(retrieval_response.selected_communities)
 
-                # Track this decision and its result in the history
-                function_call = f"{retrieval_response.function_name}("
-                if hasattr(retrieval_response, 'keyword') and retrieval_response.keyword:
-                    function_call += f"'{retrieval_response.keyword}'"
-                elif hasattr(retrieval_response, 'node_type') and retrieval_response.node_type:
-                    function_call += f"'{retrieval_response.node_type}'"
-                elif hasattr(retrieval_response, 'node_name') and retrieval_response.node_name:
-                    function_call += f"'{retrieval_response.node_name}'"
-                elif hasattr(retrieval_response, 'relation_type') and retrieval_response.relation_type:
-                    function_call += f"'{retrieval_response.relation_type}'"
-                elif hasattr(retrieval_response, 'start_node_name') and retrieval_response.start_node_name:
-                    function_call += f"'{retrieval_response.start_node_name}', '{retrieval_response.end_node_name}'"
-                function_call += ")"
-
-                decision_entry = {
-                    'decision': function_call,
-                    'result': new_context if new_context else "No results returned"
-                }
-                decision_history.append(decision_entry)
-
-                # Add to retrieved context (still needed for backward compatibility)
-                if new_context:
-                    retrieved_context += f"\n\nIteration {iteration + 1} results:\n{new_context}"
-
-                self.logger.info(f"Completed iteration {iteration + 1}, decision: {function_call}, context length: {len(retrieved_context)}")
+                self.logger.info(f"Selected communities: {retrieval_response.selected_communities}, context length: {len(retrieved_context)}")
 
             except Exception as e:
-                self.logger.error(f"Error in retrieval iteration {iteration + 1}: {e}")
-                continue
+                self.logger.error(f"Error in community selection: {e}")
+                retrieved_context = "Error during community selection"
 
-        # Save retrieval plans and retrieved contexts to shared state for BackwardPassAgent
-        current_state["retrieval_plans"] = retrieval_plan_responses
+            # Save retrieval plans and retrieved contexts to shared state for BackwardPassAgent
+            current_state["retrieval_plans"] = retrieval_plan_responses
 
-        # Store retrieved context data for BackwardPassAgent
-        retrieved_contexts = current_state.get("retrieved_contexts", [])
-        context_entry = {
-            "retrieved_context": retrieved_context,
-            "repetition": message.repetition,
-            "timestamp": datetime.now().isoformat(),
-            "batch_id": message.batch_id,
-            "query": message.query
-        }
-        retrieved_contexts.append(context_entry)
-        current_state["retrieved_contexts"] = retrieved_contexts
+            # Store retrieved context data for BackwardPassAgent
+            retrieved_contexts = current_state.get("retrieved_contexts", [])
+            from datetime import datetime
+            context_entry = {
+                "retrieved_context": retrieved_context,
+                "repetition": message.repetition,
+                "timestamp": datetime.now().isoformat(),
+                "batch_id": message.batch_id,
+                "query": message.query
+            }
+            retrieved_contexts.append(context_entry)
+            current_state["retrieved_contexts"] = retrieved_contexts
 
-        self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-        # Send GraphRetrievalReady message
-        retrieval_ready_msg = GraphRetrievalReadyMessage(
-            batch_id=message.batch_id,
-            repetition=message.repetition,
-            retrieved_context=retrieved_context,
-            dataset=message.dataset,
-            setting=message.setting
-        )
-
-        self.logger.info(f"Returning GraphRetrievalReady for batch {message.batch_id}")
-
-        # Return the retrieval ready message
-        return retrieval_ready_msg
-
-    async def _execute_retrieval_function(self, retrieval_response) -> str:
-        """Execute the graph retrieval function based on LLM response."""
-        try:
-            function_name = retrieval_response.function_name
-
-            # Import graph functions
-            from graph_functions import (
-                search_nodes_by_keyword, search_nodes_by_types, get_neighbors,
-                search_relations_by_type, identify_communities, analyze_path, find_hub_nodes
+            # Send GraphRetrievalReady message
+            retrieval_ready_msg = GraphRetrievalReadyMessage(
+                batch_id=message.batch_id,
+                repetition=message.repetition,
+                retrieved_context=retrieved_context,
+                dataset=message.dataset,
+                setting=message.setting
             )
 
-            if function_name == "search_nodes_by_keyword":
-                result = search_nodes_by_keyword(retrieval_response.keyword)
-            elif function_name == "search_nodes_by_types":
-                result = search_nodes_by_types(retrieval_response.node_type)
-            elif function_name == "get_neighbors":
-                result = get_neighbors(retrieval_response.node_name)
-            elif function_name == "search_relations_by_type":
-                result = search_relations_by_type(retrieval_response.relation_type)
-            elif function_name == "identify_communities":
-                result = identify_communities(retrieval_response.node_name)
-            elif function_name == "analyze_path":
-                result = analyze_path(retrieval_response.start_node_name, retrieval_response.end_node_name)
-            elif function_name == "find_hub_nodes":
-                result = find_hub_nodes()
-            else:
-                self.logger.error(f"Unknown function: {function_name}")
-                return ""
+            self.logger.info(f"Returning GraphRetrievalReady for batch {message.batch_id}")
 
-            # Convert result to string format - prioritize textual descriptions only
-            if isinstance(result, dict):
-                # First try to extract graph_string directly
-                graph_string = result.get("graph_string", "")
-                if graph_string:
-                    return graph_string
-
-                # Check if there's a nested subgraph with graph_string
-                subgraph = result.get("subgraph", {})
-                if isinstance(subgraph, dict):
-                    subgraph_string = subgraph.get("graph_string", "")
-                    if subgraph_string:
-                        return subgraph_string
-
-                # If no graph_string, create a simple textual summary from available metadata
-                # Check both top-level and subgraph-level metadata
-                node_count = result.get("node_count", subgraph.get("node_count", 0)) if isinstance(subgraph, dict) else result.get("node_count", 0)
-                rel_count = result.get("relationship_count", subgraph.get("relationship_count", 0)) if isinstance(subgraph, dict) else result.get("relationship_count", 0)
-                node_names = result.get("node_names", subgraph.get("node_names", [])) if isinstance(subgraph, dict) else result.get("node_names", [])
-
-                # Also check for count field (from search functions)
-                count = result.get("count", 0)
-                if count > 0 and node_count == 0:
-                    node_count = count
-
-                if node_names:
-                    names_text = ", ".join(node_names[:10])  # Limit to first 10 names
-                    if len(node_names) > 10:
-                        names_text += f" (and {len(node_names) - 10} more)"
-                    return f"Found {node_count} nodes and {rel_count} relationships. Nodes include: {names_text}."
-                elif node_count > 0 or count > 0:
-                    return f"Found {max(node_count, count)} nodes and {rel_count} relationships."
-                else:
-                    # Fallback to message if available
-                    message = result.get("message", "")
-                    if message:
-                        return message
-            elif isinstance(result, list):
-                # For lists, create a simple textual summary instead of JSON
-                if result:
-                    return f"Retrieved {len(result)} items: {', '.join(str(item)[:50] for item in result[:5])}{'...' if len(result) > 5 else ''}"
-                else:
-                    return "No results found."
-            else:
-                return str(result)
+            # Return the retrieval ready message
+            return retrieval_ready_msg
 
         except Exception as e:
-            self.logger.error(f"Error executing retrieval function {retrieval_response.function_name}: {e}")
+            self.logger.error(f"Error in community-based retrieval: {e}")
+            import traceback
+            traceback.print_exc()
+
+            return GraphRetrievalReadyMessage(
+                batch_id=message.batch_id,
+                repetition=message.repetition,
+                retrieved_context=f"Error during retrieval: {str(e)}",
+                dataset=message.dataset,
+                setting=message.setting
+            )
+
+    async def _retrieve_selected_communities(self, community_ids: List[int]) -> str:
+        """Retrieve the specified communities by their IDs."""
+        try:
+            context_parts = []
+            valid_communities = []
+
+            for community_id in community_ids:
+                # Check if community exists and has enough nodes
+                if (community_id in self.community_manager.community_summaries and
+                    community_id in self.community_manager.community_titles and
+                    len(self.community_manager.communities.get(community_id, [])) >= 3):
+
+                    title = self.community_manager.community_titles[community_id]
+                    summary = self.community_manager.community_summaries[community_id]
+                    context_parts.append(f"Community {community_id} - {title}:\n{summary}")
+                    valid_communities.append(community_id)
+                else:
+                    self.logger.warning(f"Community {community_id} not found or has too few nodes")
+
+            # Format the retrieved context
+            if context_parts:
+                result = "\n\n".join(context_parts)
+                self.logger.info(f"Retrieved {len(valid_communities)} communities (IDs: {valid_communities})")
+                return result
+            else:
+                self.logger.warning("No valid communities could be retrieved")
+                return "No valid communities found."
+
+        except Exception as e:
+            self.logger.error(f"Error retrieving selected communities {community_ids}: {e}")
             return ""
 
     async def close(self) -> None:
-        """Close the model client."""
+        """Close the model clients"""
         await self.model_client.close()
+        await self.summarizer_client.close()
 
 
 # ===== UPDATED FACTORY FUNCTIONS =====
-
 def create_graph_builder_agent() -> GraphBuilderAgent:
     """Factory function to create GraphBuilderAgent instances."""
     return GraphBuilderAgent("graph_builder_agent")
@@ -2724,8 +2760,6 @@ def create_graph_retrieval_planner_agent() -> GraphRetrievalPlannerAgent:
     """Factory function to create GraphRetrievalPlannerAgent instances."""
     return GraphRetrievalPlannerAgent("graph_retrieval_planner_agent")
 
-
-# ===== ANSWER GENERATOR AGENT =====
 
 class AnswerGeneratorAgent(RoutedAgent):
     """
@@ -2889,10 +2923,11 @@ class ResponseEvaluatorAgent(RoutedAgent):
         """Handle ResponseEvaluationStart message and evaluate response using LLM."""
         self.logger.info(f"ResponseEvaluatorAgent evaluating QA pair {message.qa_pair_id}")
 
-        # Prepare prompt with only query and generated response (no gold answers or ROUGE score to avoid data leakage)
+        # Prepare prompt with query, generated response, and ROUGE score
         prompt_content = self.response_evaluator_prompt.format(
-            message.original_query,
-            message.generated_answer
+            original_query=message.original_query,
+            generated_answer=message.generated_answer,
+            rouge_score=message.rouge_score
         )
 
         try:
@@ -3335,45 +3370,51 @@ class BackwardPassAgent(RoutedAgent):
         else:
             retrieved_context_text = "No retrieved context available"
 
-        # Create the pair showing the complete plan with all moves
-        pair = f"Retrieval Plan: {complete_retrieval_plan}\nRetrieved Context: {retrieved_context_text}"
+        # Create the pair showing the community selection reasoning
+        pair = f"Community Selection: {complete_retrieval_plan}\nRetrieved Community Summaries: {retrieved_context_text}"
         concatenated_pairs = pair
 
         # Get retrieved_content_critique for the second variable
         retrieved_content_critique = current_state.get("retrieved_content_critique", "No critique available")
 
-        # Call LLM with retrieval_plan_gradient_prompt_graph
+        # Call LLM with retrieval_plan_gradient_prompt_graph (updated for community selection)
         prompt_content = self.retrieval_plan_gradient_prompt_graph.format(concatenated_pairs, retrieved_content_critique)
 
         critique = await self._call_llm(prompt_content, ctx)
         current_state["retrieval_plan_critique"] = critique
 
-        self.logger.info("Retrieval plan critique generated and saved")
+        self.logger.info("Community selection critique generated and saved")
 
     async def _generate_retrieval_planning_prompt_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieval planning prompt."""
-        self.logger.info("Generating retrieval planning prompt critique")
+        """Generate critique for community selection prompt."""
+        self.logger.info("Generating community selection prompt critique")
 
         retrieval_prompt = current_state.get("retrieval_prompt", "")
-        graph_description = current_state.get("graph_description", "")
+        # Get community information from retrieved contexts instead of direct access
+        retrieved_contexts = current_state.get("retrieved_contexts", [])
         retrieval_plans = current_state.get("retrieval_plans", [])
 
         if not retrieval_prompt or not retrieval_plans:
-            self.logger.warning("Missing retrieval prompt or plans for critique")
+            self.logger.warning("Missing community selection prompt or reasoning for critique")
             return
 
-        # Create triplets: retrieval_prompt + graph_description + retrieval_plan
-        triplets = []
-        for plan in retrieval_plans:
-            triplet = f"Retrieval Prompt: {retrieval_prompt}\nGraph Description: {graph_description}\nRetrieval Plan: {plan}"
-            triplets.append(triplet)
+        # Create data showing: community_selection_prompt + retrieved_communities + selection_reasoning
+        retrieved_community_info = "No communities retrieved"
+        if retrieved_contexts:
+            latest_context = retrieved_contexts[-1]
+            if isinstance(latest_context, dict):
+                retrieved_community_info = latest_context.get("retrieved_context", "No context available")
 
-        concatenated_triplets = "\n\n".join(triplets)
+        # With one-shot approach, we have one selection reasoning
+        selection_reasoning = retrieval_plans[0] if retrieval_plans else "No reasoning available"
+
+        triplet = f"Community Selection Prompt: {retrieval_prompt}\nRetrieved Communities: {retrieved_community_info}\nSelection Reasoning: {selection_reasoning}"
+        concatenated_triplets = triplet
 
         # Get retrieval_plan_critique for the second variable
         retrieval_plan_critique = current_state.get("retrieval_plan_critique", "No critique available")
 
-        # Call LLM with retrieval_planning_prompt_gradient_prompt
+        # Call LLM with retrieval_planning_prompt_gradient_prompt (now for community selection)
         prompt_content = self.retrieval_planning_prompt_gradient_prompt.format(concatenated_triplets, retrieval_plan_critique)
 
         critique = await self._call_llm(prompt_content, ctx)
@@ -3391,27 +3432,63 @@ class BackwardPassAgent(RoutedAgent):
         log_critique_result(self.logger, "graph_retrieval_planner", critique, is_frozen)
 
     async def _generate_graph_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for the graph based on questions, description, and retrieval plans."""
+        """Generate critique for the graph based on questions, description, and community selections."""
         self.logger.info("Generating graph critique")
 
         batch_info = current_state.get("batch_information", {})
-        qa_pairs = batch_info.get("qa_pairs", [])
+        current_qa_pair_id = batch_info.get("current_qa_pair_id", "")
+
+        # If current_qa_pair_id is not available, try to get it from other sources
+        if not current_qa_pair_id:
+            # Try to get from conversations
+            conversations = current_state.get("conversations_answer_generation", [])
+            if conversations:
+                # Use the most recent conversation's qa_pair_id
+                current_qa_pair_id = conversations[-1].get("qa_pair_id", "")
+
+            # If still not found, try to get from response evaluations
+            if not current_qa_pair_id:
+                evaluations = current_state.get("response_evaluations", [])
+                if evaluations:
+                    current_qa_pair_id = evaluations[-1].get("qa_pair_id", "")
+
         graph_description = current_state.get("graph_description", "")
         retrieval_plans = current_state.get("retrieval_plans", [])
+        retrieved_contexts = current_state.get("retrieved_contexts", [])
 
-        if not qa_pairs or not graph_description or not retrieval_plans:
-            self.logger.warning("Missing data for graph critique")
+        # Debug logging to see what data is available
+        self.logger.info(f"Debug - current_qa_pair_id: '{current_qa_pair_id}' (from batch_info: '{batch_info.get('current_qa_pair_id', 'None')}')")
+        self.logger.info(f"Debug - graph_description length: {len(graph_description) if graph_description else 0}")
+        self.logger.info(f"Debug - retrieval_plans length: {len(retrieval_plans)}")
+        self.logger.info(f"Debug - retrieved_contexts length: {len(retrieved_contexts)}")
+        self.logger.info(f"Debug - available state keys: {list(current_state.keys())}")
+        self.logger.info(f"Debug - batch_info keys: {list(batch_info.keys())}")
+
+        # Make qa_pair_id optional for graph critique since the core functionality doesn't strictly need it
+        if not graph_description or not retrieval_plans:
+            self.logger.warning(f"Missing essential data for graph critique - graph_desc: {bool(graph_description)}, retrieval_plans: {bool(retrieval_plans)}")
             return
 
-        # Create triplets: query + graph description + retrieval plan
-        triplets = []
-        for i, qa_pair in enumerate(qa_pairs):
-            question = qa_pair.get("question", "")
-            plan = retrieval_plans[i] if i < len(retrieval_plans) else "No plan available"
-            triplet = f"Query: {question}\nGraph Description: {graph_description}\nRetrieval Plan: {plan}"
-            triplets.append(triplet)
+        if not current_qa_pair_id:
+            self.logger.warning("No qa_pair_id found, proceeding with graph critique anyway")
+            current_qa_pair_id = "unknown_qa_pair"
 
-        concatenated_triplets = "\n\n".join(triplets)
+        # Get the current question from conversations
+        conversations = current_state.get("conversations_answer_generation", [])
+        current_question = "No question available"
+        if conversations:
+            current_question = conversations[-1].get("question", "No question available")
+
+        # Create data: current_query + graph_description + community_selection
+        community_selection = retrieval_plans[0] if retrieval_plans else "No selection reasoning available"
+        retrieved_info = "No communities retrieved"
+        if retrieved_contexts:
+            latest_context = retrieved_contexts[-1]
+            if isinstance(latest_context, dict):
+                retrieved_info = latest_context.get("retrieved_context", "No context available")
+
+        triplet = f"Query: {current_question}\nGraph Description: {graph_description}\nCommunity Selection: {community_selection}\nRetrieved Communities: {retrieved_info}"
+        concatenated_triplets = triplet
 
         # Get retrieval_plan_critique for the second variable
         retrieval_plan_critique = current_state.get("retrieval_plan_critique", "No critique available")

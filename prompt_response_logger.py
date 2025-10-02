@@ -48,6 +48,11 @@ class PromptResponseLogger:
             iteration: Iteration number if applicable
             additional_metadata: Any additional metadata
         """
+        # Check if logging is disabled globally
+        global _logging_disabled
+        if _logging_disabled:
+            return
+
         self.interaction_count += 1
 
         log_entry = {
@@ -169,6 +174,7 @@ class PromptResponseLogger:
 
 # Global instance for easy access
 _global_logger: Optional[PromptResponseLogger] = None
+_logging_disabled: bool = False
 
 
 def get_global_prompt_logger() -> PromptResponseLogger:
@@ -181,7 +187,12 @@ def get_global_prompt_logger() -> PromptResponseLogger:
 
 def initialize_prompt_logging(log_dir: str = "prompt_response_logs"):
     """Initialize the global prompt logging system."""
-    global _global_logger
+    global _global_logger, _logging_disabled
+
+    if _logging_disabled:
+        print("Prompt response logging initialization skipped (disabled for performance).")
+        return
+
     _global_logger = PromptResponseLogger(log_dir)
     print(f"Prompt response logging initialized. Logs will be saved to: {_global_logger.log_file}")
 
@@ -195,3 +206,23 @@ def finalize_prompt_logging() -> str:
     report_file = _global_logger.create_summary_report()
     print(f"Prompt response summary report created: {report_file}")
     return report_file
+
+
+def disable_prompt_logging():
+    """Disable prompt and response logging for better performance."""
+    global _logging_disabled
+    _logging_disabled = True
+    print("Prompt response logging disabled for performance optimization.")
+
+
+def enable_prompt_logging():
+    """Re-enable prompt and response logging."""
+    global _logging_disabled
+    _logging_disabled = False
+    print("Prompt response logging re-enabled.")
+
+
+def is_prompt_logging_disabled() -> bool:
+    """Check if prompt logging is currently disabled."""
+    global _logging_disabled
+    return _logging_disabled

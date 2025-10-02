@@ -2,14 +2,14 @@
   "qa_pair_id": "63521_q3",
   "total_iterations": 1,
   "rouge_progression": [
-    0.1633
+    0.1387
   ],
-  "final_rouge": 0.1633,
+  "final_rouge": 0.1387,
   "rouge_improvement": 0.0,
   "iterations_summary": [
     {
       "iteration": 0,
-      "rouge_score": 0.1633,
+      "rouge_score": 0.1387,
       "has_error": false
     }
   ]
