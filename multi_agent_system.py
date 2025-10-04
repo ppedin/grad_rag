@@ -1903,7 +1903,7 @@ class HyperparametersGraphAgent(RoutedAgent):
             prompt_content = self.base_prompt_hyperparameters_graph.format(
                 text=text_sample,
                 question=question
-            )
+            ) + "\n Chunk size cannot be lower than 128."
 
             # Call LLM with structured output using learned system prompt
             system_message = SystemMessage(content=learned_system_prompt)
@@ -3388,18 +3388,22 @@ class ResponseEvaluatorAgent(RoutedAgent):
     Agent that evaluates generated responses against gold answers using LLM.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, dataset_name: str = None) -> None:
         super().__init__(name)
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.response_evaluator")
         self.shared_state = SharedState("agent_states")
+        self.dataset_name = dataset_name
 
         # Import prompts and response format
         from parameters import response_evaluator_prompt, ResponseEvaluationResponse
 
+        # Load learned gold answer patterns if available
+        self.satisfactory_criteria = self._load_gold_patterns()
+
         # Initialize Gemini model client with structured output
         self.model_client = OpenAIChatCompletionClient(
             model="gemini-2.5-flash",
-            max_tokens=2048,
+            max_tokens=8192,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=llm_keys.GEMINI_KEY,
             model_info={
@@ -3414,6 +3418,32 @@ class ResponseEvaluatorAgent(RoutedAgent):
 
         self.response_evaluator_prompt = response_evaluator_prompt
 
+    def _load_gold_patterns(self) -> str:
+        """Load learned gold answer patterns from file. Raises error if not found."""
+        from pathlib import Path
+
+        if not self.dataset_name:
+            raise ValueError("dataset_name is required for ResponseEvaluatorAgent")
+
+        patterns_file = Path("learned_patterns") / f"{self.dataset_name}_gold_patterns.txt"
+        print("Patterns file: ", patterns_file)
+
+        if not patterns_file.exists():
+            raise FileNotFoundError(
+                f"Gold patterns file not found: {patterns_file}\n"
+                f"Please run: python learn_gold_answer_patterns.py <training_data>.json "
+                f"to generate the required gold patterns file."
+            )
+
+        with open(patterns_file, 'r', encoding='utf-8') as f:
+            patterns = f.read()
+
+        self.logger.info(f"Loaded gold patterns from {patterns_file} ({len(patterns)} characters)")
+
+        # Return the patterns directly - no additional formatting needed
+        # The patterns file already contains complete description with headers
+        return patterns
+
     @message_handler
     async def handle_response_evaluation_start(self, message: ResponseEvaluationStartMessage, ctx: MessageContext) -> ResponseEvaluationReadyMessage:
         """Handle ResponseEvaluationStart message and evaluate response using LLM."""
@@ -3423,10 +3453,11 @@ class ResponseEvaluatorAgent(RoutedAgent):
 
         self.logger.info(f"ResponseEvaluatorAgent evaluating QA pair {message.qa_pair_id}")
 
-        # Prepare prompt with query and generated response (no ROUGE score)
+        # Prepare prompt with query, generated response, and satisfactory criteria
         prompt_content = self.response_evaluator_prompt.format(
             original_query=message.original_query,
-            generated_answer=message.generated_answer
+            generated_answer=message.generated_answer,
+            satisfactory_criteria=self.satisfactory_criteria
         )
 
         print(f"   Prompt prepared ({len(prompt_content)} chars)")
@@ -3570,9 +3601,9 @@ def create_answer_generator_agent() -> AnswerGeneratorAgent:
     """Factory function to create AnswerGeneratorAgent instances."""
     return AnswerGeneratorAgent("answer_generator_agent")
 
-def create_response_evaluator_agent() -> ResponseEvaluatorAgent:
+def create_response_evaluator_agent(dataset_name: str = "qmsum_test") -> ResponseEvaluatorAgent:
     """Factory function to create ResponseEvaluatorAgent instances."""
-    return ResponseEvaluatorAgent("response_evaluator_agent")
+    return ResponseEvaluatorAgent("response_evaluator_agent", dataset_name=dataset_name)
 
 
 # ===== BACKWARD PASS AGENT =====
