@@ -16,6 +16,7 @@ from prompt_response_logger import get_global_prompt_logger
 from step_execution_logger import get_global_step_logger, StepStatus
 from evaluation_logger import get_global_evaluation_logger
 from standardized_evaluation_logger import initialize_standardized_logging, get_standardized_logger, finalize_standardized_logging, SystemType
+from execution_logger import initialize_execution_logging, get_global_execution_logger, finalize_execution_logging
 
 from autogen_core import (
     AgentId, MessageContext, RoutedAgent, message_handler,
@@ -187,7 +188,6 @@ class ResponseEvaluationStartMessage(BaseModel):
     original_query: str
     generated_answer: str
     gold_answers: List[str]
-    rouge_score: float
     batch_id: int
     repetition: int
     dataset: str
@@ -196,6 +196,7 @@ class ResponseEvaluationStartMessage(BaseModel):
 class ResponseEvaluationReadyMessage(BaseModel):
     qa_pair_id: str
     evaluation_result: Dict[str, Any]
+    continue_optimization: bool
     batch_id: int
     repetition: int
 
@@ -293,11 +294,37 @@ class BatchOrchestratorAgent(RoutedAgent):
                 SystemType.GRAPHRAG, message.dataset, message.setting
             )
 
+        # Initialize execution logging
+        exec_logger = get_global_execution_logger()
+        if exec_logger is None:
+            exec_logger = initialize_execution_logging(
+                system_name="graphrag",
+                dataset=message.dataset,
+                setting=message.setting,
+                metadata={
+                    "batch_id": message.batch_id,
+                    "repetition": message.repetition
+                }
+            )
+
         # Log pipeline start
         step_logger.start_pipeline(
             dataset=message.dataset,
             setting=message.setting,
             total_qa_pairs=len(message.shared_state.get("batch_information", {}).get("qa_pairs", []))
+        )
+
+        # Log BatchOrchestratorAgent start
+        exec_logger.log_agent_start(
+            agent_name="BatchOrchestratorAgent",
+            message_type="BatchStartMessage",
+            batch_id=str(message.batch_id),
+            iteration=message.repetition,
+            metadata={
+                "dataset": message.dataset,
+                "setting": message.setting,
+                "total_qa_pairs": len(message.shared_state.get("batch_information", {}).get("qa_pairs", []))
+            }
         )
 
         try:
@@ -354,6 +381,18 @@ class BatchOrchestratorAgent(RoutedAgent):
                 # Process ONLY the current iteration (not all iterations)
                 iteration = current_iteration
                 self.logger.info(f"\n--- QA Pair {qa_pair_id}, Iteration {iteration}/{total_iterations-1} ---")
+
+                # Check if we should skip this iteration because evaluation determined response is satisfactory
+                if iteration > 0:  # Only check after first iteration
+                    should_continue = current_state.get(f"continue_optimization_{qa_pair_id}", True)
+                    if not should_continue:
+                        self.logger.info(f"Skipping iteration {iteration} for {qa_pair_id} - evaluation indicated response was satisfactory in previous iteration")
+                        # Use the last successful result
+                        if qa_pair_id in self.qa_pair_results and self.qa_pair_results[qa_pair_id]:
+                            last_result = self.qa_pair_results[qa_pair_id][-1]
+                            self.qa_pair_results[qa_pair_id].append(last_result)
+                            self.qa_pair_rouge_progression[qa_pair_id].append(last_result.get("rouge_score", 0.0))
+                        continue  # Skip to next QA pair
 
                 # Log batch start for this iteration
                 step_logger.start_batch(
@@ -509,6 +548,13 @@ class BatchOrchestratorAgent(RoutedAgent):
                 total_iterations_completed=1  # Only 1 iteration per call
             )
 
+            # Log BatchOrchestratorAgent success
+            exec_logger.log_agent_success(
+                agent_name="BatchOrchestratorAgent",
+                message_type="BatchStartMessage",
+                result_summary=f"Processed {len(qa_pairs)} QA pairs successfully"
+            )
+
             # Finalize standardized evaluation logging only handled by DatasetAgent when all processing is complete
 
             # Return BatchReady message indicating completion
@@ -521,6 +567,14 @@ class BatchOrchestratorAgent(RoutedAgent):
 
         except Exception as e:
             self.logger.error(f"Error processing batch {message.batch_id}: {e}")
+
+            # Log BatchOrchestratorAgent error
+            exec_logger.log_agent_error(
+                agent_name="BatchOrchestratorAgent",
+                message_type="BatchStartMessage",
+                error=e,
+                error_context="Failed during batch processing"
+            )
 
             # Log pipeline failure
             step_logger.complete_pipeline(
@@ -610,6 +664,7 @@ class BatchOrchestratorAgent(RoutedAgent):
         # Get loggers
         step_logger = get_global_step_logger()
         eval_logger = get_global_evaluation_logger()
+        exec_logger = get_global_execution_logger()
 
         # Track intermediate outputs for evaluation logging
         intermediate_outputs = {}
@@ -618,6 +673,15 @@ class BatchOrchestratorAgent(RoutedAgent):
         try:
             # Step 1: HyperparametersGraphAgent
             self.logger.info(f"Step 1: Executing HyperparametersGraphAgent for {qa_pair_id}")
+
+            # Log execution start
+            exec_logger.log_agent_start(
+                agent_name="HyperparametersGraphAgent",
+                message_type="HyperparametersRequestMessage",
+                batch_id=str(message.batch_id),
+                qa_pair_id=qa_pair_id,
+                iteration=iteration
+            )
 
             step_logger.log_step(
                 step_name="hyperparameters_generation",
@@ -639,6 +703,13 @@ class BatchOrchestratorAgent(RoutedAgent):
                     output_data_summary=f"chunk_size: {getattr(hyperparams_response, 'chunk_size', 'N/A')}"
                 )
 
+                # Log execution success
+                exec_logger.log_agent_success(
+                    agent_name="HyperparametersGraphAgent",
+                    message_type="HyperparametersRequestMessage",
+                    result_summary=f"chunk_size: {getattr(hyperparams_response, 'chunk_size', 512)}"
+                )
+
                 # Log intermediate output
                 intermediate_outputs["hyperparameters"] = {
                     "chunk_size": getattr(hyperparams_response, 'chunk_size', 512),
@@ -655,6 +726,14 @@ class BatchOrchestratorAgent(RoutedAgent):
                     error_message=str(e)
                 )
 
+                # Log execution error
+                exec_logger.log_agent_error(
+                    agent_name="HyperparametersGraphAgent",
+                    message_type="HyperparametersRequestMessage",
+                    error=e,
+                    error_context="Failed during hyperparameters generation"
+                )
+
                 self.logger.warning(f"HyperparametersGraphAgent failed, using fallback: {e}")
                 hyperparams_response = await self.handle_agent_failure("hyperparameters_graph_agent", qa_pair_id, iteration, e)
 
@@ -666,48 +745,182 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             # Step 2: GraphBuilderAgent
             self.logger.info(f"Step 2: Executing GraphBuilderAgent for {qa_pair_id}")
+            exec_logger.log_agent_start(
+                agent_name="GraphBuilderAgent",
+                message_type="GraphBuildMessage",
+                batch_id=str(message.batch_id),
+                qa_pair_id=qa_pair_id,
+                iteration=iteration
+            )
             try:
                 graph_response = await self._execute_graph_builder_agent(hyperparams_response, iteration)
+                exec_logger.log_agent_success(
+                    agent_name="GraphBuilderAgent",
+                    message_type="GraphBuildMessage",
+                    result_summary="Graph built successfully"
+                )
             except Exception as e:
+                exec_logger.log_agent_error(
+                    agent_name="GraphBuilderAgent",
+                    message_type="GraphBuildMessage",
+                    error=e,
+                    error_context="Failed during graph building"
+                )
                 self.logger.warning(f"GraphBuilderAgent failed, using fallback: {e}")
                 graph_response = await self.handle_agent_failure("graph_builder_agent", qa_pair_id, iteration, e)
 
             # Step 3: GraphRetrievalAgent
             self.logger.info(f"Step 3: Executing GraphRetrievalPlannerAgent for {qa_pair_id}")
+            exec_logger.log_agent_start(
+                agent_name="GraphRetrievalPlannerAgent",
+                message_type="GraphRetrievalMessage",
+                batch_id=str(message.batch_id),
+                qa_pair_id=qa_pair_id,
+                iteration=iteration
+            )
             try:
                 retrieval_response = await self._execute_graph_retrieval_agent(graph_response, qa_pair)
+                exec_logger.log_agent_success(
+                    agent_name="GraphRetrievalPlannerAgent",
+                    message_type="GraphRetrievalMessage",
+                    result_summary=f"Retrieved {len(getattr(retrieval_response, 'retrieved_contexts', []))} contexts"
+                )
             except Exception as e:
+                exec_logger.log_agent_error(
+                    agent_name="GraphRetrievalPlannerAgent",
+                    message_type="GraphRetrievalMessage",
+                    error=e,
+                    error_context="Failed during graph retrieval"
+                )
                 self.logger.warning(f"GraphRetrievalPlannerAgent failed, using fallback: {e}")
                 retrieval_response = await self.handle_agent_failure("graph_retrieval_planner_agent", qa_pair_id, iteration, e)
 
             # Step 4: AnswerGeneratorAgent
             self.logger.info(f"Step 4: Executing AnswerGeneratorAgent for {qa_pair_id}")
+            exec_logger.log_agent_start(
+                agent_name="AnswerGeneratorAgent",
+                message_type="AnswerGenerationMessage",
+                batch_id=str(message.batch_id),
+                qa_pair_id=qa_pair_id,
+                iteration=iteration
+            )
             try:
                 answer_response = await self._execute_answer_generator_agent(retrieval_response, qa_pair)
+                exec_logger.log_agent_success(
+                    agent_name="AnswerGeneratorAgent",
+                    message_type="AnswerGenerationMessage",
+                    result_summary=f"Generated answer (length: {len(getattr(answer_response, 'generated_answer', ''))})"
+                )
             except Exception as e:
+                exec_logger.log_agent_error(
+                    agent_name="AnswerGeneratorAgent",
+                    message_type="AnswerGenerationMessage",
+                    error=e,
+                    error_context="Failed during answer generation"
+                )
                 self.logger.warning(f"AnswerGeneratorAgent failed, using fallback: {e}")
                 answer_response = await self.handle_agent_failure("answer_generator_agent", qa_pair_id, iteration, e)
 
             # Step 5: ResponseEvaluatorAgent
             self.logger.info(f"Step 5: Executing ResponseEvaluatorAgent for {qa_pair_id}")
+            exec_logger.log_agent_start(
+                agent_name="ResponseEvaluatorAgent",
+                message_type="EvaluationMessage",
+                batch_id=str(message.batch_id),
+                qa_pair_id=qa_pair_id,
+                iteration=iteration
+            )
             try:
                 evaluation_response = await self._execute_response_evaluator_agent(answer_response, qa_pair)
+                exec_logger.log_agent_success(
+                    agent_name="ResponseEvaluatorAgent",
+                    message_type="EvaluationMessage",
+                    result_summary=f"Evaluation complete, continue_optimization: {getattr(evaluation_response, 'continue_optimization', False)}"
+                )
             except Exception as e:
+                exec_logger.log_agent_error(
+                    agent_name="ResponseEvaluatorAgent",
+                    message_type="EvaluationMessage",
+                    error=e,
+                    error_context="Failed during response evaluation"
+                )
                 self.logger.warning(f"ResponseEvaluatorAgent failed, using fallback: {e}")
                 evaluation_response = await self.handle_agent_failure("response_evaluator_agent", qa_pair_id, iteration, e)
 
             # Step 6: BackwardPassAgent (generates optimized prompts for next iteration)
             self.logger.info(f"Step 6: Executing BackwardPassAgent for {qa_pair_id}")
             backward_pass_response = None
-            if iteration < message.shared_state.get("batch_information", {}).get("total_iterations", 3) - 1:
-                # Only run backward pass if not the last iteration
+
+            # Check if we should continue optimization
+            should_continue = evaluation_response.continue_optimization
+            is_last_iteration = iteration >= message.shared_state.get("batch_information", {}).get("total_iterations", 3) - 1
+
+            # Store continue_optimization flag and missing keywords in shared state for next iteration
+            current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+            current_state[f"continue_optimization_{qa_pair_id}"] = should_continue
+
+            # Store missing keywords for focused graph refinement in next iteration
+            if should_continue and hasattr(evaluation_response, 'evaluation_result'):
+                missing_keywords = evaluation_response.evaluation_result.get("missing_keywords", [])
+                if missing_keywords:
+                    current_state["missing_keywords_for_refinement"] = missing_keywords
+                    self.logger.info(f"📝 [ITERATION {iteration}] SAVING KEYWORDS: Stored {len(missing_keywords)} keywords for next iteration")
+                    self.logger.info(f"📝 Keywords: {missing_keywords}")
+                    self.logger.info(f"📝 State keys after saving: {list(current_state.keys())}")
+                else:
+                    # Clear keywords if none provided
+                    current_state["missing_keywords_for_refinement"] = []
+                    self.logger.info(f"📝 [ITERATION {iteration}] No keywords provided, clearing keywords")
+            else:
+                # Clear keywords if not continuing
+                current_state["missing_keywords_for_refinement"] = []
+                self.logger.info(f"📝 [ITERATION {iteration}] Not continuing, clearing keywords")
+
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            self.logger.info(f"📝 [ITERATION {iteration}] State saved successfully")
+
+            if not should_continue:
+                self.logger.info(f"Skipping BackwardPassAgent - evaluation indicates response is satisfactory for {qa_pair_id}")
+                self.logger.info(f"Setting flag to skip future iterations for {qa_pair_id}")
+                exec_logger.log_state_transition(
+                    transition_type="backward_pass_skipped",
+                    from_state="evaluation_complete",
+                    to_state="iteration_finalize",
+                    metadata={"reason": "satisfactory_response", "qa_pair_id": qa_pair_id}
+                )
+            elif is_last_iteration:
+                self.logger.info(f"Skipping BackwardPassAgent - last iteration for {qa_pair_id}")
+                exec_logger.log_state_transition(
+                    transition_type="backward_pass_skipped",
+                    from_state="evaluation_complete",
+                    to_state="iteration_finalize",
+                    metadata={"reason": "last_iteration", "qa_pair_id": qa_pair_id}
+                )
+            else:
+                # Run backward pass if we should continue and not the last iteration
+                exec_logger.log_agent_start(
+                    agent_name="BackwardPassAgent",
+                    message_type="BackwardPassMessage",
+                    batch_id=str(message.batch_id),
+                    qa_pair_id=qa_pair_id,
+                    iteration=iteration
+                )
                 try:
                     backward_pass_response = await self._execute_backward_pass_agent(evaluation_response, iteration)
+                    exec_logger.log_agent_success(
+                        agent_name="BackwardPassAgent",
+                        message_type="BackwardPassMessage",
+                        result_summary="Backward pass completed successfully"
+                    )
                 except Exception as e:
+                    exec_logger.log_agent_error(
+                        agent_name="BackwardPassAgent",
+                        message_type="BackwardPassMessage",
+                        error=e,
+                        error_context="Failed during backward pass"
+                    )
                     self.logger.warning(f"BackwardPassAgent failed, using fallback: {e}")
                     backward_pass_response = await self.handle_agent_failure("backward_pass_agent", qa_pair_id, iteration, e)
-            else:
-                self.logger.info(f"Skipping BackwardPassAgent - last iteration for {qa_pair_id}")
 
             # Compute ROUGE score
             rouge_score = self._compute_rouge_score(qa_pair, answer_response.generated_answer)
@@ -792,12 +1005,17 @@ class BatchOrchestratorAgent(RoutedAgent):
             )
 
             # Return iteration results
+            # Get community summarization logs from shared state if available
+            current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
+            community_summarization_logs = current_state.get("community_summarization_logs", [])
+
             iteration_results = {
                 "qa_pair_id": qa_pair_id,
                 "iteration": iteration,
                 "timestamp": datetime.now().isoformat(),
                 "hyperparameters": {"chunk_size": getattr(hyperparams_response, 'chunk_size', 512)},
                 "graph_description": getattr(graph_response, 'graph_description', 'N/A'),
+                "community_summarization_logs": community_summarization_logs,  # Add community summarization logs
                 "retrieved_context": getattr(retrieval_response, 'retrieved_context', 'N/A'),
                 "generated_answer": getattr(answer_response, 'generated_answer', 'N/A'),
                 "evaluation_result": getattr(evaluation_response, 'evaluation_result', {}),
@@ -848,6 +1066,12 @@ class BatchOrchestratorAgent(RoutedAgent):
                                          iteration: int) -> GraphReadyMessage:
         """Execute GraphBuilderAgent with appropriate mode (create vs refine)."""
         current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
+
+        # Debug logging for keyword availability
+        self.logger.info(f"📖 [ITERATION {iteration}] LOADING STATE for GraphBuilder")
+        self.logger.info(f"📖 State keys available: {list(current_state.keys())}")
+        keywords_in_state = current_state.get("missing_keywords_for_refinement", [])
+        self.logger.info(f"📖 Keywords found in state: {keywords_in_state} (count: {len(keywords_in_state)})")
 
         graph_start_msg = GraphStartMessage(
             batch_id=hyperparams_response.batch_id,
@@ -900,14 +1124,11 @@ class BatchOrchestratorAgent(RoutedAgent):
     async def _execute_response_evaluator_agent(self, answer_response: AnswerGenerationReadyMessage,
                                               qa_pair: Dict[str, Any]) -> ResponseEvaluationReadyMessage:
         """Execute ResponseEvaluatorAgent."""
-        rouge_score = self._compute_rouge_score(qa_pair, answer_response.generated_answer)
-
         eval_start_msg = ResponseEvaluationStartMessage(
             qa_pair_id=answer_response.qa_pair_id,
             original_query=qa_pair.get("question", ""),
             generated_answer=answer_response.generated_answer,
             gold_answers=qa_pair.get("answers", []),
-            rouge_score=rouge_score,
             batch_id=answer_response.batch_id,
             repetition=answer_response.repetition,
             dataset=self.current_dataset,
@@ -1671,17 +1892,16 @@ class HyperparametersGraphAgent(RoutedAgent):
             else:
                 learned_system_prompt = current_state.get("learned_prompt_hyperparameters_graph", "")
 
-            # Extract text and question from QA pair
+            # Extract question from QA pair
             qa_pair = message.qa_pair
             question = qa_pair.get("question", "")
 
-            # Get document text from current state (assuming it's available)
-            batch_info = current_state.get("batch_information", {})
-            document_text = current_state.get("full_document_text", batch_info.get("document_text", ""))[:1000]  # Limit for prompt
+            # Use generic description for text sample
+            text_sample = "Meeting transcripts"
 
             # Prepare base prompt (without critique)
             prompt_content = self.base_prompt_hyperparameters_graph.format(
-                text=document_text,
+                text=text_sample,
                 question=question
             )
 
@@ -1705,7 +1925,7 @@ class HyperparametersGraphAgent(RoutedAgent):
                 batch_id=message.batch_id,
                 qa_pair_id=message.qa_pair_id,
                 additional_metadata={
-                    "document_length": len(document_text),
+                    "text_sample": text_sample,
                     "question": question
                 }
             )
@@ -1824,6 +2044,12 @@ class GraphBuilderAgent(RoutedAgent):
 
         # Load shared state
         current_state = message.shared_state
+
+        # IMMEDIATELY check keywords at entry point BEFORE any other operations
+        self.logger.info(f"🚀 [ITERATION {message.repetition}] GraphBuilder ENTRY POINT")
+        keywords_at_entry = current_state.get("missing_keywords_for_refinement", [])
+        self.logger.info(f"🚀 Keywords at ENTRY: {keywords_at_entry} (count: {len(keywords_at_entry)})")
+        self.logger.info(f"🚀 State keys at ENTRY: {list(current_state.keys())}")
         batch_info = current_state.get("batch_information", {})
         example_info = current_state.get("example_information", {})
 
@@ -1864,12 +2090,19 @@ class GraphBuilderAgent(RoutedAgent):
             learned_system_prompt = ""
             self.logger.info(f"First repetition for batch {message.batch_id} - using empty graph creation system prompt")
         else:
-            # For subsequent iterations, use the optimized graph builder prompt for refinement
-            learned_system_prompt = current_state.get("learned_prompt_graph_builder", "")
-            if learned_system_prompt:
-                self.logger.info(f"Using optimized graph builder system prompt for refinement in batch {message.batch_id}")
+            # For iteration 1, use the graph builder prompt from iteration 0
+            # For iteration 2+, use the graph refinement prompt from previous iteration
+            if message.repetition == 1:
+                learned_system_prompt = current_state.get("learned_prompt_graph_builder", "")
+                self.logger.info(f"Using learned_prompt_graph_builder for iteration 1 refinement")
             else:
-                self.logger.info(f"No optimized graph builder prompt available - using empty system prompt for refinement")
+                learned_system_prompt = current_state.get("learned_prompt_graph_refinement", "")
+                self.logger.info(f"Using learned_prompt_graph_refinement for iteration {message.repetition} refinement")
+
+            if learned_system_prompt:
+                self.logger.info(f"Using optimized graph system prompt for refinement in batch {message.batch_id} (length: {len(learned_system_prompt)} chars)")
+            else:
+                self.logger.info(f"No optimized graph prompt available - using empty system prompt for refinement")
 
         if is_first_iteration:
             # Graph creation mode
@@ -1877,8 +2110,7 @@ class GraphBuilderAgent(RoutedAgent):
             self.logger.info(f"Split corpus into {len(chunks)} chunks for graph creation")
 
             # Save prompt template (without text chunk) to shared state
-            prompt_without_critique = self.base_prompt_graph_builder.format("{TEXT_CHUNK}")
-            current_state["graph_builder_prompt"] = prompt_without_critique
+            current_state["graph_builder_prompt"] = self.base_prompt_graph_builder
 
             # Initialize graph data structure
             all_entities = []
@@ -1894,20 +2126,47 @@ class GraphBuilderAgent(RoutedAgent):
             # Graph refinement mode
             self.logger.info("Graph refinement mode: loading existing graph and refining")
 
-            # Get existing graph summary for refinement
-            existing_graph_summary = await self._get_existing_graph_summary()
+            # Get missing keywords from previous iteration's evaluation
+            self.logger.info(f"🔍 [ITERATION {message.repetition}] ACCESSING KEYWORDS in GraphBuilder")
+            self.logger.info(f"🔍 State keys available: {list(current_state.keys())}")
+            missing_keywords = current_state.get("missing_keywords_for_refinement", [])
+            self.logger.info(f"🔍 Keywords retrieved: {missing_keywords} (count: {len(missing_keywords)})")
 
-            # For refinement, split text into chunks like in creation mode
-            chunks = self._split_text_into_chunks(corpus, message.chunk_size)
-            self.logger.info(f"Split corpus into {len(chunks)} chunks for graph refinement")
+            if missing_keywords:
+                # Focused refinement: extract context around missing keywords
+                self.logger.info(f"🎯 FOCUSED REFINEMENT MODE: extracting context for {len(missing_keywords)} keywords")
+                self.logger.info(f"Missing keywords: {missing_keywords}")
+                focused_text = self._extract_focused_context(corpus, missing_keywords, context_window=800)
+
+                if focused_text:
+                    # Split focused text into chunks
+                    full_corpus_size = len(corpus)
+                    focused_size = len(focused_text)
+                    reduction_pct = ((full_corpus_size - focused_size) / full_corpus_size * 100) if full_corpus_size > 0 else 0
+
+                    chunks = self._split_text_into_chunks(focused_text, message.chunk_size)
+                    full_chunks_count = len(self._split_text_into_chunks(corpus, message.chunk_size))
+
+                    self.logger.info(f"🎯 TEXT REDUCTION: {full_corpus_size} → {focused_size} chars ({reduction_pct:.1f}% reduction)")
+                    self.logger.info(f"🎯 CHUNK REDUCTION: {full_chunks_count} → {len(chunks)} chunks (processing only {len(chunks)/full_chunks_count*100:.1f}% of full corpus)")
+                    self.logger.info(f"🎯 LLM CALLS SAVED: {full_chunks_count - len(chunks)} fewer calls to graph extraction LLM")
+                else:
+                    # Fallback to full corpus if no contexts found
+                    self.logger.warning("⚠️  No context found for keywords, falling back to full corpus")
+                    chunks = self._split_text_into_chunks(corpus, message.chunk_size)
+            else:
+                # No keywords provided, process full corpus (fallback for backward compatibility)
+                self.logger.info("No missing keywords provided, processing full corpus for refinement")
+                chunks = self._split_text_into_chunks(corpus, message.chunk_size)
+
+            self.logger.info(f"Split text into {len(chunks)} chunks for graph refinement")
 
             # Save refinement prompt template to shared state
-            prompt_without_critique = self.base_prompt_graph_refinement.format("{GRAPH_SUMMARY}", "{TEXT_CHUNK}")
-            current_state["graph_refinement_prompt"] = prompt_without_critique
+            current_state["graph_refinement_prompt"] = self.base_prompt_graph_refinement
 
-            # Process refinement
+            # Process refinement (without passing existing graph summary to the prompt)
             new_entities, new_relationships, new_triplets = await self._process_graph_refinement(
-                chunks, existing_graph_summary, learned_system_prompt, ctx
+                chunks, learned_system_prompt, ctx
             )
 
             # For refinement, merge new entities/relationships with existing ones
@@ -1957,7 +2216,21 @@ class GraphBuilderAgent(RoutedAgent):
         try:
             with open(graph_filename, 'w', encoding='utf-8') as f:
                 json.dump(graph_json, f, indent=2, ensure_ascii=False)
-            self.logger.info(f"Saved graph to {graph_filename}")
+
+            # Count nodes and relationships in saved file
+            node_count = sum(1 for item in graph_json if item.get("type") == "node")
+            rel_count = sum(1 for item in graph_json if item.get("type") == "relationship")
+
+            self.logger.info(f"✓ Saved graph to {graph_filename}")
+            self.logger.info(f"✓ File contains: {node_count} nodes, {rel_count} relationships (from {len(all_entities)} entities, {len(all_relationships)} relationships)")
+
+            # Verification: Read back the file to ensure it was written correctly
+            with open(graph_filename, 'r', encoding='utf-8') as f:
+                verify_data = json.load(f)
+            verify_node_count = sum(1 for item in verify_data if item.get("type") == "node")
+            verify_rel_count = sum(1 for item in verify_data if item.get("type") == "relationship")
+            self.logger.info(f"✓ File verification: {verify_node_count} nodes, {verify_rel_count} relationships read back successfully")
+
         except Exception as e:
             self.logger.error(f"Error saving graph file: {e}")
 
@@ -2038,6 +2311,122 @@ class GraphBuilderAgent(RoutedAgent):
             chunks.append(" ".join(current_chunk))
 
         return chunks
+
+    def _extract_focused_context(self, text: str, keywords: List[str], context_window: int = 300) -> str:
+        """
+        Extract context windows around specified keywords from text.
+        Uses exact matching first, then falls back to fuzzy matching if needed.
+
+        Args:
+            text: The full document text
+            keywords: List of keywords/phrases to search for
+            context_window: Number of characters to include before and after each keyword match
+
+        Returns:
+            Concatenated context windows containing the keywords
+        """
+        if not keywords:
+            return ""
+
+        import re
+        from difflib import SequenceMatcher
+
+        contexts = []
+        seen_contexts = set()  # To avoid duplicates
+        keywords_found = set()  # Track which keywords were found
+        keywords_not_found = []  # Track keywords that need fuzzy matching
+
+        # Phase 1: Exact matching (case-insensitive)
+        for keyword in keywords:
+            # Case-insensitive regex search for the keyword
+            pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+            found_matches = False
+
+            for match in pattern.finditer(text):
+                found_matches = True
+                start_pos = max(0, match.start() - context_window)
+                end_pos = min(len(text), match.end() + context_window)
+
+                context = text[start_pos:end_pos].strip()
+
+                # Avoid duplicate contexts
+                context_hash = hash(context)
+                if context_hash not in seen_contexts:
+                    seen_contexts.add(context_hash)
+                    contexts.append(context)
+
+            if found_matches:
+                keywords_found.add(keyword)
+            else:
+                keywords_not_found.append(keyword)
+
+        # Phase 2: Fuzzy matching for keywords not found exactly
+        if keywords_not_found:
+            self.logger.info(f"🔎 Fuzzy matching for {len(keywords_not_found)} keywords not found exactly: {keywords_not_found}")
+
+            # Split text into sentences for fuzzy matching
+            sentences = re.split(r'[.!?]\s+', text)
+
+            for keyword in keywords_not_found:
+                keyword_lower = keyword.lower()
+                best_matches = []
+
+                # Find sentences with high similarity to the keyword
+                for sentence in sentences:
+                    sentence_lower = sentence.lower()
+
+                    # Calculate similarity ratio
+                    similarity = SequenceMatcher(None, keyword_lower, sentence_lower).ratio()
+
+                    # Also check if any significant words from keyword appear in sentence
+                    keyword_words = set(keyword_lower.split())
+                    sentence_words = set(sentence_lower.split())
+                    word_overlap = len(keyword_words & sentence_words) / len(keyword_words) if keyword_words else 0
+
+                    # Consider it a match if either:
+                    # 1. Similarity ratio is high (> 0.6)
+                    # 2. Significant word overlap (> 0.5) and some similarity (> 0.3)
+                    if similarity > 0.6 or (word_overlap > 0.5 and similarity > 0.3):
+                        best_matches.append((sentence, similarity, word_overlap))
+
+                # Sort by similarity and take top matches
+                best_matches.sort(key=lambda x: (x[2], x[1]), reverse=True)
+
+                # Extract contexts from best matching sentences
+                for sentence, sim, overlap in best_matches[:3]:  # Take up to 3 best matches per keyword
+                    # Find sentence position in original text
+                    sentence_pos = text.lower().find(sentence.lower())
+                    if sentence_pos != -1:
+                        start_pos = max(0, sentence_pos - context_window)
+                        end_pos = min(len(text), sentence_pos + len(sentence) + context_window)
+
+                        context = text[start_pos:end_pos].strip()
+
+                        # Avoid duplicate contexts
+                        context_hash = hash(context)
+                        if context_hash not in seen_contexts:
+                            seen_contexts.add(context_hash)
+                            contexts.append(context)
+                            keywords_found.add(keyword)
+                            self.logger.info(f"🔎 Fuzzy match for '{keyword}': similarity={sim:.2f}, word_overlap={overlap:.2f}")
+                            break  # Found a good match for this keyword
+
+        # Log results
+        if contexts:
+            self.logger.info(f"✓ Found contexts for {len(keywords_found)}/{len(keywords)} keywords")
+            if len(keywords_found) < len(keywords):
+                still_missing = set(keywords) - keywords_found
+                self.logger.warning(f"✗ No matches found for {len(still_missing)} keywords: {list(still_missing)}")
+        else:
+            self.logger.warning(f"✗ No contexts found for any keywords: {keywords}")
+            return ""
+
+        # Concatenate all contexts with separators
+        focused_text = "\n\n---\n\n".join(contexts)
+
+        self.logger.info(f"Extracted {len(contexts)} context windows for {len(keywords)} keywords (total length: {len(focused_text)} chars)")
+
+        return focused_text
 
     async def _process_chunk(self, chunk: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
         """Process a text chunk to extract entities and relationships."""
@@ -2167,7 +2556,7 @@ class GraphBuilderAgent(RoutedAgent):
         self.logger.info(f"Completed concurrent processing of all {len(chunks)} chunks")
         return all_entities, all_relationships, all_triplets
 
-    async def _process_graph_refinement(self, chunks: list, existing_graph_summary: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
+    async def _process_graph_refinement(self, chunks: list, learned_system_prompt: str, ctx: MessageContext) -> tuple:
         """Process chunks for graph refinement mode - parallel processing like graph creation."""
         all_entities = []
         all_relationships = []
@@ -2181,7 +2570,7 @@ class GraphBuilderAgent(RoutedAgent):
             """Wrapper to process refinement chunk with index for logging and error handling."""
             try:
                 self.logger.info(f"Processing refinement chunk {i+1}/{len(chunks)}")
-                entities, relationships, triplets = await self._process_refinement_chunk(chunk, existing_graph_summary, learned_system_prompt, ctx)
+                entities, relationships, triplets = await self._process_refinement_chunk(chunk, learned_system_prompt, ctx)
                 self.logger.info(f"Completed refinement chunk {i+1}/{len(chunks)}")
                 return entities, relationships, triplets
             except Exception as e:
@@ -2208,10 +2597,10 @@ class GraphBuilderAgent(RoutedAgent):
 
         return all_entities, all_relationships, all_triplets
 
-    async def _process_refinement_chunk(self, chunk: str, existing_graph_summary: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
+    async def _process_refinement_chunk(self, chunk: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
         """Process a single text chunk for graph refinement."""
-        # Prepare the refinement prompt
-        user_prompt = self.base_prompt_graph_refinement.format(existing_graph_summary, chunk)
+        # Prepare the refinement prompt (no existing graph summary)
+        user_prompt = self.base_prompt_graph_refinement.format(chunk)
 
         # Create complete prompt with optional system message
         if learned_system_prompt:
@@ -2235,7 +2624,6 @@ class GraphBuilderAgent(RoutedAgent):
             llm_response=response.content if isinstance(response.content, str) else str(response.content),
             additional_metadata={
                 "chunk_length": len(chunk),
-                "existing_graph_summary_length": len(existing_graph_summary),
                 "mode": "refinement"
             }
         )
@@ -2290,6 +2678,16 @@ class GraphBuilderAgent(RoutedAgent):
             relationships = []
             triplets = []
 
+            # First pass: build ID to name mapping
+            id_to_name = {}
+            for item in graph_data:
+                if item.get("type") == "node":
+                    node_id = item.get("id")
+                    node_name = item.get("properties", {}).get("name", "")
+                    if node_id and node_name:
+                        id_to_name[node_id] = node_name
+
+            # Second pass: extract entities and relationships
             for item in graph_data:
                 if item.get("type") == "node":
                     # Convert back to Entity format
@@ -2298,13 +2696,13 @@ class GraphBuilderAgent(RoutedAgent):
                     # Create entity properties list from additional properties
                     entity_properties = []
                     for key, value in props.items():
-                        if key not in ["name", "entity_type"]:  # Skip main fields
+                        if key not in ["name", "type"]:  # Skip main fields
                             entity_prop = EntityProperty(key=key, value=str(value))
                             entity_properties.append(entity_prop)
 
                     entity = Entity(
                         name=props.get("name", ""),
-                        type=props.get("entity_type", ""),  # Note: 'type' not 'entity_type'
+                        type=props.get("type", ""),
                         properties=entity_properties
                     )
                     entities.append(entity)
@@ -2312,9 +2710,23 @@ class GraphBuilderAgent(RoutedAgent):
                 elif item.get("type") == "relationship":
                     # Convert back to Relationship format
                     props = item.get("properties", {})
+
+                    # Get start and end node IDs from the edge
+                    start_id = item.get("start")
+                    end_id = item.get("end")
+
+                    # Look up entity names from ID mapping
+                    source_entity = id_to_name.get(start_id, "")
+                    target_entity = id_to_name.get(end_id, "")
+
+                    # Skip relationships where we can't find the entities
+                    if not source_entity or not target_entity:
+                        self.logger.warning(f"Skipping relationship with missing entities: start_id={start_id}, end_id={end_id}")
+                        continue
+
                     relationship = Relationship(
-                        source_entity=props.get("start_entity", ""),
-                        target_entity=props.get("end_entity", ""),
+                        source_entity=source_entity,
+                        target_entity=target_entity,
                         relationship_type=props.get("type", ""),
                         description=props.get("description", ""),
                         evidence=props.get("evidence", "")
@@ -2432,14 +2844,30 @@ class GraphBuilderAgent(RoutedAgent):
                 # Merge entities in this cluster
                 primary_entity = cluster[0]  # Use first entity as primary
 
+                # Merge properties from all entities in the cluster
+                merged_properties = list(primary_entity.properties)  # Start with primary entity's properties
+                property_keys_seen = {prop.key for prop in primary_entity.properties}
+
+                for entity in cluster[1:]:  # Skip primary entity, start from second
+                    for prop in entity.properties:
+                        # Add property if key is not already present
+                        if prop.key not in property_keys_seen:
+                            merged_properties.append(prop)
+                            property_keys_seen.add(prop.key)
+
+                # Update primary entity with merged properties
+                primary_entity.properties = merged_properties
+
                 # Collect all names for mapping
                 for entity in cluster:
                     entity_name_mapping[entity.name] = primary_entity.name
 
                 merged_entities.append(primary_entity)
 
-        # Update relationships to use canonical entity names
+        # Update relationships to use canonical entity names and deduplicate
         updated_relationships = []
+        seen_relationships = set()  # Track (source, target, type) tuples to avoid duplicates
+
         for rel in relationships:
             # Map source and target entities to their canonical names
             canonical_source = entity_name_mapping.get(rel.source_entity, rel.source_entity)
@@ -2448,6 +2876,16 @@ class GraphBuilderAgent(RoutedAgent):
             # Skip self-relationships that might have been created by merging
             if canonical_source == canonical_target:
                 continue
+
+            # Create a signature for this relationship to detect duplicates
+            rel_signature = (canonical_source.lower(), canonical_target.lower(), rel.relationship_type.lower())
+
+            # Skip if we've already seen this exact relationship
+            if rel_signature in seen_relationships:
+                self.logger.debug(f"Skipping duplicate relationship: {canonical_source} -{rel.relationship_type}-> {canonical_target}")
+                continue
+
+            seen_relationships.add(rel_signature)
 
             # Create updated relationship
             updated_rel = type(rel)(
@@ -2482,7 +2920,12 @@ class GraphBuilderAgent(RoutedAgent):
         entities_after = len(merged_entities)
         entities_merged = entities_before - entities_after
 
+        relationships_before = len(relationships)
+        relationships_after = len(updated_relationships)
+        relationships_deduplicated = relationships_before - relationships_after
+
         self.logger.info(f"Entity resolution completed: {entities_before} → {entities_after} entities ({entities_merged} merged)")
+        self.logger.info(f"Relationship deduplication: {relationships_before} → {relationships_after} relationships ({relationships_deduplicated} duplicates removed)")
 
         return merged_entities, updated_relationships, updated_triplets
 
@@ -2541,6 +2984,7 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
         # Initialize community graph manager
         self.community_manager = None
         self.current_graph_file = None
+        self.last_community_prompt = ""  # Track last used community summarizer prompt
 
     @message_handler
     async def handle_graph_retrieval_start(self, message: GraphRetrievalStartMessage, ctx: MessageContext) -> GraphRetrievalReadyMessage:
@@ -2563,16 +3007,59 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                     setting=message.setting
                 )
 
-            # Load or reuse community manager
-            if self.community_manager is None or self.current_graph_file != graph_filename:
-                self.logger.info(f"Loading and processing graph: {graph_filename}")
+            # Load shared state to check for learned community summarizer prompt
+            current_state = message.shared_state
+            learned_community_prompt = current_state.get("learned_prompt_community_summarizer", "")
+
+            # Check if we need to reload/reprocess the graph
+            # Reasons to reprocess:
+            # 1. No community manager exists yet
+            # 2. Graph file has changed (different filename)
+            # 3. Graph content has changed (refinement in iteration 1+)
+            # 4. Learned community summarizer prompt has changed
+            should_reprocess = (
+                self.community_manager is None or
+                self.current_graph_file != graph_filename or
+                message.repetition > 0 or  # Always reprocess in iterations 1+ (graph was refined with new relationships)
+                learned_community_prompt != self.last_community_prompt
+            )
+
+            if should_reprocess:
+                if self.community_manager is None:
+                    self.logger.info(f"Loading and processing graph for first time: {graph_filename}")
+                elif self.current_graph_file != graph_filename:
+                    self.logger.info(f"Graph file changed, reprocessing: {graph_filename}")
+                elif message.repetition > 0:
+                    self.logger.info(f"Graph was refined in iteration {message.repetition}, reprocessing to detect communities with new relationships")
+                    if learned_community_prompt != self.last_community_prompt:
+                        self.logger.info(f"Additionally, learned community summarizer prompt changed (prev: {len(self.last_community_prompt)} chars, new: {len(learned_community_prompt)} chars)")
+                else:
+                    self.logger.info(f"Learned community summarizer prompt updated, re-summarizing communities")
+                    self.logger.info(f"Previous prompt length: {len(self.last_community_prompt) if hasattr(self, 'last_community_prompt') else 0}, New prompt length: {len(learned_community_prompt)}")
 
                 from community_graph_utils import load_and_process_graph
+                import json
+
+                # Log what's in the file before loading
+                try:
+                    with open(graph_filename, 'r', encoding='utf-8') as f:
+                        file_data = json.load(f)
+                    file_node_count = sum(1 for item in file_data if item.get("type") == "node")
+                    file_rel_count = sum(1 for item in file_data if item.get("type") == "relationship")
+                    self.logger.info(f"📖 Graph file to load contains: {file_node_count} nodes, {file_rel_count} relationships")
+                except Exception as e:
+                    self.logger.error(f"Error reading graph file for verification: {e}")
+
+                if learned_community_prompt:
+                    self.logger.info(f"Using learned community summarizer prompt ({len(learned_community_prompt)} chars)")
+                else:
+                    self.logger.info("No learned community summarizer prompt found, using base prompt")
 
                 self.community_manager = await load_and_process_graph(
                     graph_filename,
                     self.summarizer_client,
-                    embedding_model=None  # Use TF-IDF fallback
+                    embedding_model=None,  # Use TF-IDF fallback
+                    learned_prompt=learned_community_prompt
                 )
 
                 if self.community_manager is None:
@@ -2586,10 +3073,18 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                     )
 
                 self.current_graph_file = graph_filename
+                self.last_community_prompt = learned_community_prompt  # Track the prompt we used
                 self.logger.info(f"Successfully processed graph with {len(self.community_manager.communities)} communities")
 
-            # Load shared state
-            current_state = message.shared_state
+                # Store community summaries in shared state for backward pass critique
+                current_state["community_summaries"] = self.community_manager.community_summaries
+                self.logger.info(f"Stored {len(self.community_manager.community_summaries)} community summaries in shared state")
+
+                # Store community summarization logs for prompts_response_logs
+                current_state["community_summarization_logs"] = self.community_manager.community_summarization_logs
+                self.logger.info(f"Stored {len(self.community_manager.community_summarization_logs)} community summarization logs")
+            else:
+                self.logger.info(f"Reusing existing community manager (iteration {message.repetition}), no prompt changes detected")
 
             # For first repetition (repetition=0), start with empty system prompt to avoid data leakage
             if message.repetition == 0:
@@ -2808,7 +3303,7 @@ class AnswerGeneratorAgent(RoutedAgent):
         # Prepare prompt with question and retrieved context (without critique)
         prompt_content = self.base_prompt_answer_generator_graph.format(
             message.question, message.retrieved_context
-        )
+        ) + "\nIn your response, do not mention communities and the structure of a graph, since this is internal information not interesting for the user."
 
         try:
             # Call LLM for answer generation using learned system prompt
@@ -2898,13 +3393,13 @@ class ResponseEvaluatorAgent(RoutedAgent):
         self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.response_evaluator")
         self.shared_state = SharedState("agent_states")
 
-        # Import prompts
-        from parameters import response_evaluator_prompt
+        # Import prompts and response format
+        from parameters import response_evaluator_prompt, ResponseEvaluationResponse
 
-        # Initialize Gemini model client for simple text response
+        # Initialize Gemini model client with structured output
         self.model_client = OpenAIChatCompletionClient(
-            model="gemini-2.5-flash-lite",
-            max_tokens=1024,
+            model="gemini-2.5-flash",
+            max_tokens=2048,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=llm_keys.GEMINI_KEY,
             model_info={
@@ -2913,7 +3408,8 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 "json_output": True,
                 "family": "unknown",
                 "structured_output": True,
-            }
+            },
+            response_format=ResponseEvaluationResponse
         )
 
         self.response_evaluator_prompt = response_evaluator_prompt
@@ -2921,27 +3417,48 @@ class ResponseEvaluatorAgent(RoutedAgent):
     @message_handler
     async def handle_response_evaluation_start(self, message: ResponseEvaluationStartMessage, ctx: MessageContext) -> ResponseEvaluationReadyMessage:
         """Handle ResponseEvaluationStart message and evaluate response using LLM."""
+        print(f"\n🔍 ResponseEvaluatorAgent: Starting evaluation for QA pair {message.qa_pair_id}")
+        print(f"   Query: {message.original_query[:100]}...")
+        print(f"   Answer length: {len(message.generated_answer)} chars")
+
         self.logger.info(f"ResponseEvaluatorAgent evaluating QA pair {message.qa_pair_id}")
 
-        # Prepare prompt with query, generated response, and ROUGE score
+        # Prepare prompt with query and generated response (no ROUGE score)
         prompt_content = self.response_evaluator_prompt.format(
             original_query=message.original_query,
-            generated_answer=message.generated_answer,
-            rouge_score=message.rouge_score
+            generated_answer=message.generated_answer
         )
+
+        print(f"   Prompt prepared ({len(prompt_content)} chars)")
 
         try:
             # Call LLM for response evaluation
             system_message = SystemMessage(content=prompt_content)
-            user_message = UserMessage(content="Please evaluate the response and provide improvement suggestions.", source="system")
+            user_message = UserMessage(content="Please evaluate the response.", source="system")
+
+            print("=" * 80)
+            print("RESPONSE EVALUATOR AGENT - LLM CALL")
+            print("=" * 80)
+            print(f"System Prompt ({len(prompt_content)} chars):")
+            print(prompt_content[:500])  # Print first 500 chars
+            print("-" * 80)
+            print(f"User Prompt: Please evaluate the response.")
+            print("-" * 80)
+            print("Calling LLM...")
 
             response = await self.model_client.create(
                 [system_message, user_message],
                 cancellation_token=ctx.cancellation_token
             )
 
-            # Get evaluation result
-            evaluation_result = response.content if isinstance(response.content, str) else str(response.content)
+            print(f"LLM Response received ({len(response.content)} chars):")
+            print(response.content)
+            print("=" * 80)
+
+            # Parse structured response
+            assert isinstance(response.content, str)
+            from parameters import ResponseEvaluationResponse
+            eval_response = ResponseEvaluationResponse.model_validate_json(response.content)
 
             # Log LLM interaction
             logger = get_global_prompt_logger()
@@ -2949,26 +3466,32 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 agent_name="ResponseEvaluatorAgent",
                 interaction_type="response_evaluation",
                 system_prompt=prompt_content,
-                user_prompt="Please evaluate the response and provide improvement suggestions.",
-                llm_response=evaluation_result,
+                user_prompt="Please evaluate the response. Remember: if the answer states that the context doesn't contain the information, then it is not satisfactory.",
+                llm_response=response.content,
                 batch_id=message.batch_id,
                 qa_pair_id=message.qa_pair_id,
                 additional_metadata={
                     "original_query": message.original_query,
                     "generated_answer_length": len(message.generated_answer),
-                    "evaluation_length": len(evaluation_result)
+                    "continue_optimization": eval_response.continue_optimization,
+                    "critique_length": len(eval_response.critique)
                 }
             )
 
-            log_qa_processing(self.logger, message.qa_pair_id, "Evaluation completed", evaluation_result)
+            log_qa_processing(self.logger, message.qa_pair_id,
+                            f"Evaluation completed - continue: {eval_response.continue_optimization}",
+                            f"Reasoning: {eval_response.reasoning}\nCritique: {eval_response.critique}\nMissing Keywords: {eval_response.missing_keywords}")
 
-            # Create evaluation result dictionary (excluding gold answers and ROUGE score to prevent data leakage)
+            # Create evaluation result dictionary (excluding gold answers to prevent data leakage)
             evaluation_data = {
                 "qa_pair_id": message.qa_pair_id,
                 "original_query": message.original_query,
                 "generated_answer": message.generated_answer,
-                "evaluation_feedback": evaluation_result,
-                "repetition": message.repetition,  # Add repetition to track which iteration this belongs to
+                "evaluation_reasoning": eval_response.reasoning,
+                "evaluation_feedback": eval_response.critique,
+                "missing_keywords": eval_response.missing_keywords,
+                "continue_optimization": eval_response.continue_optimization,
+                "repetition": message.repetition,
                 "timestamp": datetime.now().isoformat()
             }
 
@@ -2983,6 +3506,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
             eval_ready_msg = ResponseEvaluationReadyMessage(
                 qa_pair_id=message.qa_pair_id,
                 evaluation_result=evaluation_data,
+                continue_optimization=eval_response.continue_optimization,
                 batch_id=message.batch_id,
                 repetition=message.repetition
             )
@@ -2993,12 +3517,29 @@ class ResponseEvaluatorAgent(RoutedAgent):
             return eval_ready_msg
 
         except Exception as e:
-            self.logger.error(f"Error in response evaluation: {e}")
+            print("=" * 80)
+            print("RESPONSE EVALUATOR AGENT - ERROR")
+            print("=" * 80)
+            print(f"Error Type: {type(e).__name__}")
+            print(f"Error Message: {e}")
+            import traceback
+            print(f"Traceback:")
+            print(traceback.format_exc())
+            print("=" * 80)
+
+            self.logger.error("=" * 80)
+            self.logger.error("RESPONSE EVALUATOR AGENT - ERROR")
+            self.logger.error("=" * 80)
+            self.logger.error(f"Error Type: {type(e).__name__}")
+            self.logger.error(f"Error Message: {e}")
+            self.logger.error(f"Traceback:")
+            self.logger.error(traceback.format_exc())
+            self.logger.error("=" * 80)
             # Create error response data
             evaluation_data = {
                 "qa_pair_id": message.qa_pair_id,
                 "error": f"Evaluation failed: {e}",
-                "rouge_score": message.rouge_score,
+                "continue_optimization": True,  # Default to continue on error
                 "repetition": message.repetition,
                 "timestamp": datetime.now().isoformat()
             }
@@ -3013,6 +3554,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
             return ResponseEvaluationReadyMessage(
                 qa_pair_id=message.qa_pair_id,
                 evaluation_result=evaluation_data,
+                continue_optimization=True,  # Default to continue on error
                 batch_id=message.batch_id,
                 repetition=message.repetition
             )
@@ -3060,7 +3602,9 @@ class BackwardPassAgent(RoutedAgent):
             answer_generation_prompt_optimizer,
             retrieval_planner_prompt_optimizer,
             graph_builder_prompt_optimizer,
-            hyperparameters_graph_agent_prompt_optimizer
+            hyperparameters_graph_agent_prompt_optimizer,
+            community_summarizer_gradient_prompt,
+            community_summarizer_prompt_optimizer
         )
 
         # Initialize Gemini model client for simple text response
@@ -3092,6 +3636,8 @@ class BackwardPassAgent(RoutedAgent):
         self.retrieval_planner_prompt_optimizer = retrieval_planner_prompt_optimizer
         self.graph_builder_prompt_optimizer = graph_builder_prompt_optimizer
         self.hyperparameters_graph_agent_prompt_optimizer = hyperparameters_graph_agent_prompt_optimizer
+        self.community_summarizer_gradient_prompt = community_summarizer_gradient_prompt
+        self.community_summarizer_prompt_optimizer = community_summarizer_prompt_optimizer
 
     @message_handler
     async def handle_backward_pass_start(self, message: BackwardPassStartMessage, ctx: MessageContext) -> BackwardPassReadyMessage:
@@ -3133,6 +3679,10 @@ class BackwardPassAgent(RoutedAgent):
             await self._generate_retrieval_planning_prompt_critique(current_state, ctx)
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
+            # Step 4.5: Generate community summarizer critique (after retrieval planner, uses retrieved content critique)
+            await self._generate_community_summarizer_critique(current_state, ctx)
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+
             # Step 5: Generate graph critique
             await self._generate_graph_critique(current_state, ctx)
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
@@ -3155,6 +3705,8 @@ class BackwardPassAgent(RoutedAgent):
                 "learned_prompt_answer_generator_graph": current_state.get("learned_prompt_answer_generator_graph", ""),
                 "learned_prompt_graph_retrieval_planner": current_state.get("learned_prompt_graph_retrieval_planner", ""),
                 "learned_prompt_graph_builder": current_state.get("learned_prompt_graph_builder", ""),
+                "learned_prompt_graph_refinement": current_state.get("learned_prompt_graph_refinement", ""),
+                "learned_prompt_community_summarizer": current_state.get("learned_prompt_community_summarizer", ""),
                 # Also store critiques and prompt templates for reference
                 "hyperparameters_graph_agent_critique": current_state.get("hyperparameters_graph_agent_critique", ""),
                 "graph_builder_agent_critique": current_state.get("graph_builder_agent_critique", ""),
@@ -3270,10 +3822,17 @@ class BackwardPassAgent(RoutedAgent):
         optimizer_prompt = self.answer_generation_prompt_optimizer.format(critique)
         optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
+        # Limit prompt length to prevent truncation
+        MAX_PROMPT_LENGTH = 4000
+        if len(optimized_prompt) > MAX_PROMPT_LENGTH:
+            self.logger.warning(f"Optimized answer generator prompt too long ({len(optimized_prompt)} chars), truncating to {MAX_PROMPT_LENGTH}")
+            optimized_prompt = optimized_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
+
         # Only update if not frozen
         is_frozen = self._is_prompt_frozen("answer_generator_graph", current_state)
         if not is_frozen:
             current_state["learned_prompt_answer_generator_graph"] = optimized_prompt
+            self.logger.info(f"Stored optimized answer generator prompt ({len(optimized_prompt)} chars)")
 
         log_critique_result(self.logger, "answer_generator_graph", critique, is_frozen)
 
@@ -3519,7 +4078,7 @@ class BackwardPassAgent(RoutedAgent):
             graph_critique = current_state.get("graph_critique", "No critique available")
 
             if not graph_builder_prompt or not corpus_sample or not graph_description:
-                self.logger.warning("Missing data for graph builder critique")
+                self.logger.warning(f"Missing data for graph builder critique: graph_builder_prompt={bool(graph_builder_prompt)}, corpus_sample={bool(corpus_sample)}, graph_description={bool(graph_description)}")
                 return
 
             # Call LLM with graph_extraction_prompt_gradient_prompt
@@ -3535,10 +4094,16 @@ class BackwardPassAgent(RoutedAgent):
             optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
             # Store the optimized graph builder prompt for use in graph refinement
+            # Limit prompt length to prevent truncation and LLM failures
+            MAX_PROMPT_LENGTH = 4000  # characters
+            if len(optimized_prompt) > MAX_PROMPT_LENGTH:
+                self.logger.warning(f"Optimized graph builder prompt too long ({len(optimized_prompt)} chars), truncating to {MAX_PROMPT_LENGTH}")
+                optimized_prompt = optimized_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
+
             is_frozen = self._is_prompt_frozen("graph_builder", current_state)
             if not is_frozen:
                 current_state["learned_prompt_graph_builder"] = optimized_prompt
-                self.logger.info("Stored optimized graph builder prompt for use in refinement mode")
+                self.logger.info(f"Stored optimized graph builder prompt ({len(optimized_prompt)} chars) for use in refinement mode")
             else:
                 self.logger.info("Graph builder prompt is frozen - not updating learned_prompt_graph_builder")
 
@@ -3552,7 +4117,7 @@ class BackwardPassAgent(RoutedAgent):
             graph_critique = current_state.get("graph_critique", "No critique available")
 
             if not graph_refinement_prompt or not corpus_sample or not graph_description:
-                self.logger.warning("Missing data for graph refinement critique")
+                self.logger.warning(f"Missing data for graph refinement critique: graph_refinement_prompt={bool(graph_refinement_prompt)}, corpus_sample={bool(corpus_sample)}, graph_description={bool(graph_description)}")
                 return
 
             # For refinement, we use the same gradient prompt format but focus on refinement
@@ -3568,9 +4133,16 @@ class BackwardPassAgent(RoutedAgent):
             optimized_refinement_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
             # Update the refinement prompt (this IS optimized in backward pass)
+            # Limit prompt length to prevent truncation and LLM failures
+            MAX_PROMPT_LENGTH = 4000  # characters
+            if len(optimized_refinement_prompt) > MAX_PROMPT_LENGTH:
+                self.logger.warning(f"Optimized refinement prompt too long ({len(optimized_refinement_prompt)} chars), truncating to {MAX_PROMPT_LENGTH}")
+                optimized_refinement_prompt = optimized_refinement_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
+
             is_frozen = self._is_prompt_frozen("graph_refinement", current_state)
             if not is_frozen:
                 current_state["learned_prompt_graph_refinement"] = optimized_refinement_prompt
+                self.logger.info(f"Stored optimized refinement prompt ({len(optimized_refinement_prompt)} chars)")
 
             log_critique_result(self.logger, "graph_refinement", critique, is_frozen)
 
@@ -3587,7 +4159,7 @@ class BackwardPassAgent(RoutedAgent):
         graph_critique = current_state.get("graph_critique", "No critique available")
 
         if not corpus_sample or not graph_description:
-            self.logger.warning("Missing data for hyperparameters critique")
+            self.logger.warning(f"Missing data for hyperparameters critique: corpus_sample={bool(corpus_sample)}, graph_description={bool(graph_description)}")
             return
 
         # Call LLM with rag_hyperparameters_agent_gradient_prompt
@@ -3602,12 +4174,86 @@ class BackwardPassAgent(RoutedAgent):
         optimizer_prompt = self.hyperparameters_graph_agent_prompt_optimizer.format(critique)
         optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
+        # Limit prompt length to prevent truncation
+        MAX_PROMPT_LENGTH = 4000
+        if len(optimized_prompt) > MAX_PROMPT_LENGTH:
+            self.logger.warning(f"Optimized hyperparameters prompt too long ({len(optimized_prompt)} chars), truncating to {MAX_PROMPT_LENGTH}")
+            optimized_prompt = optimized_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
+
         # Only update if not frozen
         is_frozen = self._is_prompt_frozen("hyperparameters_graph", current_state)
         if not is_frozen:
             current_state["learned_prompt_hyperparameters_graph"] = optimized_prompt
+            self.logger.info(f"Stored optimized hyperparameters prompt ({len(optimized_prompt)} chars)")
 
         log_critique_result(self.logger, "hyperparameters_graph", critique, is_frozen)
+
+    async def _generate_community_summarizer_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
+        """Generate critique for community summarizer based on retrieved content critique."""
+        self.logger.info("=" * 80)
+        self.logger.info("COMMUNITY SUMMARIZER CRITIQUE - Starting")
+        self.logger.info("=" * 80)
+
+        # Get community summaries from shared state (sample)
+        community_summaries = current_state.get("community_summaries", {})
+        self.logger.info(f"Community summaries in state: {len(community_summaries)} summaries found")
+
+        if not community_summaries:
+            self.logger.warning("⚠️ No community summaries found in state, skipping community summarizer critique")
+            self.logger.info(f"State keys available: {list(current_state.keys())}")
+            return
+
+        # Get a sample of community summaries (first 3)
+        sample_summaries = []
+        for comm_id, summary in list(community_summaries.items())[:3]:
+            sample_summaries.append(f"Community {comm_id}:\n{summary}")
+            self.logger.info(f"Sampled community {comm_id} (length: {len(summary)} chars)")
+
+        community_summaries_text = "\n\n".join(sample_summaries)
+        self.logger.info(f"Total sampled text length: {len(community_summaries_text)} chars")
+
+        # Get retrieved content critique (which critiques the community summaries)
+        retrieved_content_critique = current_state.get("retrieved_content_critique", "No critique available")
+        self.logger.info(f"Retrieved content critique length: {len(retrieved_content_critique)} chars")
+
+        if not community_summaries_text:
+            self.logger.warning("⚠️ No community summary samples available for critique (empty text)")
+            return
+
+        # Call LLM with community_summarizer_gradient_prompt
+        self.logger.info("Calling LLM for community summarizer critique...")
+        prompt_content = self.community_summarizer_gradient_prompt.format(
+            community_summaries_text, retrieved_content_critique
+        )
+
+        critique = await self._call_llm(prompt_content, ctx)
+        current_state["community_summarizer_critique"] = critique
+        self.logger.info(f"✓ Generated critique (length: {len(critique)} chars)")
+
+        # Generate optimized prompt using the critique
+        self.logger.info("Calling LLM for prompt optimization...")
+        optimizer_prompt = self.community_summarizer_prompt_optimizer.format(critique)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
+        self.logger.info(f"✓ Generated optimized prompt (length: {len(optimized_prompt)} chars)")
+
+        # Limit prompt length to prevent truncation
+        MAX_PROMPT_LENGTH = 4000
+        if len(optimized_prompt) > MAX_PROMPT_LENGTH:
+            self.logger.warning(f"Optimized community summarizer prompt too long ({len(optimized_prompt)} chars), truncating to {MAX_PROMPT_LENGTH}")
+            optimized_prompt = optimized_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
+
+        # Only update if not frozen
+        is_frozen = self._is_prompt_frozen("community_summarizer", current_state)
+        if not is_frozen:
+            current_state["learned_prompt_community_summarizer"] = optimized_prompt
+            self.logger.info(f"✓ Stored optimized community summarizer prompt ({len(optimized_prompt)} chars)")
+        else:
+            self.logger.info("⚠️ Community summarizer prompt is frozen, not updating")
+
+        log_critique_result(self.logger, "community_summarizer", critique, is_frozen)
+        self.logger.info("=" * 80)
+        self.logger.info("COMMUNITY SUMMARIZER CRITIQUE - Completed")
+        self.logger.info("=" * 80)
 
     def _is_prompt_frozen(self, prompt_type: str, current_state: Dict[str, Any]) -> bool:
         """Check if a prompt type is frozen."""

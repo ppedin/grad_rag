@@ -279,6 +279,14 @@ class SharedState:
         new_state["example_information"] = current_state.get("example_information", {})
         new_state["batch_information"] = current_state.get("batch_information", {})
 
+        # Preserve missing keywords from previous iteration's evaluation for focused refinement
+        new_state["missing_keywords_for_refinement"] = current_state.get("missing_keywords_for_refinement", [])
+
+        # Preserve continue_optimization flags for all QA pairs
+        for key, value in current_state.items():
+            if key.startswith("continue_optimization_"):
+                new_state[key] = value
+
         # Preserve system prompts from previous iteration if they exist
         if qa_pair_id in self.qa_pair_prompts:
             preserved_prompts = self.qa_pair_prompts[qa_pair_id]
@@ -288,6 +296,8 @@ class SharedState:
             new_state["learned_prompt_answer_generator_graph"] = preserved_prompts.get("learned_prompt_answer_generator_graph", "")
             new_state["learned_prompt_graph_retrieval_planner"] = preserved_prompts.get("learned_prompt_graph_retrieval_planner", "")
             new_state["learned_prompt_graph_builder"] = preserved_prompts.get("learned_prompt_graph_builder", "")
+            new_state["learned_prompt_graph_refinement"] = preserved_prompts.get("learned_prompt_graph_refinement", "")
+            new_state["learned_prompt_community_summarizer"] = preserved_prompts.get("learned_prompt_community_summarizer", "")
 
             # Preserve the actual learned system prompts that agents use (VectorRAG)
             new_state["learned_prompt_hyperparameters_vector"] = preserved_prompts.get("learned_prompt_hyperparameters_vector", "")
@@ -299,7 +309,9 @@ class SharedState:
             new_state["graph_builder_agent_critique"] = preserved_prompts.get("graph_builder_agent_critique", "")
             new_state["retrieval_planner_agent_critique"] = preserved_prompts.get("retrieval_planner_agent_critique", "")
             new_state["answer_generation_critique"] = preserved_prompts.get("answer_generation_critique", "")
+            new_state["community_summarizer_critique"] = preserved_prompts.get("community_summarizer_critique", "")
             new_state["graph_builder_prompt"] = preserved_prompts.get("graph_builder_prompt", "")
+            new_state["graph_refinement_prompt"] = preserved_prompts.get("graph_refinement_prompt", "")
             new_state["retrieval_prompt"] = preserved_prompts.get("retrieval_prompt", "")
 
         # Update iteration tracking

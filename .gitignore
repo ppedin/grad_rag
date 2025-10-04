@@ -12,6 +12,7 @@ graphs/
 agent_logs/
 agent_states/
 generated_graphs/
+.claude/
 
 
 # Test files
@@ -34,3 +35,5 @@ test_agent_states/
 training_logs/
 transition_logs/
 standardized_evaluation_logs/
+results/
+test_community_logs/

@@ -74,9 +74,27 @@ def format_subgraph_to_string(nodes, relationships=None, relationships_explored=
                     adjacency[end_name][start_name] = []
                 adjacency[end_name][start_name].append(rel_info)
 
-    # Generate the string description using actual names
+    # Generate the string description using actual names and properties
     sorted_names = sorted(node_names)
-    graph_desc = f"G describes a graph among nodes {', '.join(sorted_names)}."
+
+    # Create node descriptions with properties
+    node_descriptions = []
+    for name in sorted_names:
+        node = name_to_node[name]
+
+        # Build property description
+        properties = []
+        for key, value in node.items():
+            if key not in ['name', 'id', 'labels'] and value:  # Skip basic fields and empty values
+                properties.append(f"{key}: {value}")
+
+        if properties:
+            node_desc = f"{name} ({', '.join(properties)})"
+        else:
+            node_desc = name
+        node_descriptions.append(node_desc)
+
+    graph_desc = f"G describes a graph among nodes {', '.join(node_descriptions)}."
 
     connections = []
     for name in sorted_names:

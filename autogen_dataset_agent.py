@@ -18,6 +18,7 @@ from autogen_core import (
 from shared_state import SharedState
 from datasets_schema import Document, Question
 from eval_functions import evaluate_rouge_score
+from execution_logger import finalize_execution_logging
 
 
 # Message Types for AutoGen Communication
@@ -517,6 +518,8 @@ class DatasetAgent(RoutedAgent):
                 else:
                     self.logger.info("All QA pairs completed")
                     self._log_to_file("All QA pairs completed")
+                    # Finalize execution logging
+                    finalize_execution_logging()
 
             # Send metrics computed message
             metrics_msg = MetricsComputedMessage(
