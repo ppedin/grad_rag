@@ -2132,7 +2132,28 @@ class GraphBuilderAgent(RoutedAgent):
             missing_keywords = current_state.get("missing_keywords_for_refinement", [])
             self.logger.info(f"🔍 Keywords retrieved: {missing_keywords} (count: {len(missing_keywords)})")
 
-            if missing_keywords:
+            # If no keywords provided, skip refinement and reuse previous graph
+            if not missing_keywords:
+                print(f"\n{'='*80}")
+                print(f"⏭️  SKIPPING GRAPH REFINEMENT")
+                print(f"{'='*80}")
+                print(f"Reason: No missing keywords provided (continue=True but keywords list is empty)")
+                print(f"Action: Reusing previous iteration's graph (no new entities/relationships)")
+                print(f"{'='*80}\n")
+
+                self.logger.info("⏭️  SKIPPING graph refinement - no missing keywords, reusing previous graph")
+
+                # Load existing graph data (don't create new entities/relationships)
+                all_entities, all_relationships, all_triplets = await self._load_existing_graph_data()
+
+                # Set new entities to empty (no refinement performed)
+                new_entities, new_relationships, new_triplets = [], [], []
+
+                # Signal to retrieval agent that it should reuse community summaries
+                current_state["refinement_skipped"] = True
+                self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+
+            else:
                 # Focused refinement: extract context around missing keywords
                 self.logger.info(f"🎯 FOCUSED REFINEMENT MODE: extracting context for {len(missing_keywords)} keywords")
                 self.logger.info(f"Missing keywords: {missing_keywords}")
@@ -2154,59 +2175,55 @@ class GraphBuilderAgent(RoutedAgent):
                     # Fallback to full corpus if no contexts found
                     self.logger.warning("⚠️  No context found for keywords, falling back to full corpus")
                     chunks = self._split_text_into_chunks(corpus, message.chunk_size)
-            else:
-                # No keywords provided, process full corpus (fallback for backward compatibility)
-                self.logger.info("No missing keywords provided, processing full corpus for refinement")
-                chunks = self._split_text_into_chunks(corpus, message.chunk_size)
 
-            self.logger.info(f"Split text into {len(chunks)} chunks for graph refinement")
+                self.logger.info(f"Split text into {len(chunks)} chunks for graph refinement")
 
-            # Save refinement prompt template to shared state
-            current_state["graph_refinement_prompt"] = self.base_prompt_graph_refinement
+                # Save refinement prompt template to shared state
+                current_state["graph_refinement_prompt"] = self.base_prompt_graph_refinement
 
-            # Process refinement (without passing existing graph summary to the prompt)
-            new_entities, new_relationships, new_triplets = await self._process_graph_refinement(
-                chunks, learned_system_prompt, ctx
-            )
+                # Process refinement (without passing existing graph summary to the prompt)
+                new_entities, new_relationships, new_triplets = await self._process_graph_refinement(
+                    chunks, learned_system_prompt, ctx
+                )
 
-            # For refinement, merge new entities/relationships with existing ones
-            existing_entities, existing_relationships, existing_triplets = await self._load_existing_graph_data()
+                # For refinement, merge new entities/relationships with existing ones
+                existing_entities, existing_relationships, existing_triplets = await self._load_existing_graph_data()
 
-            # Log existing entities details
-            if existing_entities:
-                existing_names = [entity.name for entity in existing_entities[:10]]  # First 10 names
-                self.logger.info(f"EXISTING ENTITIES ({len(existing_entities)} total): {', '.join(existing_names)}{'...' if len(existing_entities) > 10 else ''}")
-            else:
-                self.logger.info("EXISTING ENTITIES: None found (first iteration or loading failed)")
+                # Log existing entities details
+                if existing_entities:
+                    existing_names = [entity.name for entity in existing_entities[:10]]  # First 10 names
+                    self.logger.info(f"EXISTING ENTITIES ({len(existing_entities)} total): {', '.join(existing_names)}{'...' if len(existing_entities) > 10 else ''}")
+                else:
+                    self.logger.info("EXISTING ENTITIES: None found (first iteration or loading failed)")
 
-            # Log new entities details
-            if new_entities:
-                new_names = [entity.name for entity in new_entities[:10]]  # First 10 names
-                self.logger.info(f"NEW ENTITIES ({len(new_entities)} total): {', '.join(new_names)}{'...' if len(new_entities) > 10 else ''}")
-            else:
-                self.logger.info("NEW ENTITIES: None found")
+                # Log new entities details
+                if new_entities:
+                    new_names = [entity.name for entity in new_entities[:10]]  # First 10 names
+                    self.logger.info(f"NEW ENTITIES ({len(new_entities)} total): {', '.join(new_names)}{'...' if len(new_entities) > 10 else ''}")
+                else:
+                    self.logger.info("NEW ENTITIES: None found")
 
-            # Merge new entities with existing ones
-            all_entities = existing_entities + new_entities
-            all_relationships = existing_relationships + new_relationships
-            all_triplets = existing_triplets + new_triplets
+                # Merge new entities with existing ones
+                all_entities = existing_entities + new_entities
+                all_relationships = existing_relationships + new_relationships
+                all_triplets = existing_triplets + new_triplets
 
-            # Log merge results
-            self.logger.info(f"MERGE RESULT: {len(existing_entities)} existing + {len(new_entities)} new = {len(all_entities)} total entities")
-            self.logger.info(f"MERGE RESULT: {len(existing_relationships)} existing + {len(new_relationships)} new = {len(all_relationships)} total relationships")
+                # Log merge results
+                self.logger.info(f"MERGE RESULT: {len(existing_entities)} existing + {len(new_entities)} new = {len(all_entities)} total entities")
+                self.logger.info(f"MERGE RESULT: {len(existing_relationships)} existing + {len(new_relationships)} new = {len(all_relationships)} total relationships")
 
-            # Log sample of merged entities to verify merging worked
-            if all_entities:
-                merged_sample = [entity.name for entity in all_entities[:15]]  # Show more for verification
-                self.logger.info(f"MERGED ENTITIES SAMPLE (first 15): {', '.join(merged_sample)}{'...' if len(all_entities) > 15 else ''}")
+                # Log sample of merged entities to verify merging worked
+                if all_entities:
+                    merged_sample = [entity.name for entity in all_entities[:15]]  # Show more for verification
+                    self.logger.info(f"MERGED ENTITIES SAMPLE (first 15): {', '.join(merged_sample)}{'...' if len(all_entities) > 15 else ''}")
 
         # Perform entity resolution to merge similar entities
         all_entities, all_relationships, all_triplets = self._resolve_entities(
             all_entities, all_relationships, all_triplets
         )
 
-        # Convert to memgraph JSON format and save to file
-        graph_json = self._convert_to_memgraph_format(all_entities, all_relationships, all_triplets)
+        # Convert to memgraph JSON format and save to file (with iteration-based edge weighting)
+        graph_json = self._convert_to_memgraph_format(all_entities, all_relationships, all_triplets, iteration=message.repetition)
         # Save to dedicated graphs folder
         import os
         graphs_dir = "graphs"
@@ -2314,54 +2331,68 @@ class GraphBuilderAgent(RoutedAgent):
 
     def _extract_focused_context(self, text: str, keywords: List[str], context_window: int = 300) -> str:
         """
-        Extract context windows around specified keywords from text.
+        Extract context windows where at least TWO keywords co-occur.
         Uses exact matching first, then falls back to fuzzy matching if needed.
 
         Args:
             text: The full document text
             keywords: List of keywords/phrases to search for
-            context_window: Number of characters to include before and after each keyword match
+            context_window: Number of characters to include before and after keyword matches
 
         Returns:
-            Concatenated context windows containing the keywords
+            Concatenated context windows containing at least 2 keywords
         """
         if not keywords:
             return ""
 
+        if len(keywords) == 1:
+            # If only one keyword, fall back to single keyword matching
+            print(f"⚠️  Only 1 keyword provided, using single-keyword matching")
+
         import re
         from difflib import SequenceMatcher
 
-        contexts = []
-        seen_contexts = set()  # To avoid duplicates
+        # Track all keyword positions (exact and fuzzy matches)
+        keyword_positions = {}  # keyword -> list of (start, end) positions
         keywords_found = set()  # Track which keywords were found
         keywords_not_found = []  # Track keywords that need fuzzy matching
 
-        # Phase 1: Exact matching (case-insensitive)
+        # Phase 1: Exact matching (case-insensitive) - Track positions
+        print(f"\n{'='*80}")
+        print(f"🔍 KEYWORD SEARCH - Exact Matching Phase (Co-occurrence Mode)")
+        print(f"{'='*80}")
+        print(f"Searching for {len(keywords)} keywords in corpus ({len(text)} chars)")
+        print(f"Keywords: {keywords}")
+        print(f"Strategy: Extract contexts where at least 2 keywords co-occur")
+        print(f"{'-'*80}")
+
         for keyword in keywords:
             # Case-insensitive regex search for the keyword
             pattern = re.compile(re.escape(keyword), re.IGNORECASE)
             found_matches = False
+            positions = []
 
             for match in pattern.finditer(text):
                 found_matches = True
-                start_pos = max(0, match.start() - context_window)
-                end_pos = min(len(text), match.end() + context_window)
-
-                context = text[start_pos:end_pos].strip()
-
-                # Avoid duplicate contexts
-                context_hash = hash(context)
-                if context_hash not in seen_contexts:
-                    seen_contexts.add(context_hash)
-                    contexts.append(context)
+                positions.append((match.start(), match.end()))
+                print(f"  ✓ Exact match for '{keyword}': found at position {match.start()}")
 
             if found_matches:
                 keywords_found.add(keyword)
+                keyword_positions[keyword] = positions
+                print(f"  ✓ '{keyword}': {len(positions)} exact matches found in corpus")
             else:
                 keywords_not_found.append(keyword)
+                print(f"  ✗ '{keyword}': NO exact matches found in corpus (will try fuzzy matching)")
 
         # Phase 2: Fuzzy matching for keywords not found exactly
         if keywords_not_found:
+            print(f"\n{'='*80}")
+            print(f"🔎 KEYWORD SEARCH - Fuzzy Matching Phase")
+            print(f"{'='*80}")
+            print(f"Attempting fuzzy matching for {len(keywords_not_found)} keywords not found exactly:")
+            print(f"Keywords: {keywords_not_found}")
+            print(f"{'-'*80}")
             self.logger.info(f"🔎 Fuzzy matching for {len(keywords_not_found)} keywords not found exactly: {keywords_not_found}")
 
             # Split text into sentences for fuzzy matching
@@ -2392,39 +2423,89 @@ class GraphBuilderAgent(RoutedAgent):
                 # Sort by similarity and take top matches
                 best_matches.sort(key=lambda x: (x[2], x[1]), reverse=True)
 
-                # Extract contexts from best matching sentences
+                # Track positions from best matching sentences
                 for sentence, sim, overlap in best_matches[:3]:  # Take up to 3 best matches per keyword
                     # Find sentence position in original text
                     sentence_pos = text.lower().find(sentence.lower())
                     if sentence_pos != -1:
-                        start_pos = max(0, sentence_pos - context_window)
-                        end_pos = min(len(text), sentence_pos + len(sentence) + context_window)
+                        # Store position for co-occurrence check
+                        if keyword not in keyword_positions:
+                            keyword_positions[keyword] = []
+                        keyword_positions[keyword].append((sentence_pos, sentence_pos + len(sentence)))
+                        keywords_found.add(keyword)
+                        print(f"  ✓ Fuzzy match for '{keyword}': similarity={sim:.2f}, word_overlap={overlap:.2f}, position={sentence_pos}")
+                        self.logger.info(f"🔎 Fuzzy match for '{keyword}': similarity={sim:.2f}, word_overlap={overlap:.2f}")
+                        break  # Found a good match for this keyword
 
-                        context = text[start_pos:end_pos].strip()
+        # Phase 3: Find contexts with keyword co-occurrence (at least 2 keywords)
+        print(f"\n{'='*80}")
+        print(f"🔍 KEYWORD SEARCH - Co-occurrence Analysis")
+        print(f"{'='*80}")
+        print(f"Found {len(keywords_found)}/{len(keywords)} keywords")
 
-                        # Avoid duplicate contexts
-                        context_hash = hash(context)
-                        if context_hash not in seen_contexts:
-                            seen_contexts.add(context_hash)
-                            contexts.append(context)
-                            keywords_found.add(keyword)
-                            self.logger.info(f"🔎 Fuzzy match for '{keyword}': similarity={sim:.2f}, word_overlap={overlap:.2f}")
-                            break  # Found a good match for this keyword
+        if len(keywords_found) < len(keywords):
+            still_missing = set(keywords) - keywords_found
+            print(f"✗ No matches found for {len(still_missing)} keywords: {list(still_missing)}")
+            self.logger.warning(f"✗ No matches found for {len(still_missing)} keywords: {list(still_missing)}")
 
-        # Log results
+        if len(keyword_positions) < 2 and len(keywords) > 1:
+            print(f"✗ Need at least 2 keywords found for co-occurrence, but only found {len(keyword_positions)}")
+            print(f"{'='*80}\n")
+            self.logger.warning(f"✗ Insufficient keywords for co-occurrence ({len(keyword_positions)}/2 minimum)")
+            return ""
+
+        # Find all contexts where at least 2 keywords co-occur
+        contexts = []
+        seen_contexts = set()
+        co_occurrence_count = 0
+
+        # For each keyword position, check if another keyword appears within the context window
+        for keyword1, positions1 in keyword_positions.items():
+            for start1, end1 in positions1:
+                # Define context window around this keyword
+                context_start = max(0, start1 - context_window)
+                context_end = min(len(text), end1 + context_window)
+
+                # Check if any other keyword appears in this window
+                keywords_in_window = {keyword1}
+                for keyword2, positions2 in keyword_positions.items():
+                    if keyword2 != keyword1:
+                        for start2, end2 in positions2:
+                            # Check if keyword2 overlaps with this context window
+                            if (context_start <= start2 < context_end) or (context_start < end2 <= context_end):
+                                keywords_in_window.add(keyword2)
+                                break
+
+                # Extract context if at least 2 keywords co-occur (or only 1 keyword exists)
+                if len(keywords_in_window) >= 2 or len(keywords) == 1:
+                    context = text[context_start:context_end].strip()
+                    context_hash = hash(context)
+
+                    if context_hash not in seen_contexts:
+                        seen_contexts.add(context_hash)
+                        contexts.append(context)
+                        co_occurrence_count += 1
+                        print(f"  ✓ Co-occurrence found: {list(keywords_in_window)} at position {start1}")
+
+        print(f"\n{'='*80}")
+        print(f"🔍 KEYWORD SEARCH - Final Results")
+        print(f"{'='*80}")
+
         if contexts:
-            self.logger.info(f"✓ Found contexts for {len(keywords_found)}/{len(keywords)} keywords")
-            if len(keywords_found) < len(keywords):
-                still_missing = set(keywords) - keywords_found
-                self.logger.warning(f"✗ No matches found for {len(still_missing)} keywords: {list(still_missing)}")
+            print(f"✓ Found {len(contexts)} context windows with keyword co-occurrence")
+            print(f"✓ Total extracted text: {sum(len(c) for c in contexts)} chars")
+            print(f"{'='*80}\n")
+            self.logger.info(f"✓ Extracted {len(contexts)} context windows with co-occurrence")
         else:
-            self.logger.warning(f"✗ No contexts found for any keywords: {keywords}")
+            print(f"✗ No contexts with keyword co-occurrence found")
+            print(f"{'='*80}\n")
+            self.logger.warning(f"✗ No contexts with keyword co-occurrence found")
             return ""
 
         # Concatenate all contexts with separators
         focused_text = "\n\n---\n\n".join(contexts)
 
-        self.logger.info(f"Extracted {len(contexts)} context windows for {len(keywords)} keywords (total length: {len(focused_text)} chars)")
+        self.logger.info(f"Extracted {len(contexts)} context windows with keyword co-occurrence (total length: {len(focused_text)} chars)")
 
         return focused_text
 
@@ -2463,8 +2544,17 @@ class GraphBuilderAgent(RoutedAgent):
 
         return graph_response.entities, graph_response.relationships, graph_response.triplets
 
-    def _convert_to_memgraph_format(self, entities, relationships, triplets) -> List[Dict[str, Any]]:
-        """Convert extracted data to Memgraph import_util.json() format."""
+    def _convert_to_memgraph_format(self, entities, relationships, triplets, iteration: int = 0) -> List[Dict[str, Any]]:
+        """
+        Convert extracted data to Memgraph import_util.json() format.
+
+        Args:
+            entities: List of entities
+            relationships: List of relationships
+            triplets: List of triplets
+            iteration: Current iteration number (0 for first iteration, 1 for second, etc.)
+                      Used to weight edges - higher iteration = higher weight
+        """
         memgraph_items = []
         node_id_counter = 1000  # Start with high numbers to avoid conflicts
 
@@ -2495,7 +2585,9 @@ class GraphBuilderAgent(RoutedAgent):
             memgraph_items.append(node)
             name_to_id[entity.name] = node_id
 
-        # Convert relationships to edges
+        # Convert relationships to edges with iteration-based weighting
+        # Weight formula: iteration 0 -> weight 1, iteration 1 -> weight 2, etc.
+        edge_weight = iteration + 1
         rel_id_counter = 2000  # Start with high numbers to avoid conflicts
         for relationship in relationships:
             # Get node IDs for start and end nodes
@@ -2512,7 +2604,9 @@ class GraphBuilderAgent(RoutedAgent):
                     "properties": {
                         "description": relationship.description,
                         "evidence": relationship.evidence,
-                        "type": relationship.relationship_type
+                        "type": relationship.relationship_type,
+                        "weight": edge_weight,  # Add weight based on iteration
+                        "iteration": iteration  # Track which iteration added this edge
                     },
                     "type": "relationship"
                 }
@@ -3011,17 +3105,20 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
             current_state = message.shared_state
             learned_community_prompt = current_state.get("learned_prompt_community_summarizer", "")
 
+            # Check if refinement was skipped (no missing keywords)
+            refinement_skipped = current_state.get("refinement_skipped", False)
+
             # Check if we need to reload/reprocess the graph
             # Reasons to reprocess:
             # 1. No community manager exists yet
             # 2. Graph file has changed (different filename)
-            # 3. Graph content has changed (refinement in iteration 1+)
+            # 3. Graph content has changed (refinement in iteration 1+) AND refinement wasn't skipped
             # 4. Learned community summarizer prompt has changed
             should_reprocess = (
                 self.community_manager is None or
                 self.current_graph_file != graph_filename or
-                message.repetition > 0 or  # Always reprocess in iterations 1+ (graph was refined with new relationships)
-                learned_community_prompt != self.last_community_prompt
+                (message.repetition > 0 and not refinement_skipped) or  # Only reprocess if graph was actually refined
+                (learned_community_prompt != self.last_community_prompt and not refinement_skipped)
             )
 
             if should_reprocess:
@@ -3084,7 +3181,23 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 current_state["community_summarization_logs"] = self.community_manager.community_summarization_logs
                 self.logger.info(f"Stored {len(self.community_manager.community_summarization_logs)} community summarization logs")
             else:
-                self.logger.info(f"Reusing existing community manager (iteration {message.repetition}), no prompt changes detected")
+                if refinement_skipped:
+                    print(f"\n{'='*80}")
+                    print(f"⏭️  SKIPPING COMMUNITY REPROCESSING")
+                    print(f"{'='*80}")
+                    print(f"Reason: Graph refinement was skipped (no missing keywords)")
+                    print(f"Action: Reusing existing community manager and summaries from previous iteration")
+                    print(f"{'='*80}\n")
+                    self.logger.info(f"⏭️  SKIPPING community reprocessing - refinement was skipped, reusing existing communities")
+
+                    # Ensure community data persists in current state for backward pass
+                    if self.community_manager:
+                        current_state["community_summaries"] = self.community_manager.community_summaries
+                        current_state["community_summarization_logs"] = self.community_manager.community_summarization_logs
+                        self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+                        self.logger.info(f"Persisted {len(self.community_manager.community_summaries)} community summaries to current iteration state")
+                else:
+                    self.logger.info(f"Reusing existing community manager (iteration {message.repetition}), no prompt changes detected")
 
             # For first repetition (repetition=0), start with empty system prompt to avoid data leakage
             if message.repetition == 0:
@@ -3220,9 +3333,8 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                     community_id in self.community_manager.community_titles and
                     len(self.community_manager.communities.get(community_id, [])) >= 3):
 
-                    title = self.community_manager.community_titles[community_id]
                     summary = self.community_manager.community_summaries[community_id]
-                    context_parts.append(f"Community {community_id} - {title}:\n{summary}")
+                    context_parts.append(summary)
                     valid_communities.append(community_id)
                 else:
                     self.logger.warning(f"Community {community_id} not found or has too few nodes")
@@ -3271,7 +3383,7 @@ class AnswerGeneratorAgent(RoutedAgent):
 
         # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
-            model="gemini-2.5-flash-lite",
+            model="gemini-2.5-flash",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=llm_keys.GEMINI_KEY,
             model_info={
@@ -3303,7 +3415,7 @@ class AnswerGeneratorAgent(RoutedAgent):
         # Prepare prompt with question and retrieved context (without critique)
         prompt_content = self.base_prompt_answer_generator_graph.format(
             message.question, message.retrieved_context
-        ) + "\nIn your response, do not mention communities and the structure of a graph, since this is internal information not interesting for the user."
+        ) 
 
         try:
             # Call LLM for answer generation using learned system prompt
@@ -3453,14 +3565,36 @@ class ResponseEvaluatorAgent(RoutedAgent):
 
         self.logger.info(f"ResponseEvaluatorAgent evaluating QA pair {message.qa_pair_id}")
 
-        # Prepare prompt with query, generated response, and satisfactory criteria
+        # Load previous evaluations from shared state
+        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+        all_evaluation_responses = current_state.get("response_evaluations", [])
+
+        # Format previous evaluations for context
+        if all_evaluation_responses:
+            prev_evals_text = "\n\nPrevious evaluations for this query:\n"
+            for eval_resp in all_evaluation_responses:
+                iter_num = eval_resp.get('repetition', 0)
+                prev_evals_text += f"\nIteration {iter_num}:\n"
+                prev_evals_text += f"  Answer: {eval_resp.get('generated_answer', 'N/A')[:200]}...\n"
+                prev_evals_text += f"  Reasoning: {eval_resp.get('evaluation_reasoning', 'N/A')}\n"
+                prev_evals_text += f"  Critique: {eval_resp.get('evaluation_feedback', 'N/A')}\n"
+                prev_evals_text += f"  Continue: {eval_resp.get('continue_optimization', False)}"
+        else:
+            prev_evals_text = ""
+
+        # Prepare prompt with query, generated response, previous evaluations, and satisfactory criteria
         prompt_content = self.response_evaluator_prompt.format(
             original_query=message.original_query,
             generated_answer=message.generated_answer,
+            previous_evaluations=prev_evals_text,
             satisfactory_criteria=self.satisfactory_criteria
         )
 
         print(f"   Prompt prepared ({len(prompt_content)} chars)")
+        if prev_evals_text:
+            print(f"   ✓ Including {len(all_evaluation_responses)} previous evaluation(s) in prompt")
+        else:
+            print(f"   ℹ️  No previous evaluations (first iteration)")
 
         try:
             # Call LLM for response evaluation
@@ -3471,7 +3605,12 @@ class ResponseEvaluatorAgent(RoutedAgent):
             print("RESPONSE EVALUATOR AGENT - LLM CALL")
             print("=" * 80)
             print(f"System Prompt ({len(prompt_content)} chars):")
-            print(prompt_content[:500])  # Print first 500 chars
+            if prev_evals_text:
+                print(f"\n[Previous Evaluations Section:]")
+                print(prev_evals_text[:300] + "..." if len(prev_evals_text) > 300 else prev_evals_text)
+                print("-" * 80)
+            print(f"\n[First 500 chars of full prompt:]")
+            print(prompt_content[:500])
             print("-" * 80)
             print(f"User Prompt: Please evaluate the response.")
             print("-" * 80)
@@ -3635,7 +3774,9 @@ class BackwardPassAgent(RoutedAgent):
             graph_builder_prompt_optimizer,
             hyperparameters_graph_agent_prompt_optimizer,
             community_summarizer_gradient_prompt,
-            community_summarizer_prompt_optimizer
+            community_summarizer_prompt_optimizer,
+            PromptCritiqueResponse,
+            ContentCritiqueResponse
         )
 
         # Initialize Gemini model client for simple text response
@@ -3801,52 +3942,65 @@ class BackwardPassAgent(RoutedAgent):
                 }
             )
 
+    def _format_all_evaluation_responses(self, all_evaluation_responses: list) -> str:
+        """Format all evaluation responses into a single string."""
+        if not all_evaluation_responses:
+            return "No evaluation responses available"
+
+        formatted_evals = []
+        for eval_resp in all_evaluation_responses:
+            iter_num = eval_resp.get('repetition', 0)
+            eval_text = f"Iteration {iter_num}:\n"
+            eval_text += f"  Reasoning: {eval_resp.get('evaluation_reasoning', 'N/A')}\n"
+            eval_text += f"  Critique: {eval_resp.get('evaluation_feedback', 'N/A')}\n"
+            eval_text += f"  Continue: {eval_resp.get('continue_optimization', False)}"
+            formatted_evals.append(eval_text)
+
+        return "\n\n".join(formatted_evals)
+
     async def _generate_answer_generation_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for answer generation based on conversations and evaluations."""
+        """Generate critique for answer generation prompt (with skip logic)."""
         self.logger.info("Generating answer generation critique")
 
-        all_conversations = current_state.get("conversations_answer_generation", [])
         all_evaluation_responses = current_state.get("response_evaluations", [])
 
-        # Get current repetition from batch info
-        batch_info = current_state.get("batch_information", {})
-        current_repetition = batch_info.get("current_repetition", 0)
-
-        # Since lists are cleared at the start of each iteration, all data should be from current iteration
-        conversations = all_conversations
-        evaluation_responses = all_evaluation_responses
-
-        self.logger.info(f"Found {len(conversations)} conversations and {len(evaluation_responses)} evaluations for iteration {current_repetition}")
-
-        if not conversations or not evaluation_responses:
-            self.logger.warning("No conversation or evaluation data available - skipping answer generation critique")
+        if not all_evaluation_responses:
+            self.logger.warning("No evaluation data available - skipping answer generation critique")
+            current_state["answer_generation_critique"] = "No critique provided"
             return
 
-        # Get the current answer generation prompt for critique
+        # Get the current answer generation prompt
         current_answer_prompt = current_state.get("learned_prompt_answer_generator_graph", "")
         if not current_answer_prompt:
-            # Use base prompt if no learned prompt exists yet
             from parameters import base_prompt_answer_generator_graph
             current_answer_prompt = base_prompt_answer_generator_graph
 
-        # One iteration = One QA pair, so we should have exactly 1 conversation and 1 evaluation
-        if len(conversations) != 1 or len(evaluation_responses) != 1:
-            self.logger.error(f"Expected exactly 1 conversation and 1 evaluation per iteration, but got {len(conversations)} conversations and {len(evaluation_responses)} evaluations")
+        # Get previous critique (empty string for first component in backward pass)
+        previous_critique = ""
+
+        # Get response evaluator output (all iterations)
+        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
+
+        # Format prompt with new structure
+        prompt_content = self.generation_prompt_gradient_prompt.format(
+            current_prompt=current_answer_prompt,
+            previous_critique=previous_critique,
+            response_evaluator_output=response_evaluator_output
+        )
+
+        # Call LLM with structured output
+        from parameters import PromptCritiqueResponse
+        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+
+        # Implement skip logic
+        if not critique_response.problem_in_this_component:
+            # No problem in this component - pass "No critique provided" to next component
+            current_state["answer_generation_critique"] = "No critique provided"
+            self.logger.info("Answer generation prompt: No problem detected, skipping optimization")
             return
 
-        # Extract the single conversation and evaluation from this iteration
-        conv = conversations[0]
-        eval_resp = evaluation_responses[0]
-
-        # Create the single sequence: query + previous prompt + answer + feedback
-        concatenated_data = f"Question: {conv.get('question', '')}\nPrevious Answer Generation Prompt: {current_answer_prompt}\nGenerated Answer: {conv.get('generated_answer', '')}\nResponse Feedback: {eval_resp.get('evaluation_feedback', '')}"
-
-        self.logger.info(f"Created answer generation critique sequence for iteration {current_repetition}")
-
-        # Call LLM with generation_prompt_gradient_prompt
-        prompt_content = self.generation_prompt_gradient_prompt.format(concatenated_data)
-
-        critique = await self._call_llm(prompt_content, ctx)
+        # Problem detected - store critique and optimize
+        critique = critique_response.critique
         current_state["answer_generation_critique"] = critique
 
         # Generate optimized prompt using the critique
@@ -3868,20 +4022,15 @@ class BackwardPassAgent(RoutedAgent):
         log_critique_result(self.logger, "answer_generator_graph", critique, is_frozen)
 
     async def _generate_retrieved_content_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieved content based on conversations, contexts, and evaluations."""
+        """Generate critique for retrieved content (no skip logic)."""
         self.logger.info("Generating retrieved content critique")
 
-        all_conversations = current_state.get("conversations_answer_generation", [])
         all_retrieved_contexts = current_state.get("retrieved_contexts", [])
         all_evaluation_responses = current_state.get("response_evaluations", [])
 
         # Get current repetition from batch info
         batch_info = current_state.get("batch_information", {})
         current_repetition = batch_info.get("current_repetition", 0)
-
-        # Since lists are cleared at the start of each iteration, all data should be from current iteration
-        conversations = all_conversations
-        evaluation_responses = all_evaluation_responses
 
         # Extract retrieved contexts for current iteration
         retrieved_contexts = []
@@ -3890,124 +4039,125 @@ class BackwardPassAgent(RoutedAgent):
                 if ctx_entry.get("repetition") == current_repetition:
                     retrieved_contexts.append(ctx_entry.get("retrieved_context", ""))
 
-        self.logger.info(f"Found {len(conversations)} conversations, {len(evaluation_responses)} evaluations, {len(retrieved_contexts)} contexts for iteration {current_repetition}")
-
-        if not conversations or not evaluation_responses:
-            self.logger.warning("No conversation or evaluation data available - skipping retrieved content critique")
-            return
-
-        # One iteration = One QA pair, so we should have exactly 1 conversation, 1 evaluation, and 1 context
-        if len(conversations) != 1 or len(evaluation_responses) != 1:
-            self.logger.error(f"Expected exactly 1 conversation and 1 evaluation per iteration, but got {len(conversations)} conversations and {len(evaluation_responses)} evaluations")
+        if not all_evaluation_responses or not retrieved_contexts:
+            self.logger.warning("No evaluation or context data available - skipping retrieved content critique")
+            current_state["retrieved_content_critique"] = "No critique provided"
             return
 
         if len(retrieved_contexts) != 1:
             self.logger.error(f"Expected exactly 1 retrieved context per iteration, but got {len(retrieved_contexts)}")
+            current_state["retrieved_content_critique"] = "No critique provided"
             return
 
-        # Extract the single conversation, evaluation, and context from this iteration
-        conv = conversations[0]
-        eval_resp = evaluation_responses[0]
+        # Get retrieved content
         context = retrieved_contexts[0]
 
-        # Extract query from conversation
-        query = conv.get('question', 'No query available')
+        # Get previous critique (empty - only reads response evaluator)
+        previous_critique = ""
 
-        # Log context size for monitoring
+        # Get response evaluator output (all iterations)
+        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
+
+        # Log context size
         context_length = len(str(context))
         self.logger.info(f"Retrieved context length: {context_length} characters")
 
-        # Note: No truncation applied - using full retrieved context for gradient analysis
+        # Format prompt with new structure
+        prompt_content = self.retrieved_content_gradient_prompt_graph.format(
+            retrieved_content=context,
+            previous_critique=previous_critique,
+            response_evaluator_output=response_evaluator_output
+        )
 
-        # Create the single sequence: context + query + answer + feedback
-        concatenated_data = f"Retrieved Context: {context}\nQuery: {query}\nGenerated Answer: {conv.get('generated_answer', '')}\nFeedback: {eval_resp.get('evaluation_feedback', '')}"
+        # Call LLM with structured output (ContentCritiqueResponse - no skip logic)
+        from parameters import ContentCritiqueResponse
+        critique_response = await self._call_llm_structured(prompt_content, ctx, ContentCritiqueResponse)
 
-        self.logger.info(f"Created retrieved content critique sequence for iteration {current_repetition}")
-
-        # Call LLM with retrieved_content_gradient_prompt_graph
-        prompt_content = self.retrieved_content_gradient_prompt_graph.format(concatenated_data)
-
-        critique = await self._call_llm(prompt_content, ctx)
-        current_state["retrieved_content_critique"] = critique
+        # Store critique (always, no skip logic for content critiques)
+        current_state["retrieved_content_critique"] = critique_response.critique
 
         self.logger.info("Retrieved content critique generated and saved")
 
     async def _generate_retrieval_plan_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieval plans based on plans and contexts."""
+        """Generate critique for retrieval plan (no skip logic)."""
         self.logger.info("Generating retrieval plan critique")
 
         retrieval_plans = current_state.get("retrieval_plans", [])
-        retrieved_contexts = current_state.get("retrieved_contexts", [])
+        all_evaluation_responses = current_state.get("response_evaluations", [])
 
-        self.logger.info(f"Retrieval plans: {retrieval_plans}")
-        self.logger.info(f"Retrieved contexts: {retrieved_contexts}")
-
-        if not retrieval_plans or not retrieved_contexts:
-            self.logger.warning("Missing retrieval plans or contexts for critique")
+        if not retrieval_plans or not all_evaluation_responses:
+            self.logger.warning("Missing retrieval plans or evaluation for critique")
+            current_state["retrieval_plan_critique"] = "No critique provided"
             return
 
-        # retrieval_plans is a list of reasoning strings from k iterations in the current repetition
-        # We want to show all moves in the complete plan, not just the first one
+        # Get complete retrieval plan
         complete_retrieval_plan = "\n".join([f"Move {i+1}: {plan}" for i, plan in enumerate(retrieval_plans)])
 
-        # retrieved_contexts is a list of context entries, get the most recent one for this repetition
-        if retrieved_contexts:
-            latest_context_entry = retrieved_contexts[-1]  # Get the most recent context
-            if isinstance(latest_context_entry, dict):
-                retrieved_context_text = latest_context_entry.get("retrieved_context", str(latest_context_entry))
-            else:
-                retrieved_context_text = str(latest_context_entry)
-        else:
-            retrieved_context_text = "No retrieved context available"
+        # Get previous critique (from retrieved content)
+        previous_critique = current_state.get("retrieved_content_critique", "")
 
-        # Create the pair showing the community selection reasoning
-        pair = f"Community Selection: {complete_retrieval_plan}\nRetrieved Community Summaries: {retrieved_context_text}"
-        concatenated_pairs = pair
+        # Get response evaluator output (all iterations)
+        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
 
-        # Get retrieved_content_critique for the second variable
-        retrieved_content_critique = current_state.get("retrieved_content_critique", "No critique available")
+        # Format prompt with new structure
+        prompt_content = self.retrieval_plan_gradient_prompt_graph.format(
+            retrieval_plan=complete_retrieval_plan,
+            previous_critique=previous_critique,
+            response_evaluator_output=response_evaluator_output
+        )
 
-        # Call LLM with retrieval_plan_gradient_prompt_graph (updated for community selection)
-        prompt_content = self.retrieval_plan_gradient_prompt_graph.format(concatenated_pairs, retrieved_content_critique)
+        # Call LLM with structured output (ContentCritiqueResponse - no skip logic)
+        from parameters import ContentCritiqueResponse
+        critique_response = await self._call_llm_structured(prompt_content, ctx, ContentCritiqueResponse)
 
-        critique = await self._call_llm(prompt_content, ctx)
-        current_state["retrieval_plan_critique"] = critique
+        # Store critique (always, no skip logic)
+        current_state["retrieval_plan_critique"] = critique_response.critique
 
-        self.logger.info("Community selection critique generated and saved")
+        self.logger.info("Retrieval plan critique generated and saved")
 
     async def _generate_retrieval_planning_prompt_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for community selection prompt."""
-        self.logger.info("Generating community selection prompt critique")
+        """Generate critique for retrieval planning prompt (with skip logic)."""
+        self.logger.info("Generating retrieval planning prompt critique")
 
         retrieval_prompt = current_state.get("retrieval_prompt", "")
-        # Get community information from retrieved contexts instead of direct access
-        retrieved_contexts = current_state.get("retrieved_contexts", [])
-        retrieval_plans = current_state.get("retrieval_plans", [])
+        all_evaluation_responses = current_state.get("response_evaluations", [])
 
-        if not retrieval_prompt or not retrieval_plans:
-            self.logger.warning("Missing community selection prompt or reasoning for critique")
+        if not retrieval_prompt or not all_evaluation_responses:
+            self.logger.warning("Missing retrieval prompt or evaluation for critique")
+            current_state["retrieval_planner_agent_critique"] = "No critique provided"
             return
 
-        # Create data showing: community_selection_prompt + retrieved_communities + selection_reasoning
-        retrieved_community_info = "No communities retrieved"
-        if retrieved_contexts:
-            latest_context = retrieved_contexts[-1]
-            if isinstance(latest_context, dict):
-                retrieved_community_info = latest_context.get("retrieved_context", "No context available")
+        # Get the current retrieval planning prompt
+        current_retrieval_prompt = current_state.get("learned_prompt_graph_retrieval_planner", "")
+        if not current_retrieval_prompt:
+            from parameters import base_prompt_graph_retrieval_planner
+            current_retrieval_prompt = base_prompt_graph_retrieval_planner
 
-        # With one-shot approach, we have one selection reasoning
-        selection_reasoning = retrieval_plans[0] if retrieval_plans else "No reasoning available"
+        # Get previous critique (from retrieval plan)
+        previous_critique = current_state.get("retrieval_plan_critique", "")
 
-        triplet = f"Community Selection Prompt: {retrieval_prompt}\nRetrieved Communities: {retrieved_community_info}\nSelection Reasoning: {selection_reasoning}"
-        concatenated_triplets = triplet
+        # Get response evaluator output (all iterations)
+        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
 
-        # Get retrieval_plan_critique for the second variable
-        retrieval_plan_critique = current_state.get("retrieval_plan_critique", "No critique available")
+        # Format prompt with new structure
+        prompt_content = self.retrieval_planning_prompt_gradient_prompt.format(
+            current_prompt=current_retrieval_prompt,
+            previous_critique=previous_critique,
+            response_evaluator_output=response_evaluator_output
+        )
 
-        # Call LLM with retrieval_planning_prompt_gradient_prompt (now for community selection)
-        prompt_content = self.retrieval_planning_prompt_gradient_prompt.format(concatenated_triplets, retrieval_plan_critique)
+        # Call LLM with structured output
+        from parameters import PromptCritiqueResponse
+        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
 
-        critique = await self._call_llm(prompt_content, ctx)
+        # Implement skip logic
+        if not critique_response.problem_in_this_component:
+            current_state["retrieval_planner_agent_critique"] = "No critique provided"
+            self.logger.info("Retrieval planning prompt: No problem detected, skipping optimization")
+            return
+
+        # Problem detected - store critique and optimize
+        critique = critique_response.critique
         current_state["retrieval_planner_agent_critique"] = critique
 
         # Generate optimized prompt using the critique
@@ -4022,183 +4172,199 @@ class BackwardPassAgent(RoutedAgent):
         log_critique_result(self.logger, "graph_retrieval_planner", critique, is_frozen)
 
     async def _generate_graph_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for the graph based on questions, description, and community selections."""
+        """Generate critique for graph (no skip logic)."""
         self.logger.info("Generating graph critique")
 
-        batch_info = current_state.get("batch_information", {})
-        current_qa_pair_id = batch_info.get("current_qa_pair_id", "")
-
-        # If current_qa_pair_id is not available, try to get it from other sources
-        if not current_qa_pair_id:
-            # Try to get from conversations
-            conversations = current_state.get("conversations_answer_generation", [])
-            if conversations:
-                # Use the most recent conversation's qa_pair_id
-                current_qa_pair_id = conversations[-1].get("qa_pair_id", "")
-
-            # If still not found, try to get from response evaluations
-            if not current_qa_pair_id:
-                evaluations = current_state.get("response_evaluations", [])
-                if evaluations:
-                    current_qa_pair_id = evaluations[-1].get("qa_pair_id", "")
-
         graph_description = current_state.get("graph_description", "")
-        retrieval_plans = current_state.get("retrieval_plans", [])
-        retrieved_contexts = current_state.get("retrieved_contexts", [])
+        all_evaluation_responses = current_state.get("response_evaluations", [])
 
-        # Debug logging to see what data is available
-        self.logger.info(f"Debug - current_qa_pair_id: '{current_qa_pair_id}' (from batch_info: '{batch_info.get('current_qa_pair_id', 'None')}')")
-        self.logger.info(f"Debug - graph_description length: {len(graph_description) if graph_description else 0}")
-        self.logger.info(f"Debug - retrieval_plans length: {len(retrieval_plans)}")
-        self.logger.info(f"Debug - retrieved_contexts length: {len(retrieved_contexts)}")
-        self.logger.info(f"Debug - available state keys: {list(current_state.keys())}")
-        self.logger.info(f"Debug - batch_info keys: {list(batch_info.keys())}")
-
-        # Make qa_pair_id optional for graph critique since the core functionality doesn't strictly need it
-        if not graph_description or not retrieval_plans:
-            self.logger.warning(f"Missing essential data for graph critique - graph_desc: {bool(graph_description)}, retrieval_plans: {bool(retrieval_plans)}")
+        if not graph_description or not all_evaluation_responses:
+            self.logger.warning("Missing graph description or evaluation for critique")
+            current_state["graph_critique"] = "No critique provided"
             return
 
-        if not current_qa_pair_id:
-            self.logger.warning("No qa_pair_id found, proceeding with graph critique anyway")
-            current_qa_pair_id = "unknown_qa_pair"
+        # Get previous critique (from retrieved content)
+        previous_critique = current_state.get("retrieved_content_critique", "")
 
-        # Get the current question from conversations
-        conversations = current_state.get("conversations_answer_generation", [])
-        current_question = "No question available"
-        if conversations:
-            current_question = conversations[-1].get("question", "No question available")
+        # Get response evaluator output (all iterations)
+        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
 
-        # Create data: current_query + graph_description + community_selection
-        community_selection = retrieval_plans[0] if retrieval_plans else "No selection reasoning available"
-        retrieved_info = "No communities retrieved"
-        if retrieved_contexts:
-            latest_context = retrieved_contexts[-1]
-            if isinstance(latest_context, dict):
-                retrieved_info = latest_context.get("retrieved_context", "No context available")
+        # Format prompt with new structure
+        prompt_content = self.graph_gradient_prompt.format(
+            graph_description=graph_description,
+            previous_critique=previous_critique,
+            response_evaluator_output=response_evaluator_output
+        )
 
-        triplet = f"Query: {current_question}\nGraph Description: {graph_description}\nCommunity Selection: {community_selection}\nRetrieved Communities: {retrieved_info}"
-        concatenated_triplets = triplet
+        # Call LLM with structured output (ContentCritiqueResponse - no skip logic)
+        from parameters import ContentCritiqueResponse
+        critique_response = await self._call_llm_structured(prompt_content, ctx, ContentCritiqueResponse)
 
-        # Get retrieval_plan_critique for the second variable
-        retrieval_plan_critique = current_state.get("retrieval_plan_critique", "No critique available")
-
-        # Call LLM with graph_gradient_prompt
-        prompt_content = self.graph_gradient_prompt.format(concatenated_triplets, retrieval_plan_critique)
-
-        critique = await self._call_llm(prompt_content, ctx)
-        current_state["graph_critique"] = critique
+        # Store critique (always, no skip logic)
+        current_state["graph_critique"] = critique_response.critique
 
         self.logger.info("Graph critique generated and saved")
 
     async def _generate_graph_builder_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for graph builder/refinement prompt based on current iteration."""
+        """Generate critique for graph builder/refinement prompt (with skip logic)."""
 
-        # Determine current repetition to decide creation vs refinement
         batch_info = current_state.get("batch_information", {})
         current_repetition = batch_info.get("current_repetition", 0)
         is_first_iteration = current_repetition == 0
+        all_evaluation_responses = current_state.get("response_evaluations", [])
+
+        if not all_evaluation_responses:
+            self.logger.warning("No evaluation data available - skipping graph builder critique")
+            if is_first_iteration:
+                current_state["graph_builder_agent_critique"] = "No critique provided"
+            else:
+                current_state["graph_refinement_agent_critique"] = "No critique provided"
+            return
 
         if is_first_iteration:
             # First iteration: optimize graph creation prompt
-            self.logger.info("Generating graph builder (creation) critique - first iteration")
+            self.logger.info("Generating graph builder (creation) critique")
 
-            graph_builder_prompt = current_state.get("graph_builder_prompt", "")
-            corpus_sample = current_state.get("full_document_text", batch_info.get("document_text", ""))[:500]
-            graph_description = current_state.get("graph_description", "")
-            graph_critique = current_state.get("graph_critique", "No critique available")
+            graph_builder_prompt = current_state.get("learned_prompt_graph_builder", "")
+            if not graph_builder_prompt:
+                from parameters import base_prompt_graph_builder
+                graph_builder_prompt = base_prompt_graph_builder
 
-            if not graph_builder_prompt or not corpus_sample or not graph_description:
-                self.logger.warning(f"Missing data for graph builder critique: graph_builder_prompt={bool(graph_builder_prompt)}, corpus_sample={bool(corpus_sample)}, graph_description={bool(graph_description)}")
-                return
+            # Get previous critique (from graph)
+            previous_critique = current_state.get("graph_critique", "")
 
-            # Call LLM with graph_extraction_prompt_gradient_prompt
+            # Get response evaluator output
+            eval_resp = all_evaluation_responses[0]
+            response_evaluator_output = f"Reasoning: {eval_resp.get('evaluation_reasoning', '')}\nCritique: {eval_resp.get('evaluation_feedback', '')}\nContinue: {eval_resp.get('continue_optimization', False)}"
+
+            # Format prompt with new structure
             prompt_content = self.graph_extraction_prompt_gradient_prompt.format(
-                graph_builder_prompt, corpus_sample, graph_description, graph_critique
+                current_prompt=graph_builder_prompt,
+                previous_critique=previous_critique,
+                response_evaluator_output=response_evaluator_output
             )
 
-            critique = await self._call_llm(prompt_content, ctx)
+            # Call LLM with structured output
+            from parameters import PromptCritiqueResponse
+            critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+
+            # Implement skip logic
+            if not critique_response.problem_in_this_component:
+                current_state["graph_builder_agent_critique"] = "No critique provided"
+                self.logger.info("Graph builder prompt: No problem detected, skipping optimization")
+                return
+
+            # Problem detected
+            critique = critique_response.critique
             current_state["graph_builder_agent_critique"] = critique
 
-            # Generate optimized prompt using the critique
+            # Generate optimized prompt
             optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
             optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
-            # Store the optimized graph builder prompt for use in graph refinement
-            # Limit prompt length to prevent truncation and LLM failures
-            MAX_PROMPT_LENGTH = 4000  # characters
+            MAX_PROMPT_LENGTH = 4000
             if len(optimized_prompt) > MAX_PROMPT_LENGTH:
-                self.logger.warning(f"Optimized graph builder prompt too long ({len(optimized_prompt)} chars), truncating to {MAX_PROMPT_LENGTH}")
+                self.logger.warning(f"Optimized graph builder prompt too long ({len(optimized_prompt)} chars), truncating")
                 optimized_prompt = optimized_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
 
             is_frozen = self._is_prompt_frozen("graph_builder", current_state)
             if not is_frozen:
                 current_state["learned_prompt_graph_builder"] = optimized_prompt
-                self.logger.info(f"Stored optimized graph builder prompt ({len(optimized_prompt)} chars) for use in refinement mode")
-            else:
-                self.logger.info("Graph builder prompt is frozen - not updating learned_prompt_graph_builder")
 
         else:
             # Subsequent iterations: optimize graph refinement prompt
             self.logger.info(f"Generating graph refinement critique - iteration {current_repetition}")
 
-            graph_refinement_prompt = current_state.get("graph_refinement_prompt", "")
-            corpus_sample = current_state.get("full_document_text", batch_info.get("document_text", ""))[:500]
-            graph_description = current_state.get("graph_description", "")
-            graph_critique = current_state.get("graph_critique", "No critique available")
+            graph_refinement_prompt = current_state.get("learned_prompt_graph_refinement", "")
+            if not graph_refinement_prompt:
+                from parameters import base_prompt_graph_refinement
+                graph_refinement_prompt = base_prompt_graph_refinement
 
-            if not graph_refinement_prompt or not corpus_sample or not graph_description:
-                self.logger.warning(f"Missing data for graph refinement critique: graph_refinement_prompt={bool(graph_refinement_prompt)}, corpus_sample={bool(corpus_sample)}, graph_description={bool(graph_description)}")
-                return
+            # Get previous critique (from graph)
+            previous_critique = current_state.get("graph_critique", "")
 
-            # For refinement, we use the same gradient prompt format but focus on refinement
+            # Get response evaluator output
+            eval_resp = all_evaluation_responses[0]
+            response_evaluator_output = f"Reasoning: {eval_resp.get('evaluation_reasoning', '')}\nCritique: {eval_resp.get('evaluation_feedback', '')}\nContinue: {eval_resp.get('continue_optimization', False)}"
+
+            # Format prompt with new structure
             prompt_content = self.graph_extraction_prompt_gradient_prompt.format(
-                graph_refinement_prompt, corpus_sample, graph_description, graph_critique
+                current_prompt=graph_refinement_prompt,
+                previous_critique=previous_critique,
+                response_evaluator_output=response_evaluator_output
             )
 
-            critique = await self._call_llm(prompt_content, ctx)
+            # Call LLM with structured output
+            from parameters import PromptCritiqueResponse
+            critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+
+            # Implement skip logic
+            if not critique_response.problem_in_this_component:
+                current_state["graph_refinement_agent_critique"] = "No critique provided"
+                self.logger.info("Graph refinement prompt: No problem detected, skipping optimization")
+                return
+
+            # Problem detected
+            critique = critique_response.critique
             current_state["graph_refinement_agent_critique"] = critique
 
-            # Generate optimized refinement prompt using the critique
+            # Generate optimized refinement prompt
             optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
             optimized_refinement_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
-            # Update the refinement prompt (this IS optimized in backward pass)
-            # Limit prompt length to prevent truncation and LLM failures
-            MAX_PROMPT_LENGTH = 4000  # characters
+            MAX_PROMPT_LENGTH = 4000
             if len(optimized_refinement_prompt) > MAX_PROMPT_LENGTH:
-                self.logger.warning(f"Optimized refinement prompt too long ({len(optimized_refinement_prompt)} chars), truncating to {MAX_PROMPT_LENGTH}")
+                self.logger.warning(f"Optimized refinement prompt too long ({len(optimized_refinement_prompt)} chars), truncating")
                 optimized_refinement_prompt = optimized_refinement_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
 
             is_frozen = self._is_prompt_frozen("graph_refinement", current_state)
             if not is_frozen:
                 current_state["learned_prompt_graph_refinement"] = optimized_refinement_prompt
-                self.logger.info(f"Stored optimized refinement prompt ({len(optimized_refinement_prompt)} chars)")
 
             log_critique_result(self.logger, "graph_refinement", critique, is_frozen)
 
     async def _generate_hyperparameters_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for hyperparameters agent."""
+        """Generate critique for hyperparameters agent prompt (with skip logic)."""
         self.logger.info("Generating hyperparameters critique")
 
-        rag_hyperparams = current_state.get("rag_hyperparameters", {})
-        chunk_size = rag_hyperparams.get("chunk_size", "Not specified")
+        all_evaluation_responses = current_state.get("response_evaluations", [])
 
-        batch_info = current_state.get("batch_information", {})
-        corpus_sample = current_state.get("full_document_text", batch_info.get("document_text", ""))[:500]  # Sample of corpus
-        graph_description = current_state.get("graph_description", "")
-        graph_critique = current_state.get("graph_critique", "No critique available")
-
-        if not corpus_sample or not graph_description:
-            self.logger.warning(f"Missing data for hyperparameters critique: corpus_sample={bool(corpus_sample)}, graph_description={bool(graph_description)}")
+        if not all_evaluation_responses:
+            self.logger.warning("No evaluation data available - skipping hyperparameters critique")
+            current_state["hyperparameters_graph_agent_critique"] = "No critique provided"
             return
 
-        # Call LLM with rag_hyperparameters_agent_gradient_prompt
+        # Get the current hyperparameters prompt
+        current_hyperparameters_prompt = current_state.get("learned_prompt_hyperparameters_graph", "")
+        if not current_hyperparameters_prompt:
+            from parameters import base_prompt_hyperparameters_graph
+            current_hyperparameters_prompt = base_prompt_hyperparameters_graph
+
+        # Get previous critique (from graph builder or graph refinement)
+        previous_critique = current_state.get("graph_builder_agent_critique", "") or current_state.get("graph_refinement_agent_critique", "")
+
+        # Get response evaluator output (all iterations)
+        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
+
+        # Format prompt with new structure
         prompt_content = self.rag_hyperparameters_agent_gradient_prompt.format(
-            chunk_size, corpus_sample, graph_description, graph_critique
+            current_prompt=current_hyperparameters_prompt,
+            previous_critique=previous_critique,
+            response_evaluator_output=response_evaluator_output
         )
 
-        critique = await self._call_llm(prompt_content, ctx)
+        # Call LLM with structured output
+        from parameters import PromptCritiqueResponse
+        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+
+        # Implement skip logic
+        if not critique_response.problem_in_this_component:
+            current_state["hyperparameters_graph_agent_critique"] = "No critique provided"
+            self.logger.info("Hyperparameters prompt: No problem detected, skipping optimization")
+            return
+
+        # Problem detected - store critique and optimize
+        critique = critique_response.critique
         current_state["hyperparameters_graph_agent_critique"] = critique
 
         # Generate optimized prompt using the critique
@@ -4220,52 +4386,52 @@ class BackwardPassAgent(RoutedAgent):
         log_critique_result(self.logger, "hyperparameters_graph", critique, is_frozen)
 
     async def _generate_community_summarizer_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for community summarizer based on retrieved content critique."""
-        self.logger.info("=" * 80)
-        self.logger.info("COMMUNITY SUMMARIZER CRITIQUE - Starting")
-        self.logger.info("=" * 80)
+        """Generate critique for community summarizer prompt (with skip logic)."""
+        self.logger.info("Generating community summarizer critique")
 
-        # Get community summaries from shared state (sample)
-        community_summaries = current_state.get("community_summaries", {})
-        self.logger.info(f"Community summaries in state: {len(community_summaries)} summaries found")
+        all_evaluation_responses = current_state.get("response_evaluations", [])
 
-        if not community_summaries:
-            self.logger.warning("⚠️ No community summaries found in state, skipping community summarizer critique")
-            self.logger.info(f"State keys available: {list(current_state.keys())}")
+        if not all_evaluation_responses:
+            self.logger.warning("No evaluation data available - skipping community summarizer critique")
+            current_state["community_summarizer_critique"] = "No critique provided"
             return
 
-        # Get a sample of community summaries (first 3)
-        sample_summaries = []
-        for comm_id, summary in list(community_summaries.items())[:3]:
-            sample_summaries.append(f"Community {comm_id}:\n{summary}")
-            self.logger.info(f"Sampled community {comm_id} (length: {len(summary)} chars)")
+        # Get the current community summarizer prompt
+        current_summarizer_prompt = current_state.get("learned_prompt_community_summarizer", "")
+        if not current_summarizer_prompt:
+            from parameters import base_prompt_community_summarizer
+            current_summarizer_prompt = base_prompt_community_summarizer
 
-        community_summaries_text = "\n\n".join(sample_summaries)
-        self.logger.info(f"Total sampled text length: {len(community_summaries_text)} chars")
+        # Get previous critique (from retrieved content)
+        previous_critique = current_state.get("retrieved_content_critique", "")
 
-        # Get retrieved content critique (which critiques the community summaries)
-        retrieved_content_critique = current_state.get("retrieved_content_critique", "No critique available")
-        self.logger.info(f"Retrieved content critique length: {len(retrieved_content_critique)} chars")
+        # Get response evaluator output (all iterations)
+        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
 
-        if not community_summaries_text:
-            self.logger.warning("⚠️ No community summary samples available for critique (empty text)")
-            return
-
-        # Call LLM with community_summarizer_gradient_prompt
-        self.logger.info("Calling LLM for community summarizer critique...")
+        # Format prompt with new structure
         prompt_content = self.community_summarizer_gradient_prompt.format(
-            community_summaries_text, retrieved_content_critique
+            current_prompt=current_summarizer_prompt,
+            previous_critique=previous_critique,
+            response_evaluator_output=response_evaluator_output
         )
 
-        critique = await self._call_llm(prompt_content, ctx)
+        # Call LLM with structured output
+        from parameters import PromptCritiqueResponse
+        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+
+        # Implement skip logic
+        if not critique_response.problem_in_this_component:
+            current_state["community_summarizer_critique"] = "No critique provided"
+            self.logger.info("Community summarizer prompt: No problem detected, skipping optimization")
+            return
+
+        # Problem detected - store critique and optimize
+        critique = critique_response.critique
         current_state["community_summarizer_critique"] = critique
-        self.logger.info(f"✓ Generated critique (length: {len(critique)} chars)")
 
         # Generate optimized prompt using the critique
-        self.logger.info("Calling LLM for prompt optimization...")
         optimizer_prompt = self.community_summarizer_prompt_optimizer.format(critique)
         optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
-        self.logger.info(f"✓ Generated optimized prompt (length: {len(optimized_prompt)} chars)")
 
         # Limit prompt length to prevent truncation
         MAX_PROMPT_LENGTH = 4000
@@ -4277,14 +4443,9 @@ class BackwardPassAgent(RoutedAgent):
         is_frozen = self._is_prompt_frozen("community_summarizer", current_state)
         if not is_frozen:
             current_state["learned_prompt_community_summarizer"] = optimized_prompt
-            self.logger.info(f"✓ Stored optimized community summarizer prompt ({len(optimized_prompt)} chars)")
-        else:
-            self.logger.info("⚠️ Community summarizer prompt is frozen, not updating")
+            self.logger.info(f"Stored optimized community summarizer prompt ({len(optimized_prompt)} chars)")
 
         log_critique_result(self.logger, "community_summarizer", critique, is_frozen)
-        self.logger.info("=" * 80)
-        self.logger.info("COMMUNITY SUMMARIZER CRITIQUE - Completed")
-        self.logger.info("=" * 80)
 
     def _is_prompt_frozen(self, prompt_type: str, current_state: Dict[str, Any]) -> bool:
         """Check if a prompt type is frozen."""
@@ -4332,6 +4493,58 @@ class BackwardPassAgent(RoutedAgent):
         except Exception as e:
             self.logger.error(f"Error calling LLM: {e}")
             return f"Error generating critique: {e}"
+
+    async def _call_llm_structured(self, prompt_content: str, ctx: MessageContext, response_format, interaction_type: str = "critique", batch_id: int = None, user_prompt: str = "Please provide your critique."):
+        """Helper method to call LLM with structured output (Pydantic response format)."""
+        try:
+            # Create a temporary client with the response format
+            structured_client = OpenAIChatCompletionClient(
+                model="gemini-2.5-flash-lite",
+                max_tokens=512,
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                api_key=llm_keys.GEMINI_KEY,
+                model_info={
+                    "vision": False,
+                    "function_calling": True,
+                    "json_output": True,
+                    "family": "unknown",
+                    "structured_output": True,
+                },
+                response_format=response_format
+            )
+
+            system_message = SystemMessage(content=prompt_content)
+            user_message = UserMessage(content=user_prompt, source="system")
+
+            response = await structured_client.create(
+                [system_message, user_message],
+                cancellation_token=ctx.cancellation_token
+            )
+
+            # Parse structured response
+            assert isinstance(response.content, str)
+            parsed_response = response_format.model_validate_json(response.content)
+
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            logger.log_interaction(
+                agent_name="BackwardPassAgent",
+                interaction_type=interaction_type,
+                system_prompt=prompt_content,
+                user_prompt=user_prompt,
+                llm_response=response.content,
+                batch_id=batch_id,
+                additional_metadata={
+                    "response_format": response_format.__name__,
+                    "prompt_length": len(prompt_content)
+                }
+            )
+
+            return parsed_response
+
+        except Exception as e:
+            self.logger.error(f"Error calling LLM with structured output: {e}")
+            raise
 
     async def close(self) -> None:
         """Close the model client."""

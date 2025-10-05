@@ -250,7 +250,9 @@ The query was:
 The response was:
 {generated_answer}
 
-First, assess whether the response is satisfactory. Don't demand perfection; "good enough" is acceptable. Be pragmatic in your evaluation.
+{previous_evaluations}
+
+First, assess whether the response is satisfactory. Don't demand perfection; "good enough" is acceptable. Be pragmatic in your evaluation. If there are previous evaluations, consider whether the response has improved over iterations.
 
 
 If the response needs improvement, provide a detailed explanation of how it can be improved and set "continue" to true. Remember: if information is missing, it means the pipeline failed to extract or retrieve it properly, so improvement is necessary.
@@ -259,25 +261,42 @@ Your response must include:
 1. "reasoning": Explain why you decided the response is satisfactory or needs improvement
 2. "continue": A boolean field (true if improvement needed, false if response is satisfactory)
 3. "critique": A critique explaining what needs improvement (can be empty if continue is false). 
-4. "missing_keywords": A list of important entities, relationships, concepts, or terms that are crucial to answer the query but are missing or have insufficient information in the current response. These keywords will be used to search for relevant text in the source document, so they should be simple, specific terms that actually appear in the text rather than descriptive phrases. (empty list if continue is false). 
+4. "missing_keywords": A list of important entities, relationships, concepts, or terms that are crucial to answer the query but are missing or have insufficient information in the current response. These keywords will be used to search for relevant text in the source document, so they should be simple, specific terms that actually appear in the text rather than descriptive phrases. (empty list if continue is false) (max 4-5 keywords)
 
 IMPORTANT GUIDELINES FOR missing_keywords:
-- Use SIMPLE TERMS that actually appear in the text (e.g., "Professor C", "workshop", "budget")
+
+WORD LIMIT: Each keyword must be 1-3 words MAXIMUM (preferably 1-2 words)
+- Single words are best (e.g., "budget", "workshop")
+- Person names can be 2-3 words (e.g., "Karl Von Mark", "John Smith")
+- Multi-word technical terms only if they're atomic concepts (e.g., "knowledge graph")
+
+DECOMPOSITION: If a concept requires multiple elements, split them into SEPARATE keywords
+- Instead of one complex phrase, use multiple simple keywords
+- BAD: "Karl Von Mark plan execution" → GOOD: ["Karl Von Mark", "plan", "execution"]
+- BAD: "meeting discussion about budget" → GOOD: ["meeting", "budget", "discussion"]
+- BAD: "collaboration between X and Y regarding Z" → GOOD: ["X", "Y", "Z", "collaboration"]
+
+SIMPLE TERMS that actually appear in the text:
+- Use terms exactly as they appear in the source (e.g., "Professor C", "workshop", "budget")
 - AVOID descriptive phrases (NOT "Professor C's statements about the workshop")
 - AVOID possessives and complex noun phrases (NOT "John's opinion on X")
 - For people: use just their name/title (e.g., "Professor C", "John Smith")
-- For concepts: use the core term (e.g., "budget allocation" → "budget", "allocation")
-- For relationships: use entity names separately (e.g., instead of "partnership between X and Y" → ["X", "Y", "partnership"])
+- For concepts: use the core term (e.g., "budget allocation" → ["budget", "allocation"])
+- For relationships: use entity names separately (e.g., "partnership between X and Y" → ["X", "Y", "partnership"])
 
 Examples of GOOD missing_keywords:
-- Simple entity names: "SmartKom", "John Smith", "Microsoft", "Professor C"
-- Simple concepts: "budget", "privacy", "workshop", "evaluation"
+- Simple entity names: "SmartKom", "John Smith", "Microsoft", "Professor C", "Karl Von Mark"
+- Simple concepts: "budget", "privacy", "workshop", "evaluation", "plan", "execution"
 - Simple relationship terms: "partnership", "collaboration", "manages"
 
 Examples of BAD missing_keywords (avoid these):
-- "Professor C's statements about the workshop" (too descriptive, use "Professor C" and "workshop" separately)
-- "John's opinion on the project" (too complex, use "John" and "project" and "opinion" separately)
-- "the connection between X and Y" (too descriptive, use "X", "Y", "connection" separately)
+- "Karl Von Mark plan execution" (too complex, use ["Karl Von Mark", "plan", "execution"])
+- "Professor C's statements about the workshop" (too descriptive, use ["Professor C", "workshop", "statements"])
+- "John's opinion on the project" (too complex, use ["John", "project", "opinion"])
+- "the connection between X and Y" (too descriptive, use ["X", "Y", "connection"])
+- "meeting discussion about budget" (too complex, use ["meeting", "budget", "discussion"])
+
+IMPORTANT: if the response acknowledges that the query cannot be addressed based on the information in the context, then this is a serious retrieval issue, so the response cannot be considered good and satisfactory.
 """
 
 
@@ -286,6 +305,20 @@ class ResponseEvaluationResponse(BaseModel):
     continue_optimization: bool = Field(alias="continue")
     critique: str
     missing_keywords: List[str] = Field(default_factory=list)
+
+
+# Pydantic models for prompt critique responses (with skip logic)
+class PromptCritiqueResponse(BaseModel):
+    """Response model for prompt critiques that can skip optimization."""
+    reasoning: str
+    problem_in_this_component: bool
+    critique: str = ""
+
+
+# Pydantic models for non-prompt critique responses (no skip logic)
+class ContentCritiqueResponse(BaseModel):
+    """Response model for content critiques (retrieved content, graph, retrieval plan)."""
+    critique: str
 
 
 base_prompt_community_summarizer = """
@@ -305,190 +338,221 @@ SUMMARY: [your detailed summary here]
 
 
 generation_prompt_gradient_prompt = """
-You are evaluating the prompt used for answer generation in a Graph RAG system during test-time training.
+You are evaluating the prompt used for answer generation in a GraphRAG system.
 
+Current answer generation prompt:
+{current_prompt}
 
-Here is the current example with prompt, answer, and feedback:
-{}
+Critique from the previous component:
+{previous_critique}
 
-Based on this single example, provide a detailed critique that will be used to improve the answer generation prompt. Focus on specific issues identified in the feedback and how the prompt could be modified to address them.
+Response evaluator output:
+{response_evaluator_output}
+
+Based on this information, determine if there is a problem with the answer generation prompt that needs to be fixed.
+
+First, provide your reasoning explaining why there is or isn't a problem.
+Then, set problem_in_this_component=true or false accordingly.
+If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If false, leave the critique empty.
 """
 
 generation_prompt_gradient_prompt_vector = """
-You are evaluating the prompt used for answer generation in a VectorRAG system during test-time training.
+You are evaluating the prompt used for answer generation in a VectorRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. Each chunk is embedded. An LLM agent refines the queries to retrieve the content. The context obtained is then passed to an LLM together with the query. The LLM generates an answer.
+Current answer generation prompt:
+{current_prompt}
 
-Here is the current example with system prompt, user prompt, query, answer, and feedback:
-{}
+Critique from the previous component:
+{previous_critique}
 
-Based on this single example, provide a detailed critique that will be used to improve the answer generation prompt. Focus on specific issues identified in the feedback and how the prompt could be modified to address them.
+Response evaluator output:
+{response_evaluator_output}
+
+Based on this information, determine if there is a problem with the answer generation prompt that needs to be fixed.
+
+If there IS a problem with this component, set problem_in_this_component=true and provide a detailed critique.
+If the problem is NOT in this component, set problem_in_this_component=false and leave the critique empty.
 """
 
 
 retrieved_content_gradient_prompt_graph = """
-You are evaluating the content retrieved by a GraphRAG system during test-time training.
+You are evaluating the content retrieved by a GraphRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text is split into chunks and graphs are extracted and merged. The merged graph undergoes community detection to identify clusters of related entities. Each community is summarized with a title and description using an LLM. For retrieval, an LLM agent is presented with all community titles and selects the most relevant communities to answer the query. The selected community summaries are then passed to an answer generation LLM.
+Retrieved content:
+{retrieved_content}
 
-Here is the current example with retrieved context, query, answer, and feedback:
-{}
+Critique from the previous component:
+{previous_critique}
 
-Based on these contents, provide a detailed critique of how the retrieved content can be improved.
+Response evaluator output:
+{response_evaluator_output}
+
+Based on this information, provide a SHORT and CONCISE critique (2-3 sentences max) of how the retrieved content can be improved.
 """
 
 retrieved_content_gradient_prompt_vector = """
-You are evaluating the content retrieved by a VectorRAG system during test-time training.
+You are evaluating the content retrieved by a VectorRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. Each chunk is embedded. An LLM agent refines the queries to retrieve the content. The context obtained is then passed to an LLM together with the query. The LLM generates an answer.
+Retrieved content:
+{retrieved_content}
 
-Here is the current example with retrieved context, query, answer, and feedback:
-{}
+Critique from the previous component:
+{previous_critique}
 
-Based on this single example, provide a detailed critique of how the retrieved content can be improved.
+Response evaluator output:
+{response_evaluator_output}
+
+Based on this information, provide a detailed critique of how the retrieved content can be improved.
 """
 
 
 retrieval_plan_gradient_prompt_graph = """
 You are evaluating the community selection made by an agentic community-based GraphRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text is split into chunks and graphs are extracted and merged. The merged graph undergoes community detection to identify clusters of related entities. Each community is summarized with a title and description using an LLM. For retrieval, an LLM agent is presented with all community titles and selects the most relevant communities to answer the query. The selected community summaries are then passed to an answer generation LLM.
+Community selection (retrieval plan):
+{retrieval_plan}
 
-Here are some examples of community selections, with the retrieved community summaries:
-{}
+Critique from the previous component:
+{previous_critique}
 
-The critique on the retrieved content was:
-{}
+Response evaluator output:
+{response_evaluator_output}
 
-Based on these contents, provide a detailed critique of how the community selection can be improved.
+Based on this information, provide a SHORT and CONCISE critique (2-3 sentences max) of how the community selection can be improved.
 """
 
 
 retrieval_plan_gradient_prompt_vector = """
-You are evaluating the retrieval plan made by an agentic VectorRAG system during test-time training.
+You are evaluating the retrieval plan made by an agentic VectorRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. Each chunk is embedded. An LLM agent refines the queries to retrieve the content. The context obtained is then passed to an LLM together with the query. The LLM generates an answer.
+Retrieval plan:
+{retrieval_plan}
 
-Here is the current example with retrieval plan and retrieved content:
-{}
+Critique from the previous component:
+{previous_critique}
 
-The critique on the retrieved content was:
-{}
+Response evaluator output:
+{response_evaluator_output}
 
-Based on this single example, provide a detailed critique of how the retrieval plan can be improved.
+Based on this information, provide a detailed critique of how the retrieval plan can be improved.
 """
 
 
 retrieval_planning_prompt_gradient_prompt = """
 You are evaluating the prompt used for community selection in an agentic community-based GraphRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text is split into chunks and graphs are extracted and merged. The merged graph undergoes community detection to identify clusters of related entities. Each community is summarized with a title and description using an LLM. For retrieval, an LLM agent is presented with all community titles and selects the most relevant communities to answer the query. The selected community summaries are then passed to an answer generation LLM.
+Current retrieval planning prompt:
+{current_prompt}
 
-These are the community selection prompt and a high-level description of the available communities, with the community selections made:
-{}
+Critique from the previous component:
+{previous_critique}
 
-The critique on the community selections was:
-{}
+Response evaluator output:
+{response_evaluator_output}
 
-Based on these contents, provide a detailed critique that will be used to improve the community selection prompt.  
+Based on this information, determine if there is a problem with the retrieval planning prompt that needs to be fixed.
+
+First, provide your reasoning explaining why there is or isn't a problem.
+Then, set problem_in_this_component=true or false accordingly.
+If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If false, leave the critique empty.
 """
 
 
 retrieval_planning_prompt_gradient_vector = """
-You are evaluating the prompt used for retrieval planning in an agentic GraphRAG system. 
+You are evaluating the prompt used for retrieval planning in an agentic VectorRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. Each chunk is embedded. An LLM agent refines the queries to retrieve the content. The context obtained is then passed to an LLM together with the query. The LLM generates an answer.
+Current retrieval planning prompt:
+{current_prompt}
 
-These are the retrieval planning prompt, with the retrieval plans generated:
-{}
+Critique from the previous component:
+{previous_critique}
 
-The critique on the retrieval plans was:
-{}
+Response evaluator output:
+{response_evaluator_output}
 
-Based on these contents, provide a detailed critique that will be used to improve the retrieval planning prompt.  
+Based on this information, determine if there is a problem with the retrieval planning prompt that needs to be fixed.
+
+If there IS a problem with this component, set problem_in_this_component=true and provide a detailed critique.
+If the problem is NOT in this component, set problem_in_this_component=false and leave the critique empty.
 """
 
 
 graph_gradient_prompt = """
-You are evaluating a graph that has been automatically built for a GraphRAG system. 
+You are evaluating a graph that has been automatically built for a GraphRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text is split into chunks and graphs are extracted and merged. The merged graph undergoes community detection to identify clusters of related entities. Each community is summarized with a title and description using an LLM. For retrieval, an LLM agent is presented with all community titles and selects the most relevant communities to answer the query. The selected community summaries are then passed to an answer generation LLM.
+Graph description:
+{graph_description}
 
-Here are the queries, the graph and the retrieval plans generated by the agent. 
-{}
+Critique from the previous component:
+{previous_critique}
 
-The critique on the retrieval plans was:
-{}
+Response evaluator output:
+{response_evaluator_output}
 
-Based on these contents, provide a detailed critique of how the graph can be improved. 
+Based on this information, provide a SHORT and CONCISE critique (2-3 sentences max) of how the graph can be improved.
 """
 
 
 graph_extraction_prompt_gradient_prompt = """
-You are evaluating the prompt used for graph construction in an agentic GraphRAG system. 
+You are evaluating the prompt used for graph construction in an agentic GraphRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text is split into chunks and graphs are extracted and merged. The merged graph undergoes community detection to identify clusters of related entities. Each community is summarized with a title and description using an LLM. For retrieval, an LLM agent is presented with all community titles and selects the most relevant communities to answer the query. The selected community summaries are then passed to an answer generation LLM.
+Current graph extraction prompt:
+{current_prompt}
 
-The prompt was the following:
-{}
+Critique from the previous component:
+{previous_critique}
 
-A sample from the corpus used to build the graph is the following:
-{}
+Response evaluator output:
+{response_evaluator_output}
 
-A high-level description of the obtained graph was the following:
-{}
+Based on this information, determine if there is a problem with the graph extraction prompt that needs to be fixed.
 
-The critique on the graph was: 
-{}
-
-Based on these contents, provide a detailed critique that will be used to improve the graph construction prompt. 
+First, provide your reasoning explaining why there is or isn't a problem.
+Then, set problem_in_this_component=true or false accordingly.
+If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If false, leave the critique empty.
 """
 
 
 rag_hyperparameters_agent_gradient_prompt = """
-You are evaluating the choice of the chunk size for a GraphRAG system. 
+You are evaluating the prompt used for hyperparameter (chunk size) selection in a GraphRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text is split into chunks and graphs are extracted and merged. The merged graph undergoes community detection to identify clusters of related entities. Each community is summarized with a title and description using an LLM. For retrieval, an LLM agent is presented with all community titles and selects the most relevant communities to answer the query. The selected community summaries are then passed to an answer generation LLM.
+Current hyperparameters selection prompt:
+{current_prompt}
 
-The chosen chunk size is the following:
-{}
+Critique from the previous component:
+{previous_critique}
 
-A sample from the corpus used to build the graph is the following:
-{}
+Response evaluator output:
+{response_evaluator_output}
 
-A high-level description of the obtained graph was the following:
-{}
+Based on this information, determine if there is a problem with the hyperparameters selection prompt that needs to be fixed.
 
-The critique on the graph was:
-{}
-
-Based on these contents, provide a detailed critique of how the chunk size can be improved. 
+First, provide your reasoning explaining why there is or isn't a problem.
+Then, set problem_in_this_component=true or false accordingly.
+If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If false, leave the critique empty.
 """
 
 
 rag_hyperparameters_agent_gradient_vector = """
-You are evaluating the choice of the chunk size for a VectorRAG system during test-time training.
+You are evaluating the prompt used for hyperparameter (chunk size) selection in a VectorRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text (where the information is located) is split into chunks based on the chosen chunk size. Each chunk is embedded. An LLM agent refines the queries to retrieve the content. The context obtained is then passed to an LLM together with the query. The LLM generates an answer.
+Current hyperparameters selection prompt:
+{current_prompt}
 
-The chosen chunk size for this example was:
-{}
+Critique from the previous component:
+{previous_critique}
 
-Here is the current example with query, retrieval prompt, and retrieval plan generated by the agent:
-{}
+Response evaluator output:
+{response_evaluator_output}
 
-Based on this single example, provide a detailed critique of how the chunk size can be improved.
+Based on this information, determine if there is a problem with the hyperparameters selection prompt that needs to be fixed.
+
+If there IS a problem with this component, set problem_in_this_component=true and provide a detailed critique.
+If the problem is NOT in this component, set problem_in_this_component=false and leave the critique empty.
 """
 
 answer_generation_prompt_optimizer = """
@@ -536,24 +600,23 @@ Provide only the optimized system prompt without additional commentary.
 """
 
 community_summarizer_gradient_prompt = """
-You are evaluating the community summarization process in a GraphRAG system.
+You are evaluating the prompt used for community summarization in a GraphRAG system.
 
-The system works this way:
-The system starts from an input text and a fixed query. An LLM selects the hyperparameters (chunk size). The input text is split into chunks and graphs are extracted and merged. The merged graph undergoes community detection to identify clusters of related entities. Each community is summarized with a title and description using an LLM. For retrieval, an LLM agent is presented with all community titles and selects the most relevant communities to answer the query. The selected community summaries are then passed to an answer generation LLM.
+Current community summarization prompt:
+{current_prompt}
 
-These are sample community summaries that were generated:
-{}
+Critique from the previous component:
+{previous_critique}
 
-The critique on the retrieved content (which consists of the community summaries) was:
-{}
+Response evaluator output:
+{response_evaluator_output}
 
-Based on these contents, provide a detailed critique of the community summarization process. Focus on:
-1. Whether the summaries capture the key entities and relationships effectively
-2. Whether the summaries provide sufficient detail for answering queries
-3. Whether the summaries are concise yet informative
-4. How the summarization could be improved to better support answer generation
+Based on this information, determine if there is a problem with the community summarization prompt that needs to be fixed.
 
-Provide a detailed critique that will be used to improve the community summarization prompt.
+First, provide your reasoning explaining why there is or isn't a problem.
+Then, set problem_in_this_component=true or false accordingly.
+If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If false, leave the critique empty.
 """
 
 community_summarizer_prompt_optimizer = """

@@ -282,6 +282,9 @@ class SharedState:
         # Preserve missing keywords from previous iteration's evaluation for focused refinement
         new_state["missing_keywords_for_refinement"] = current_state.get("missing_keywords_for_refinement", [])
 
+        # Preserve all response evaluations from previous iterations
+        new_state["response_evaluations"] = current_state.get("response_evaluations", [])
+
         # Preserve continue_optimization flags for all QA pairs
         for key, value in current_state.items():
             if key.startswith("continue_optimization_"):
