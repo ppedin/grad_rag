@@ -8,7 +8,8 @@
       "Bash(findstr:*)",
       "Bash(cat:*)",
       "Bash(awk:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(timeout:*)"
     ],
     "deny": [],
     "ask": []

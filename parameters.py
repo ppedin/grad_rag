@@ -138,7 +138,7 @@ class GraphRefinementResponse(BaseModel):
 
 base_prompt_graph_retrieval_planner = """
 You are an agentic retrieval component of a community-based GraphRAG system. Your goal is to select the most relevant communities from the knowledge graph to answer the following query: {}.
-You can select more than one community. 
+You can select more than one community.
 
 Available Communities:
 {}
@@ -198,7 +198,7 @@ class FindHubNodesCall(BaseModel):
 
 class GraphRetrievalPlannerResponse(BaseModel):
     model_config = {"extra": "forbid"}
-    selected_communities: List[int]  # List of community IDs to retrieve
+    selected_communities: List[str]  # List of community IDs to retrieve (e.g., "L0_1", "L1_2")
     reasoning: str  # Explanation of the community selection
 
 class VectorRetrievalPlannerResponse(BaseModel):
@@ -265,7 +265,7 @@ Your response must include:
 
 IMPORTANT GUIDELINES FOR missing_keywords:
 
-WORD LIMIT: Each keyword must be 1-3 words MAXIMUM (preferably 1-2 words)
+WORD LIMIT: Each keyword must be 1-2 words MAXIMUM
 - Single words are best (e.g., "budget", "workshop")
 - Person names can be 2-3 words (e.g., "Karl Von Mark", "John Smith")
 - Multi-word technical terms only if they're atomic concepts (e.g., "knowledge graph")

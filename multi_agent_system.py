@@ -6,6 +6,8 @@ Includes BatchOrchestratorAgent and HyperparametersGraphAgent.
 import json
 import logging
 import statistics
+import asyncio
+import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from pathlib import Path
@@ -114,6 +116,50 @@ __all__ = [
     'BatchOrchestratorAgent',
     'HyperparametersGraphAgent'
 ]
+
+
+# ===== RETRY HELPER =====
+
+async def retry_api_call_with_backoff(api_call_func, max_retries: int = 10, initial_delay: float = 2.0, max_delay: float = 60.0):
+    """
+    Retry an async API call with exponential backoff.
+
+    Args:
+        api_call_func: Async function to call
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds
+        max_delay: Maximum delay between retries in seconds
+
+    Returns:
+        The result of the API call
+
+    Raises:
+        The last exception if all retries fail
+    """
+    delay = initial_delay
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return await api_call_func()
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e)
+
+            # Check if it's a 503 overload error
+            is_overload = "503" in error_msg or "overloaded" in error_msg.lower() or "UNAVAILABLE" in error_msg
+
+            if is_overload and attempt < max_retries - 1:
+                logging.warning(f"API overload error (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                logging.warning(f"Retrying in {delay:.1f} seconds...")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)  # Exponential backoff with cap
+            else:
+                # Non-overload error or final attempt
+                raise
+
+    # If we get here, all retries failed
+    raise last_exception
 
 
 # ===== MESSAGE TYPES =====
@@ -2586,8 +2632,10 @@ class GraphBuilderAgent(RoutedAgent):
             name_to_id[entity.name] = node_id
 
         # Convert relationships to edges with iteration-based weighting
-        # Weight formula: iteration 0 -> weight 1, iteration 1 -> weight 2, etc.
-        edge_weight = iteration + 1
+        # Weight formula: log(iteration + 1) + 1 for less aggressive weighting
+        # iteration 0 -> weight 1.0, iteration 1 -> weight 1.69, iteration 2 -> weight 2.10, etc.
+        import math
+        edge_weight = math.log(iteration + 1) + 1
         rel_id_counter = 2000  # Start with high numbers to avoid conflicts
         for relationship in relationships:
             # Get node IDs for start and end nodes
@@ -2695,6 +2743,21 @@ class GraphBuilderAgent(RoutedAgent):
         """Process a single text chunk for graph refinement."""
         # Prepare the refinement prompt (no existing graph summary)
         user_prompt = self.base_prompt_graph_refinement.format(chunk)
+
+        # Add instruction to focus on entity/relationship types from system prompt
+        type_focus_instruction = (
+            "\n\n" + "=" * 80 + "\n"
+            "CRITICAL CONSTRAINT:\n"
+            "=" * 80 + "\n"
+            "Extract ONLY entities and relationships that are explicitly required by the system prompt.\n"
+            "- DO NOT extract any entity types not mentioned in the system prompt\n"
+            "- DO NOT extract any relationship types not mentioned in the system prompt\n"
+            "- DO NOT include any information that is not directly useful for satisfying the system prompt requirements\n"
+            "- If an entity or relationship does not fit the categories defined in the system prompt, SKIP it entirely\n"
+            "- Focus exclusively on what the system prompt asks for - nothing more, nothing less\n"
+            "=" * 80 + "\n"
+        )
+        user_prompt += type_focus_instruction
 
         # Create complete prompt with optional system message
         if learned_system_prompt:
@@ -3233,6 +3296,10 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                     message.query, titles_text
                 )
 
+                # Add format instruction to user prompt
+                format_instruction = "\n\nIMPORTANT: In the selected_communities field, provide ONLY the community IDs WITHOUT the 'Community ' prefix.\n- Correct format: [\"L0_3\", \"L1_2\", \"L0_5\"]\n- WRONG format: [\"Community L0_3\", \"Community L1_2\"]\nJust use the ID itself (e.g., \"L0_3\" NOT \"Community L0_3\")."
+                prompt_content = prompt_content + format_instruction
+
                 # Call LLM to select communities using learned system prompt
                 from autogen_core.models import SystemMessage, UserMessage
                 system_message = SystemMessage(content=learned_system_prompt)
@@ -3267,8 +3334,11 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 # Store the LLM response
                 retrieval_plan_responses.append(retrieval_response.reasoning)
 
+                # Clean up community IDs (remove "Community " prefix if present)
+                cleaned_ids = [cid.replace("Community ", "").strip() for cid in retrieval_response.selected_communities]
+
                 # Retrieve the selected communities
-                retrieved_context = await self._retrieve_selected_communities(retrieval_response.selected_communities)
+                retrieved_context = await self._retrieve_selected_communities(cleaned_ids)
 
                 self.logger.info(f"Selected communities: {retrieval_response.selected_communities}, context length: {len(retrieved_context)}")
 
@@ -3321,35 +3391,54 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 setting=message.setting
             )
 
-    async def _retrieve_selected_communities(self, community_ids: List[int]) -> str:
+    async def _retrieve_selected_communities(self, community_ids: List[str]) -> str:
         """Retrieve the specified communities by their IDs."""
         try:
             context_parts = []
             valid_communities = []
 
+            print(f"\n{'='*80}")
+            print(f"🔍 COMMUNITY RETRIEVAL DEBUG")
+            print(f"{'='*80}")
+            print(f"Attempting to retrieve {len(community_ids)} communities: {community_ids}")
+            print(f"Available communities in manager: {list(self.community_manager.community_summaries.keys())}")
+            print(f"{'='*80}\n")
+
             for community_id in community_ids:
                 # Check if community exists and has enough nodes
-                if (community_id in self.community_manager.community_summaries and
-                    community_id in self.community_manager.community_titles and
-                    len(self.community_manager.communities.get(community_id, [])) >= 3):
+                in_summaries = community_id in self.community_manager.community_summaries
+                in_titles = community_id in self.community_manager.community_titles
+                node_count = len(self.community_manager.communities.get(community_id, []))
 
+                print(f"  Community '{community_id}': in_summaries={in_summaries}, in_titles={in_titles}, nodes={node_count}")
+
+                if (in_summaries and in_titles and node_count >= 3):
                     summary = self.community_manager.community_summaries[community_id]
                     context_parts.append(summary)
                     valid_communities.append(community_id)
+                    print(f"  ✓ Community '{community_id}' RETRIEVED (summary length: {len(summary)} chars)")
                 else:
-                    self.logger.warning(f"Community {community_id} not found or has too few nodes")
+                    print(f"  ✗ Community '{community_id}' REJECTED - in_summaries={in_summaries}, in_titles={in_titles}, nodes={node_count}")
 
             # Format the retrieved context
+            print(f"\n{'='*80}")
             if context_parts:
                 result = "\n\n".join(context_parts)
-                self.logger.info(f"Retrieved {len(valid_communities)} communities (IDs: {valid_communities})")
+                print(f"✅ SUCCESSFULLY Retrieved {len(valid_communities)} communities: {valid_communities}")
+                print(f"   Total context length: {len(result)} chars")
+                print(f"{'='*80}\n")
                 return result
             else:
-                self.logger.warning("No valid communities could be retrieved")
+                print(f"❌ FAILED - No valid communities could be retrieved")
+                print(f"{'='*80}\n")
                 return "No valid communities found."
 
         except Exception as e:
-            self.logger.error(f"Error retrieving selected communities {community_ids}: {e}")
+            print(f"\n{'='*80}")
+            print(f"❌ ERROR retrieving selected communities {community_ids}: {e}")
+            print(f"{'='*80}\n")
+            import traceback
+            traceback.print_exc()
             return ""
 
     async def close(self) -> None:
@@ -3412,20 +3501,62 @@ class AnswerGeneratorAgent(RoutedAgent):
         else:
             learned_system_prompt = current_state.get("learned_prompt_answer_generator_graph", "")
 
-        # Prepare prompt with question and retrieved context (without critique)
+        # Get previous responses and evaluations for this QA pair
+        all_evaluation_responses = current_state.get("response_evaluations", [])
+
+        # Filter evaluations for this specific QA pair
+        qa_pair_evals = [
+            eval_resp for eval_resp in all_evaluation_responses
+            if eval_resp.get('qa_pair_id') == message.qa_pair_id
+        ]
+
+        # Format previous responses and evaluations
+        if qa_pair_evals:
+            previous_attempts_text = "\n\n" + "=" * 80 + "\n"
+            previous_attempts_text += "PREVIOUS ATTEMPTS FOR THIS QUESTION:\n"
+            previous_attempts_text += "=" * 80 + "\n\n"
+
+            for eval_resp in qa_pair_evals:
+                iter_num = eval_resp.get('repetition', 0)
+                generated_ans = eval_resp.get('generated_answer', 'N/A')
+                reasoning = eval_resp.get('evaluation_reasoning', 'N/A')
+                critique = eval_resp.get('evaluation_feedback', 'N/A')
+
+                previous_attempts_text += f"--- Iteration {iter_num} ---\n\n"
+                previous_attempts_text += f"Generated Answer:\n{generated_ans}\n\n"
+                previous_attempts_text += f"Evaluation Reasoning:\n{reasoning}\n\n"
+                previous_attempts_text += f"Critique and Suggestions:\n{critique}\n\n"
+                previous_attempts_text += "-" * 80 + "\n\n"
+
+            previous_attempts_text += "=" * 80 + "\n"
+            previous_attempts_text += "END OF PREVIOUS ATTEMPTS\n"
+            previous_attempts_text += "=" * 80 + "\n\n"
+        else:
+            previous_attempts_text = ""
+
+        # Prepare prompt with question and retrieved context
         prompt_content = self.base_prompt_answer_generator_graph.format(
             message.question, message.retrieved_context
-        ) 
+        )
+
+        # Append previous attempts to the prompt
+        if previous_attempts_text:
+            prompt_content += "\n\n" + previous_attempts_text
+            self.logger.info(f"Including {len(qa_pair_evals)} previous attempt(s) in answer generation prompt") 
 
         try:
             # Call LLM for answer generation using learned system prompt
             system_message = SystemMessage(content=learned_system_prompt)
             user_message = UserMessage(content=prompt_content, source="user")
 
-            response = await self.model_client.create(
-                [system_message, user_message],
-                cancellation_token=ctx.cancellation_token
-            )
+            # Use retry logic to handle API overload errors
+            async def api_call():
+                return await self.model_client.create(
+                    [system_message, user_message],
+                    cancellation_token=ctx.cancellation_token
+                )
+
+            response = await retry_api_call_with_backoff(api_call)
 
             # Get generated answer
             generated_answer = response.content if isinstance(response.content, str) else str(response.content)
@@ -3479,14 +3610,9 @@ class AnswerGeneratorAgent(RoutedAgent):
             return answer_ready_msg
 
         except Exception as e:
-            self.logger.error(f"Error in answer generation: {e}")
-            # Return default response on error
-            return AnswerGenerationReadyMessage(
-                qa_pair_id=message.qa_pair_id,
-                generated_answer="Error generating answer",
-                batch_id=message.batch_id,
-                repetition=message.repetition
-            )
+            self.logger.error(f"Error in answer generation after all retries: {e}")
+            # Raise exception to stop pipeline - don't continue with bad data
+            raise RuntimeError(f"Failed to generate answer for QA pair {message.qa_pair_id} after multiple retries: {e}")
 
     async def close(self) -> None:
         """Close the model client."""
@@ -3569,16 +3695,26 @@ class ResponseEvaluatorAgent(RoutedAgent):
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
         all_evaluation_responses = current_state.get("response_evaluations", [])
 
-        # Format previous evaluations for context
-        if all_evaluation_responses:
-            prev_evals_text = "\n\nPrevious evaluations for this query:\n"
-            for eval_resp in all_evaluation_responses:
+        # Filter previous evaluations for this specific QA pair only
+        qa_pair_evals = [
+            eval_resp for eval_resp in all_evaluation_responses
+            if eval_resp.get('qa_pair_id') == message.qa_pair_id
+        ]
+
+        # Format previous evaluations for context (with FULL answers, not truncated)
+        if qa_pair_evals:
+            prev_evals_text = "\n\n" + "=" * 80 + "\n"
+            prev_evals_text += "PREVIOUS EVALUATIONS FOR THIS QUERY:\n"
+            prev_evals_text += "=" * 80 + "\n"
+            for eval_resp in qa_pair_evals:
                 iter_num = eval_resp.get('repetition', 0)
-                prev_evals_text += f"\nIteration {iter_num}:\n"
-                prev_evals_text += f"  Answer: {eval_resp.get('generated_answer', 'N/A')[:200]}...\n"
-                prev_evals_text += f"  Reasoning: {eval_resp.get('evaluation_reasoning', 'N/A')}\n"
-                prev_evals_text += f"  Critique: {eval_resp.get('evaluation_feedback', 'N/A')}\n"
-                prev_evals_text += f"  Continue: {eval_resp.get('continue_optimization', False)}"
+                prev_evals_text += f"\n--- Iteration {iter_num} ---\n\n"
+                prev_evals_text += f"Generated Answer (FULL):\n{eval_resp.get('generated_answer', 'N/A')}\n\n"
+                prev_evals_text += f"Evaluation Reasoning:\n{eval_resp.get('evaluation_reasoning', 'N/A')}\n\n"
+                prev_evals_text += f"Critique:\n{eval_resp.get('evaluation_feedback', 'N/A')}\n\n"
+                prev_evals_text += f"Continue Optimization: {eval_resp.get('continue_optimization', False)}\n"
+                prev_evals_text += "-" * 80 + "\n"
+            prev_evals_text += "=" * 80 + "\n"
         else:
             prev_evals_text = ""
 
@@ -3592,7 +3728,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
 
         print(f"   Prompt prepared ({len(prompt_content)} chars)")
         if prev_evals_text:
-            print(f"   ✓ Including {len(all_evaluation_responses)} previous evaluation(s) in prompt")
+            print(f"   ✓ Including {len(qa_pair_evals)} previous evaluation(s) for this QA pair in prompt")
         else:
             print(f"   ℹ️  No previous evaluations (first iteration)")
 
@@ -3616,10 +3752,14 @@ class ResponseEvaluatorAgent(RoutedAgent):
             print("-" * 80)
             print("Calling LLM...")
 
-            response = await self.model_client.create(
-                [system_message, user_message],
-                cancellation_token=ctx.cancellation_token
-            )
+            # Use retry logic to handle API overload errors
+            async def api_call():
+                return await self.model_client.create(
+                    [system_message, user_message],
+                    cancellation_token=ctx.cancellation_token
+                )
+
+            response = await retry_api_call_with_backoff(api_call)
 
             print(f"LLM Response received ({len(response.content)} chars):")
             print(response.content)
@@ -3688,7 +3828,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
 
         except Exception as e:
             print("=" * 80)
-            print("RESPONSE EVALUATOR AGENT - ERROR")
+            print("RESPONSE EVALUATOR AGENT - ERROR AFTER ALL RETRIES")
             print("=" * 80)
             print(f"Error Type: {type(e).__name__}")
             print(f"Error Message: {e}")
@@ -3698,36 +3838,16 @@ class ResponseEvaluatorAgent(RoutedAgent):
             print("=" * 80)
 
             self.logger.error("=" * 80)
-            self.logger.error("RESPONSE EVALUATOR AGENT - ERROR")
+            self.logger.error("RESPONSE EVALUATOR AGENT - ERROR AFTER ALL RETRIES")
             self.logger.error("=" * 80)
             self.logger.error(f"Error Type: {type(e).__name__}")
             self.logger.error(f"Error Message: {e}")
             self.logger.error(f"Traceback:")
             self.logger.error(traceback.format_exc())
             self.logger.error("=" * 80)
-            # Create error response data
-            evaluation_data = {
-                "qa_pair_id": message.qa_pair_id,
-                "error": f"Evaluation failed: {e}",
-                "continue_optimization": True,  # Default to continue on error
-                "repetition": message.repetition,
-                "timestamp": datetime.now().isoformat()
-            }
 
-            # Store error result in shared state for BackwardPassAgent
-            current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-            response_evaluations = current_state.get("response_evaluations", [])
-            response_evaluations.append(evaluation_data)
-            current_state["response_evaluations"] = response_evaluations
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
-
-            return ResponseEvaluationReadyMessage(
-                qa_pair_id=message.qa_pair_id,
-                evaluation_result=evaluation_data,
-                continue_optimization=True,  # Default to continue on error
-                batch_id=message.batch_id,
-                repetition=message.repetition
-            )
+            # Raise exception to stop pipeline - don't continue with bad data
+            raise RuntimeError(f"Failed to evaluate response for QA pair {message.qa_pair_id} after multiple retries: {e}")
 
     async def close(self) -> None:
         """Close the model client."""
