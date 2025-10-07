@@ -15,18 +15,15 @@ Please, suggest an appropriate chunk size and provide the reasoning that led to 
 """
 
 base_prompt_hyperparameters_vector = """
-Your goal is to define the hyperparameters for a vector RAG architecture.
+Your goal is to define the hyperparameters for a Vector RAG architecture.
 You have to define a good chunk size. The chunk size must be in tokens. The chunk size must be only one (no variable chunk sizes).
-The system will split the input text based on the chunk size. For each split, an embedder will embed the split text (so the split text will be one point in the vector base).
+The system will split the input text based on the chunk size. For each split, an embedder will embed the split text (so the split text will be one point in the vector base). So, the chunk size determines the granularity of the embedded text chunks.
 
-Text: {text}
+Text to analyze: {text}
+
 Question: {question}
 
-Please, suggest an appropriate chunk size for this text and question.
-Use the following critique:
-{critique}
-
-Provide the reasoning that led to your response.
+Please, suggest an appropriate chunk size and provide the reasoning that led to your response.
 """
 
 
@@ -149,14 +146,23 @@ Provide the list of community IDs you want to retrieve and explain your reasonin
 """
 
 base_prompt_vector_retrieval_planner = """
-You are an agentic retrieval component of a RAG system. Your goal is to refine the query to retrieve relevant information from the knowledge base to answer the following query: {}.
+You are an agentic retrieval component of a RAG system. Your goal is to determine if you have enough information to answer the query, or if you need to retrieve more information.
+
+Query to answer: {}
+
+Current context from previous retrievals:
+{}
 
 Previous retrieval decisions in this session:
 {}
 
-IMPORTANT: Review the previous decisions above to avoid repeating the same queries. Choose a query that will retrieve complementary information to build upon what you have already gathered.
+First, provide your reasoning about whether the current context contains sufficient information to answer the query comprehensively.
 
-Choose a new query and provide the reasoning that led to your response.
+Then, set information_sufficient to true or false:
+- true: The current context contains enough information to provide a comprehensive answer
+- false: More information is needed from the knowledge base
+
+If information_sufficient is false, provide a new query that will retrieve complementary information. Make sure your new query is different from previous queries to gather new perspectives or details.
 """
 
 
@@ -203,8 +209,28 @@ class GraphRetrievalPlannerResponse(BaseModel):
 
 class VectorRetrievalPlannerResponse(BaseModel):
     model_config = {"extra": "forbid"}
-    query: str
     reasoning: str
+    information_sufficient: bool  # True if current context has enough info, False if more retrieval needed
+    query: str  # Only used if information_sufficient=False
+
+class RetrievalSummarizerResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+    reasoning: str
+    summary: str
+
+base_prompt_retrieval_summarizer_vector = """
+You are summarizing a retrieved document to help answer a query.
+
+Query: {query}
+
+Document:
+{document}
+
+Summarize this document, focusing on the information that is relevant for answering the query.
+
+First, provide your reasoning about what aspects of the document are most relevant.
+Then, provide a concise summary that captures the key information needed to answer the query.
+"""
 
 base_prompt_answer_generator_graph = """
 You will be given a query and the information retrieved from a graph.
@@ -366,13 +392,15 @@ Current answer generation prompt:
 Critique from the previous component:
 {previous_critique}
 
-Response evaluator output:
-{response_evaluator_output}
+History of generated responses and critiques for this QA pair:
+{response_critique_history}
 
 Based on this information, determine if there is a problem with the answer generation prompt that needs to be fixed.
 
-If there IS a problem with this component, set problem_in_this_component=true and provide a detailed critique.
-If the problem is NOT in this component, set problem_in_this_component=false and leave the critique empty.
+First, provide your reasoning explaining why there is or isn't a problem.
+Then, set problem_in_this_component=true or false accordingly.
+If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If false, leave the critique empty.
 """
 
 
@@ -400,8 +428,8 @@ Retrieved content:
 Critique from the previous component:
 {previous_critique}
 
-Response evaluator output:
-{response_evaluator_output}
+History of generated responses and critiques for this QA pair:
+{response_critique_history}
 
 Based on this information, provide a detailed critique of how the retrieved content can be improved.
 """
@@ -432,8 +460,8 @@ Retrieval plan:
 Critique from the previous component:
 {previous_critique}
 
-Response evaluator output:
-{response_evaluator_output}
+History of generated responses and critiques for this QA pair:
+{response_critique_history}
 
 Based on this information, provide a detailed critique of how the retrieval plan can be improved.
 """
@@ -469,13 +497,15 @@ Current retrieval planning prompt:
 Critique from the previous component:
 {previous_critique}
 
-Response evaluator output:
-{response_evaluator_output}
+History of generated responses and critiques for this QA pair:
+{response_critique_history}
 
 Based on this information, determine if there is a problem with the retrieval planning prompt that needs to be fixed.
 
-If there IS a problem with this component, set problem_in_this_component=true and provide a detailed critique.
-If the problem is NOT in this component, set problem_in_this_component=false and leave the critique empty.
+First, provide your reasoning explaining why there is or isn't a problem.
+Then, set problem_in_this_component=true or false accordingly.
+If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If false, leave the critique empty.
 """
 
 
@@ -538,21 +568,25 @@ If false, leave the critique empty.
 
 
 rag_hyperparameters_agent_gradient_vector = """
-You are evaluating the prompt used for hyperparameter (chunk size) selection in a VectorRAG system.
+You are evaluating the hyperparameter (chunk size) selection in a VectorRAG system.
 
-Current hyperparameters selection prompt:
-{current_prompt}
+Current chunk size: {chunk_size}
+
+Examples of queries with retrieval prompts and plans:
+{concatenated_triplets}
 
 Critique from the previous component:
 {previous_critique}
 
-Response evaluator output:
-{response_evaluator_output}
+History of generated responses and critiques for this QA pair:
+{response_critique_history}
 
-Based on this information, determine if there is a problem with the hyperparameters selection prompt that needs to be fixed.
+Based on this information, determine if there is a problem with the chunk size selection that needs to be fixed.
 
-If there IS a problem with this component, set problem_in_this_component=true and provide a detailed critique.
-If the problem is NOT in this component, set problem_in_this_component=false and leave the critique empty.
+First, provide your reasoning explaining why there is or isn't a problem.
+Then, set problem_in_this_component=true or false accordingly.
+If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue with the chunk size.
+If false, leave the critique empty.
 """
 
 answer_generation_prompt_optimizer = """
@@ -654,6 +688,37 @@ The current critique of the retrieval planning process is:
 {}
 
 Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better plan vector retrieval strategies. The system prompt should incorporate the feedback to improve query refinement, search strategy, and information gathering.
+
+Provide only the optimized system prompt without additional commentary.
+"""
+
+retrieval_summarizer_prompt_gradient_vector = """
+You are evaluating the prompt used for chunk summarization in a VectorRAG system. Each chunk of text is given to the summarizer that generates a summary.
+
+Current retrieval summarizer prompt:
+{current_prompt}
+
+Critique from the previous component:
+{previous_critique}
+
+History of generated responses and critiques for this QA pair:
+{response_critique_history}
+
+Based on this information, determine if there is a problem with the retrieval summarizer prompt that needs to be fixed.
+
+First, provide your reasoning explaining why there is or isn't a problem.
+Then, set problem_in_this_component=true or false accordingly.
+If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If false, leave the critique empty.
+"""
+
+retrieval_summarizer_prompt_optimizer_vector = """
+You are optimizing a system prompt for document summarization in a vector RAG system.
+
+The current critique of the retrieval summarization process is:
+{}
+
+Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better summarize retrieved documents. The system prompt should incorporate the feedback to improve summarization quality, relevance focus, and information extraction.
 
 Provide only the optimized system prompt without additional commentary.
 """
