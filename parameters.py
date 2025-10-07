@@ -392,8 +392,8 @@ Current answer generation prompt:
 Critique from the previous component:
 {previous_critique}
 
-History of generated responses and critiques for this QA pair:
-{response_critique_history}
+Response evaluator output:
+{response_evaluator_output}
 
 Based on this information, determine if there is a problem with the answer generation prompt that needs to be fixed.
 
@@ -422,16 +422,31 @@ Based on this information, provide a SHORT and CONCISE critique (2-3 sentences m
 retrieved_content_gradient_prompt_vector = """
 You are evaluating the content retrieved by a VectorRAG system.
 
-Retrieved content:
+═══════════════════════════════════════════════════════════════════
+QUERY TO ANSWER:
+═══════════════════════════════════════════════════════════════════
+{query}
+
+═══════════════════════════════════════════════════════════════════
+RETRIEVED CONTENT ACROSS ITERATIONS:
+═══════════════════════════════════════════════════════════════════
 {retrieved_content}
 
-Critique from the previous component:
+═══════════════════════════════════════════════════════════════════
+CRITIQUE FROM PREVIOUS COMPONENT (Answer Generation):
+═══════════════════════════════════════════════════════════════════
 {previous_critique}
 
-History of generated responses and critiques for this QA pair:
+═══════════════════════════════════════════════════════════════════
+DETAILED HISTORY (Question, Context, Answer, Evaluation per Iteration):
+═══════════════════════════════════════════════════════════════════
 {response_critique_history}
 
-Based on this information, provide a detailed critique of how the retrieved content can be improved.
+═══════════════════════════════════════════════════════════════════
+YOUR TASK:
+═══════════════════════════════════════════════════════════════════
+Based on the information above, provide a detailed critique of how the retrieved content can be improved to better answer the query.
+Focus on: relevance, completeness, quality, and whether the right information was retrieved.
 """
 
 
@@ -453,17 +468,36 @@ Based on this information, provide a SHORT and CONCISE critique (2-3 sentences m
 
 retrieval_plan_gradient_prompt_vector = """
 You are evaluating the retrieval plan made by an agentic VectorRAG system.
+The retrieval planner determines what queries to make to the vector database to gather relevant information.
 
-Retrieval plan:
+═══════════════════════════════════════════════════════════════════
+RETRIEVAL PLANS:
+═══════════════════════════════════════════════════════════════════
 {retrieval_plan}
 
-Critique from the previous component:
+═══════════════════════════════════════════════════════════════════
+CRITIQUE FROM PREVIOUS COMPONENT (Retrieval Summarizer):
+═══════════════════════════════════════════════════════════════════
 {previous_critique}
 
-History of generated responses and critiques for this QA pair:
+═══════════════════════════════════════════════════════════════════
+DETAILED HISTORY (Question, Context, Answer, Evaluation per Iteration):
+═══════════════════════════════════════════════════════════════════
 {response_critique_history}
 
-Based on this information, provide a detailed critique of how the retrieval plan can be improved.
+═══════════════════════════════════════════════════════════════════
+YOUR TASK:
+═══════════════════════════════════════════════════════════════════
+Based on the information above, provide a detailed critique of how the retrieval plan can be improved.
+
+The retrieval planner should:
+- Generate relevant, specific queries that target the information needed to answer the question
+- Avoid duplicate or redundant queries that retrieve similar information
+- Progressively refine queries based on what has already been retrieved
+- Know when sufficient information has been gathered (information_sufficient flag)
+- Cover different aspects of the question comprehensively
+
+Focus on: query relevance, query diversity, avoiding redundancy, and knowing when to stop retrieving.
 """
 
 
@@ -490,17 +524,34 @@ If false, leave the critique empty.
 
 retrieval_planning_prompt_gradient_vector = """
 You are evaluating the prompt used for retrieval planning in an agentic VectorRAG system.
+The retrieval planning prompt instructs the LLM how to decide whether to retrieve more information and what queries to make.
 
-Current retrieval planning prompt:
+═══════════════════════════════════════════════════════════════════
+CURRENT RETRIEVAL PLANNING PROMPT (System Prompt):
+═══════════════════════════════════════════════════════════════════
 {current_prompt}
 
-Critique from the previous component:
+═══════════════════════════════════════════════════════════════════
+CRITIQUE FROM PREVIOUS COMPONENT (Retrieval Plan):
+═══════════════════════════════════════════════════════════════════
 {previous_critique}
 
-History of generated responses and critiques for this QA pair:
+═══════════════════════════════════════════════════════════════════
+DETAILED HISTORY (Question, Context, Answer, Evaluation per Iteration):
+═══════════════════════════════════════════════════════════════════
 {response_critique_history}
 
-Based on this information, determine if there is a problem with the retrieval planning prompt that needs to be fixed.
+═══════════════════════════════════════════════════════════════════
+YOUR TASK:
+═══════════════════════════════════════════════════════════════════
+Based on the information above, determine if there is a problem with the retrieval planning prompt that needs to be fixed.
+
+The retrieval planning prompt should guide the model to:
+- Evaluate whether current context is sufficient to answer the question
+- Generate specific, targeted queries when more information is needed
+- Avoid redundant queries that retrieve similar information
+- Set the information_sufficient flag appropriately
+- Provide clear reasoning for its decisions
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.
@@ -693,18 +744,33 @@ Provide only the optimized system prompt without additional commentary.
 """
 
 retrieval_summarizer_prompt_gradient_vector = """
-You are evaluating the prompt used for chunk summarization in a VectorRAG system. Each chunk of text is given to the summarizer that generates a summary.
+You are evaluating the prompt used for chunk summarization in a VectorRAG system.
+Each retrieved chunk of text is processed by a summarizer that generates a summary based on the prompt below.
 
-Current retrieval summarizer prompt:
+═══════════════════════════════════════════════════════════════════
+CURRENT RETRIEVAL SUMMARIZER PROMPT (System Prompt):
+═══════════════════════════════════════════════════════════════════
 {current_prompt}
 
-Critique from the previous component:
+═══════════════════════════════════════════════════════════════════
+CRITIQUE FROM PREVIOUS COMPONENT (Retrieved Content):
+═══════════════════════════════════════════════════════════════════
 {previous_critique}
 
-History of generated responses and critiques for this QA pair:
+═══════════════════════════════════════════════════════════════════
+DETAILED HISTORY (Question, Context, Answer, Evaluation per Iteration):
+═══════════════════════════════════════════════════════════════════
 {response_critique_history}
 
-Based on this information, determine if there is a problem with the retrieval summarizer prompt that needs to be fixed.
+═══════════════════════════════════════════════════════════════════
+YOUR TASK:
+═══════════════════════════════════════════════════════════════════
+Based on the information above, determine if there is a problem with the retrieval summarizer prompt that needs to be fixed.
+
+The summarizer prompt should guide the model to:
+- Extract key information relevant to answering the query
+- Create concise but informative summaries
+- Maintain important details while removing noise
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.

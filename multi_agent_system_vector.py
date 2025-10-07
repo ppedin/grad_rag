@@ -108,6 +108,7 @@ class VectorReadyMessage(BaseModel):
     faiss_index_path: str
     chunk_metadata_path: str
     total_chunks: int = 0
+    index_reused: bool = False
 
 class VectorRetrievalStartMessage(BaseModel):
     batch_id: int
@@ -501,52 +502,20 @@ class BatchOrchestratorAgent(RoutedAgent):
         step_start_time = datetime.now()
 
         try:
-            # Step 1: Hyperparameters
-            self.logger.info(f"Step 1/5: Hyperparameters optimization for {qa_pair_id}")
+            # Fixed chunk size (300 words)
+            FIXED_CHUNK_SIZE = 300
 
-            step_agent_start = datetime.now()
-            try:
-                hyperparams_start_msg = HyperparametersVectorStartMessage(
-                    qa_pair_id=qa_pair_id,
-                    qa_pair=qa_pair,
-                    batch_id=original_message.batch_id,
-                    repetition=original_message.repetition,
-                    dataset=original_message.dataset,
-                    setting=original_message.setting
-                )
-
-                # Send to HyperparametersVectorAgent
-                hyperparams_agent_id = AgentId("hyperparameters_vector_agent", "default")
-                hyperparams_response = await self.send_message(hyperparams_start_msg, hyperparams_agent_id)
-
-                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
-
-                # Log intermediate output
-                intermediate_outputs["hyperparameters"] = {
-                    "chunk_size": getattr(hyperparams_response, 'chunk_size', 512),
-                    "processing_time_ms": step_execution_time,
-                    "learned_prompt_used": bool(getattr(hyperparams_response, 'learned_prompt', None))
-                }
-
-            except Exception as e:
-                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
-                intermediate_outputs["hyperparameters"] = {
-                    "error": str(e),
-                    "processing_time_ms": step_execution_time
-                }
-                raise
-
-            # Step 2: Vector Building
-            self.logger.info(f"Step 2/5: Vector building for {qa_pair_id}")
+            # Step 1: Vector Building (only on first iteration)
+            self.logger.info(f"Step 1/4: Vector building for {qa_pair_id}")
 
             step_agent_start = datetime.now()
             try:
                 current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
 
                 vector_start_msg = VectorStartMessage(
-                    batch_id=hyperparams_response.batch_id,
-                    repetition=hyperparams_response.repetition,
-                    chunk_size=hyperparams_response.chunk_size,
+                    batch_id=original_message.batch_id,
+                    repetition=original_message.repetition,
+                    chunk_size=FIXED_CHUNK_SIZE,
                     dataset=original_message.dataset,
                     setting=original_message.setting,
                     shared_state=current_state
@@ -559,11 +528,12 @@ class BatchOrchestratorAgent(RoutedAgent):
 
                 # Log intermediate output
                 intermediate_outputs["vector_building"] = {
-                    "chunk_size": hyperparams_response.chunk_size,
+                    "chunk_size": FIXED_CHUNK_SIZE,
                     "faiss_index_path": getattr(vector_response, 'faiss_index_path', 'N/A'),
                     "vectors_created": True,
                     "embedding_method": "openai",
-                    "processing_time_ms": step_execution_time
+                    "processing_time_ms": step_execution_time,
+                    "index_reused": getattr(vector_response, 'index_reused', False)
                 }
 
             except Exception as e:
@@ -575,8 +545,8 @@ class BatchOrchestratorAgent(RoutedAgent):
                 }
                 raise
 
-            # Step 3: Vector Retrieval
-            self.logger.info(f"Step 3/5: Vector retrieval for {qa_pair_id}")
+            # Step 2: Vector Retrieval
+            self.logger.info(f"Step 2/4: Vector retrieval for {qa_pair_id}")
             # Update shared state with FAISS index paths for retrieval
             current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
             current_state["faiss_index_path"] = vector_response.faiss_index_path
@@ -615,8 +585,8 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             self.shared_state.save_state(current_state, original_message.dataset, original_message.setting, original_message.batch_id)
 
-            # Step 4: Answer Generation
-            self.logger.info(f"Step 4/5: Answer generation for {qa_pair_id}")
+            # Step 3: Answer Generation
+            self.logger.info(f"Step 3/4: Answer generation for {qa_pair_id}")
             answer_gen_msg = AnswerGenerationStartMessage(
                 qa_pair_id=qa_pair_id,
                 question=qa_pair.get("question", ""),
@@ -637,8 +607,8 @@ class BatchOrchestratorAgent(RoutedAgent):
                 "generated_answer_length": len(answer_response.generated_answer)
             }
 
-            # Step 5: Evaluation
-            self.logger.info(f"Step 5/5: Evaluation for {qa_pair_id}")
+            # Step 4: Evaluation
+            self.logger.info(f"Step 4/4: Evaluation for {qa_pair_id}")
 
             # Create evaluation message (ROUGE score will be computed by ResponseEvaluatorAgent)
             # Debug: check qa_pair structure
@@ -682,7 +652,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Collect comprehensive vector statistics
             try:
                 comprehensive_vector_stats = {
-                    "chunk_size": hyperparams_response.chunk_size,
+                    "chunk_size": FIXED_CHUNK_SIZE,
                     "total_chunks": getattr(vector_response, 'total_chunks', 0),
                     "faiss_index_path": getattr(vector_response, 'faiss_index_path', ''),
                     "retrieved_context_length": len(retrieval_response.retrieved_context) if retrieval_response.retrieved_context else 0,
@@ -692,23 +662,11 @@ class BatchOrchestratorAgent(RoutedAgent):
                 self.logger.warning(f"Could not collect detailed vector statistics: {e}")
                 comprehensive_vector_stats = {"error": f"Stats collection failed: {e}"}
 
-            # Store evaluation results in shared state
-            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
-            response_evaluations = current_state.get("response_evaluations", [])
-            response_evaluations.append({
-                "qa_pair_id": qa_pair_id,
-                "iteration": iteration,
-                "question": qa_pair.get("question", ""),
-                "expected_answer": qa_pair.get("answer", ""),
-                "generated_answer": answer_response.generated_answer,
-                "evaluation": eval_response.evaluation_result,
-                "rouge_score": rouge_score,
-                "chunk_size": hyperparams_response.chunk_size,
-                "comprehensive_vector_statistics": comprehensive_vector_stats
-            })
-            current_state["response_evaluations"] = response_evaluations
+            # Note: ResponseEvaluatorAgent already stores evaluation results in response_evaluations
+            # with the proper format needed for backward pass. No need to duplicate here.
 
             # Store ROUGE scores for tracking
+            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
             rouge_scores = current_state.get("rouge_scores", [])
             rouge_scores.append(rouge_score)
             current_state["rouge_scores"] = rouge_scores
@@ -740,7 +698,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                     "rouge-1": rouge_score,  # Use same score for ROUGE-1 (simplified)
                     "rouge-2": rouge_score * 0.85  # Estimate ROUGE-2 as typically lower
                 },
-                hyperparameters={"chunk_size": hyperparams_response.chunk_size},
+                hyperparameters={"chunk_size": FIXED_CHUNK_SIZE},
                 additional_metrics=comprehensive_vector_stats,
                 retrieval_context=retrieval_response.retrieved_context,
                 execution_time_seconds=total_execution_time
@@ -757,7 +715,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                     "rouge-2": rouge_score * 0.85  # Estimate ROUGE-2 as typically lower
                 },
                 intermediate_outputs=intermediate_outputs,
-                hyperparameters={"chunk_size": hyperparams_response.chunk_size},
+                hyperparameters={"chunk_size": FIXED_CHUNK_SIZE},
                 execution_time_seconds=total_execution_time,
                 system_specific_metrics=comprehensive_vector_stats
             )
@@ -782,7 +740,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                     "retrieved_context": retrieval_response.retrieved_context,
                     "evaluation": eval_response.evaluation_result,
                     "rouge_score": rouge_score,
-                    "chunk_size": hyperparams_response.chunk_size
+                    "chunk_size": FIXED_CHUNK_SIZE
                 }
 
                 backward_pass_msg = BackwardPassStartMessage(
@@ -810,8 +768,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                 "retrieved_context": retrieval_response.retrieved_context,
                 "evaluation": eval_response.evaluation_result,
                 "rouge_score": rouge_score,
-                "chunk_size": hyperparams_response.chunk_size,
-                "hyperparams_response": hyperparams_response.model_dump() if hasattr(hyperparams_response, 'model_dump') else str(hyperparams_response),
+                "chunk_size": FIXED_CHUNK_SIZE,
                 "comprehensive_vector_statistics": comprehensive_vector_stats,
                 "vector_stats": {
                     "faiss_index_path": vector_response.faiss_index_path,
@@ -1169,14 +1126,11 @@ class BatchOrchestratorAgent(RoutedAgent):
         """Process evaluation response and track completion."""
         self.logger.info(f"Processing evaluation response for QA pair {eval_response.qa_pair_id}")
 
-        # Add to shared state
-        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, eval_response.batch_id)
-        response_evaluations = current_state.get("response_evaluations", [])
-        response_evaluations.append(eval_response.evaluation_result)
-        current_state["response_evaluations"] = response_evaluations
-        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, eval_response.batch_id)
+        # Note: ResponseEvaluatorAgent already stores evaluation results in response_evaluations
+        # with the proper structured format needed for backward pass. No need to duplicate here.
 
         # Mark QA pair as completed
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, eval_response.batch_id)
         self.completed_qa_pairs[eval_response.qa_pair_id] = eval_response.evaluation_result
 
         # Check if all QA pairs are completed
@@ -1576,12 +1530,36 @@ class VectorBuilderAgent(RoutedAgent):
 
     @message_handler
     async def handle_vector_start(self, message: VectorStartMessage, ctx: MessageContext) -> VectorReadyMessage:
-        """Handle VectorStart message by rebuilding FAISS index from scratch."""
+        """Handle VectorStart message by reusing or building FAISS index."""
         self.logger.info(f"VectorBuilderAgent processing batch {message.batch_id} with chunk_size {message.chunk_size} (iteration {message.repetition})")
 
-        # Always clear existing index for reconstruction (test-time training approach)
+        # Check if index already exists (reuse across iterations)
+        import os
+        index_dir = "vector_indexes"
+        index_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}.index")
+        metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_metadata.json")
+
+        if os.path.exists(index_filename) and os.path.exists(metadata_filename):
+            self.logger.info(f"Reusing existing FAISS index from {index_filename} (iteration {message.repetition})")
+
+            # Load metadata to get total chunks
+            with open(metadata_filename, 'r', encoding='utf-8') as f:
+                chunk_metadata = json.load(f)
+
+            return VectorReadyMessage(
+                batch_id=message.batch_id,
+                repetition=message.repetition,
+                dataset=message.dataset,
+                setting=message.setting,
+                faiss_index_path=index_filename,
+                chunk_metadata_path=metadata_filename,
+                total_chunks=len(chunk_metadata),
+                index_reused=True
+            )
+
+        # Index doesn't exist - build it
+        self.logger.info(f"Building new FAISS index (iteration {message.repetition})")
         self._reset_vector_store()
-        self.logger.info(f"Cleared existing vector store for reconstruction (iteration {message.repetition})")
 
         # Load shared state
         current_state = message.shared_state
@@ -1598,7 +1576,8 @@ class VectorBuilderAgent(RoutedAgent):
                 setting=message.setting,
                 faiss_index_path="",
                 chunk_metadata_path="",
-                total_chunks=0
+                total_chunks=0,
+                index_reused=False
             )
 
         # Split corpus into chunks
@@ -1725,7 +1704,8 @@ class VectorBuilderAgent(RoutedAgent):
             setting=message.setting,
             faiss_index_path=index_filename,
             chunk_metadata_path=metadata_filename,
-            total_chunks=len(chunks) if 'chunks' in locals() else 0
+            total_chunks=len(chunks) if 'chunks' in locals() else 0,
+            index_reused=False
         )
 
         self.logger.info(f"Returning VectorReady for batch {message.batch_id}")
@@ -2219,12 +2199,50 @@ class AnswerGeneratorAgent(RoutedAgent):
         else:
             self.logger.info(f"Using learned answer generator system prompt for QA pair {message.qa_pair_id}")
 
+        # Get previous responses and evaluations for this QA pair
+        all_evaluation_responses = current_state.get("response_evaluations", [])
+
+        # Filter evaluations for this specific QA pair
+        qa_pair_evals = [
+            eval_resp for eval_resp in all_evaluation_responses
+            if eval_resp.get('qa_pair_id') == message.qa_pair_id
+        ]
+
+        # Format previous responses and evaluations
+        if qa_pair_evals:
+            previous_attempts_text = "\n\n" + "=" * 80 + "\n"
+            previous_attempts_text += "PREVIOUS ATTEMPTS FOR THIS QUESTION:\n"
+            previous_attempts_text += "=" * 80 + "\n\n"
+
+            for eval_resp in qa_pair_evals:
+                iter_num = eval_resp.get('repetition', 0)
+                generated_ans = eval_resp.get('generated_answer', 'N/A')
+                reasoning = eval_resp.get('evaluation_reasoning', 'N/A')
+                critique = eval_resp.get('evaluation_feedback', 'N/A')
+
+                previous_attempts_text += f"--- Iteration {iter_num} ---\n\n"
+                previous_attempts_text += f"Generated Answer:\n{generated_ans}\n\n"
+                previous_attempts_text += f"Evaluation Reasoning:\n{reasoning}\n\n"
+                previous_attempts_text += f"Critique and Suggestions:\n{critique}\n\n"
+                previous_attempts_text += "-" * 80 + "\n\n"
+
+            previous_attempts_text += "=" * 80 + "\n"
+            previous_attempts_text += "END OF PREVIOUS ATTEMPTS\n"
+            previous_attempts_text += "=" * 80 + "\n\n"
+        else:
+            previous_attempts_text = ""
+
         # Prepare base user prompt with question and retrieved context
         user_prompt_content = self.base_prompt_answer_generator_vector.format(
             question=message.question,
             retrieved_context=message.retrieved_context,
             critique=""  # Empty critique for initial call
         )
+
+        # Append previous attempts to the prompt
+        if previous_attempts_text:
+            user_prompt_content += "\n\n" + previous_attempts_text
+            self.logger.info(f"Including {len(qa_pair_evals)} previous attempt(s) in answer generation prompt")
 
         try:
             # Create messages with dual-prompt structure
@@ -2264,7 +2282,8 @@ class AnswerGeneratorAgent(RoutedAgent):
                 "retrieved_context": message.retrieved_context,
                 "system_prompt": learned_system_prompt,
                 "user_prompt": user_prompt_content,
-                "generated_answer": generated_answer
+                "generated_answer": generated_answer,
+                "repetition": message.repetition
             }
 
             conversations = current_state.get("conversations_answer_generation", [])
@@ -2669,16 +2688,11 @@ class BackwardPassAgent(RoutedAgent):
             await self._generate_retrieval_planning_prompt_critique(current_state, ctx)
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-            # Step 5: Generate hyperparameters critique
-            await self._generate_hyperparameters_critique(current_state, ctx)
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
-
             # Final save to ensure everything is persisted
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-            # Prepare optimized prompts to return to BatchOrchestrator (like GraphRAG does)
+            # Prepare optimized prompts to return to BatchOrchestrator (no hyperparameters - fixed chunk size)
             optimized_prompts = {
-                "learned_prompt_hyperparameters_vector": current_state.get("learned_prompt_hyperparameters_vector", ""),
                 "learned_prompt_answer_generator_vector": current_state.get("learned_prompt_answer_generator_vector", ""),
                 "learned_prompt_retrieval_summarizer_vector": current_state.get("learned_prompt_retrieval_summarizer_vector", ""),
                 "learned_prompt_vector_retrieval_planner": current_state.get("learned_prompt_vector_retrieval_planner", "")
@@ -2700,8 +2714,7 @@ class BackwardPassAgent(RoutedAgent):
                         "retrieved_content_critique",
                         "retrieval_summarizer_agent_critique",
                         "retrieval_plan_critique",
-                        "retrieval_planner_agent_critique",
-                        "hyperparameters_vector_agent_critique"
+                        "retrieval_planner_agent_critique"
                     ]
                 },
                 dataset=message.dataset,
@@ -2743,8 +2756,31 @@ class BackwardPassAgent(RoutedAgent):
 
         return "\n\n".join(formatted_evals)
 
+    def _format_all_evaluation_responses(self, all_evaluation_responses: list) -> str:
+        """Format all evaluation responses into a single string (matching GraphRAG format)."""
+        if not all_evaluation_responses:
+            return "No evaluation responses available"
+
+        formatted_evals = []
+        for eval_resp in all_evaluation_responses:
+            iter_num = eval_resp.get('repetition', 0)
+            eval_text = f"""
+--- ITERATION {iter_num} EVALUATION ---
+
+Reasoning:
+{eval_resp.get('evaluation_reasoning', 'N/A')}
+
+Critique:
+{eval_resp.get('evaluation_feedback', 'N/A')}
+
+Continue Optimization: {eval_resp.get('continue_optimization', False)}
+"""
+            formatted_evals.append(eval_text)
+
+        return "\n".join(formatted_evals)
+
     def _format_response_critique_history(self, conversations: list, evaluations: list) -> str:
-        """Format combined history of generated responses and their critiques."""
+        """Format combined history of generated responses and their critiques (for retrieval components)."""
         if not conversations and not evaluations:
             return "No history available"
 
@@ -2756,6 +2792,8 @@ class BackwardPassAgent(RoutedAgent):
             rep = conv.get('repetition', 0)
             if rep not in history_by_iter:
                 history_by_iter[rep] = {}
+            history_by_iter[rep]['question'] = conv.get('question', 'N/A')
+            history_by_iter[rep]['retrieved_context'] = conv.get('retrieved_context', 'N/A')
             history_by_iter[rep]['generated_answer'] = conv.get('generated_answer', 'N/A')
 
         # Add evaluations
@@ -2771,21 +2809,43 @@ class BackwardPassAgent(RoutedAgent):
         formatted_history = []
         for rep in sorted(history_by_iter.keys()):
             data = history_by_iter[rep]
-            iter_text = f"Iteration {rep}:\n"
-            iter_text += f"  Generated Answer: {data.get('generated_answer', 'N/A')}\n"
-            iter_text += f"  Evaluation Reasoning: {data.get('evaluation_reasoning', 'N/A')}\n"
-            iter_text += f"  Evaluation Critique: {data.get('evaluation_feedback', 'N/A')}\n"
-            iter_text += f"  Continue Optimization: {data.get('continue_optimization', False)}"
+
+            # Truncate retrieved context if too long
+            retrieved_ctx = data.get('retrieved_context', 'N/A')
+            if len(retrieved_ctx) > 500:
+                retrieved_ctx = retrieved_ctx[:500] + "... [truncated]"
+
+            iter_text = f"""
+╔════════════════════════════════════════════════════════════════════
+║ ITERATION {rep}
+╚════════════════════════════════════════════════════════════════════
+
+Question:
+{data.get('question', 'N/A')}
+
+Retrieved Context:
+{retrieved_ctx}
+
+Generated Answer:
+{data.get('generated_answer', 'N/A')}
+
+Evaluation Reasoning:
+{data.get('evaluation_reasoning', 'N/A')}
+
+Evaluation Critique:
+{data.get('evaluation_feedback', 'N/A')}
+
+Continue Optimization: {data.get('continue_optimization', False)}
+"""
             formatted_history.append(iter_text)
 
-        return "\n\n".join(formatted_history)
+        return "\n".join(formatted_history)
 
     async def _generate_answer_generation_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for answer generation prompt (with skip logic)."""
         self.logger.info("Generating answer generation critique")
 
         all_evaluation_responses = current_state.get("response_evaluations", [])
-        conversations = current_state.get("conversations_answer_generation", [])
 
         if not all_evaluation_responses:
             self.logger.warning("No evaluation data available - skipping answer generation critique")
@@ -2801,14 +2861,14 @@ class BackwardPassAgent(RoutedAgent):
         # Get previous critique (empty string for first component in backward pass)
         previous_critique = ""
 
-        # Get combined history of responses and critiques
-        response_critique_history = self._format_response_critique_history(conversations, all_evaluation_responses)
+        # Get response evaluator output (all iterations)
+        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
 
         # Format prompt with new structure
         prompt_content = self.generation_prompt_gradient_prompt_vector.format(
             current_prompt=current_answer_prompt,
             previous_critique=previous_critique,
-            response_critique_history=response_critique_history
+            response_evaluator_output=response_evaluator_output
         )
 
         # Call LLM with structured output
@@ -2863,24 +2923,44 @@ class BackwardPassAgent(RoutedAgent):
             current_state["retrieved_content_critique"] = "No critique provided"
             return
 
-        # Create triplets: summarized context + conversation (prompt-answer) + evaluation response
+        # Extract query from first conversation
+        query = conversations[0].get('question', 'Unknown query') if conversations else 'Unknown query'
+
+        # Create triplets: summarized context + conversation (question-answer) + evaluation response
         triplets = []
         for i, conv in enumerate(conversations):
             if i < len(evaluation_responses):
                 eval_resp = evaluation_responses[i]
-                triplet = f"Context Summary: {context_summary}\nConversation: {conv.get('prompt', '')} -> {conv.get('generated_answer', '')}\nEvaluation: {eval_resp.get('evaluation_feedback', '')}"
+                question = conv.get('question', 'N/A')
+                answer = conv.get('generated_answer', 'N/A')
+                eval_feedback = eval_resp.get('evaluation_feedback', 'N/A')
+
+                triplet = f"""
+--- ITERATION {i} ---
+Question: {question}
+
+Retrieved Context:
+{context_summary}
+
+Generated Answer:
+{answer}
+
+Evaluation Feedback:
+{eval_feedback}
+"""
                 triplets.append(triplet)
 
-        concatenated_data = "\n\n".join(triplets)
+        concatenated_data = "\n".join(triplets)
 
-        # Get previous critique (this is the first critique in backward pass, so no previous)
-        previous_critique = ""
+        # Get previous critique (answer generation critique)
+        previous_critique = current_state.get("answer_generation_critique", "")
 
         # Get combined history of responses and critiques
         response_critique_history = self._format_response_critique_history(conversations, evaluation_responses)
 
         # Call LLM with retrieved_content_gradient_prompt_vector with all required parameters
         prompt_content = self.retrieved_content_gradient_prompt_vector.format(
+            query=query,
             retrieved_content=concatenated_data,
             previous_critique=previous_critique,
             response_critique_history=response_critique_history
@@ -2974,12 +3054,12 @@ class BackwardPassAgent(RoutedAgent):
             current_state["retrieval_plan_critique"] = "No critique provided"
             return
 
-        # Create comprehensive retrieval plan information with all plans
-        all_plans_info = f"All Retrieval Plans ({len(retrieval_plans)} total):\n"
+        # Create comprehensive retrieval plan information with all plans (WITHOUT retrieved content)
+        all_plans_info = []
         for i, plan in enumerate(retrieval_plans, 1):
-            all_plans_info += f"\nPlan {i}: {plan}\n"
+            all_plans_info.append(f"--- RETRIEVAL PLAN {i} ---\n{plan}")
 
-        all_plans_info += f"\nContext Summary: {context_summary}"
+        all_plans_formatted = "\n\n".join(all_plans_info)
 
         # Get retrieved_content_critique from previous component
         previous_critique = current_state.get("retrieved_content_critique", "No critique available")
