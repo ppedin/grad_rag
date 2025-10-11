@@ -113,6 +113,7 @@ class VectorReadyMessage(BaseModel):
 class VectorRetrievalStartMessage(BaseModel):
     batch_id: int
     repetition: int
+    qa_pair_id: str
     query: str
     dataset: str
     setting: str
@@ -330,6 +331,9 @@ class BatchOrchestratorAgent(RoutedAgent):
                     current_state = self.shared_state.reset_for_new_qa_pair(qa_pair_id, message.dataset, message.setting, message.batch_id)
                     current_state["batch_information"] = batch_info
                     current_state["full_document_text"] = batch_info.get("document_text", "")
+                    # Restore document_index for fault-tolerant FAISS index naming
+                    if "document_index" in message.shared_state:
+                        current_state["document_index"] = message.shared_state["document_index"]
                     self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
                 elif transition_type == 'new_iteration':
                     # Partial reset for new iteration of same QA pair
@@ -556,6 +560,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             retrieval_start_msg = VectorRetrievalStartMessage(
                 batch_id=vector_response.batch_id,
                 repetition=vector_response.repetition,
+                qa_pair_id=qa_pair_id,
                 query=qa_pair.get("question", ""),
                 dataset=original_message.dataset,
                 setting=original_message.setting,
@@ -720,15 +725,10 @@ class BatchOrchestratorAgent(RoutedAgent):
                 system_specific_metrics=comprehensive_vector_stats
             )
 
-            # Perform backward pass if not the last iteration
-            # Since DatasetAgent handles repetitions, we should run backward pass for all iterations except the last
-            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
-            batch_info = current_state.get("batch_information", {})
-            total_iterations = batch_info.get("total_iterations", 1)
-
-            # Run backward pass for iterations 0 to (total_iterations - 2), skip for last iteration
-            if iteration < total_iterations - 1:
-                self.logger.info(f"🔄 Starting backward pass for iteration {iteration}")
+            # Perform backward pass ONLY if evaluator determined answer needs refinement
+            # The ResponseEvaluatorAgent sets continue_optimization=True when decision is NEEDS_REFINEMENT
+            if eval_response.continue_optimization:
+                self.logger.info(f"🔄 Starting backward pass for iteration {iteration} (evaluator determined answer needs refinement)")
 
                 # Gather QA results for backward pass
                 qa_result = {
@@ -751,12 +751,19 @@ class BatchOrchestratorAgent(RoutedAgent):
                     all_qa_results=[qa_result]  # Include current QA result
                 )
 
-                backward_agent_id = AgentId("backward_pass_agent", "default")
-                backward_response = await self.send_message(backward_pass_msg, backward_agent_id)
-                self.logger.info(f"✓ Backward pass completed for iteration {iteration}")
+                try:
+                    backward_agent_id = AgentId("backward_pass_agent", "default")
+                    backward_response = await self.send_message(backward_pass_msg, backward_agent_id)
+                    self.logger.info(f"✓ Backward pass completed for iteration {iteration}")
 
-                # Process backward pass response to update QA pair prompts (like GraphRAG does)
-                await self._process_backward_pass_response(backward_response, ctx)
+                    # Process backward pass response to update QA pair prompts (like GraphRAG does)
+                    await self._process_backward_pass_response(backward_response, ctx)
+                except Exception as e:
+                    self.logger.error(f"❌ Backward pass failed: {e}")
+                    self.logger.error(f"Make sure 'backward_pass_agent' is registered in your runtime!")
+                    self.logger.warning(f"Continuing without backward pass optimization...")
+            else:
+                self.logger.info(f"⏭️  Skipping backward pass for iteration {iteration} (evaluator determined answer is satisfactory)")
 
             # Return iteration results
             return {
@@ -935,6 +942,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             retrieval_start_msg = VectorRetrievalStartMessage(
                 batch_id=vector_response.batch_id,
                 repetition=vector_response.repetition,
+                qa_pair_id=qa_pair_id,
                 query=question,
                 dataset=vector_response.dataset,
                 setting=vector_response.setting,
@@ -1214,7 +1222,8 @@ class BatchOrchestratorAgent(RoutedAgent):
             await self._process_backward_pass_response(backward_response, ctx)
 
         except Exception as e:
-            self.logger.warning(f"BackwardPassAgent not available, falling back to simulation: {e}")
+            self.logger.error(f"BackwardPassAgent failed: {e}", exc_info=True)
+            self.logger.warning(f"Falling back to backward pass simulation due to error")
             # Fallback to simulation if agent is not available
             await self._simulate_backward_pass_ready(backward_pass_msg, ctx)
 
@@ -1464,6 +1473,7 @@ class HyperparametersVectorAgent(RoutedAgent):
                 llm_response=response.content if isinstance(response.content, str) else str(response.content),
                 batch_id=message.batch_id,
                 qa_pair_id=message.qa_pair_id,
+                iteration=message.repetition,
                 additional_metadata={
                     "text_sample": text_sample,
                     "chunk_size": hyperparams_response.chunk_size,
@@ -1534,10 +1544,15 @@ class VectorBuilderAgent(RoutedAgent):
         self.logger.info(f"VectorBuilderAgent processing batch {message.batch_id} with chunk_size {message.chunk_size} (iteration {message.repetition})")
 
         # Check if index already exists (reuse across iterations)
+        # Use document_index from shared_state for consistent naming across QA pairs from same document
         import os
         index_dir = "vector_indexes"
-        index_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}.index")
-        metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_metadata.json")
+
+        # Get document_index from shared_state (if available) for fault-tolerant index naming
+        document_index = message.shared_state.get("document_index", message.batch_id)
+
+        index_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{document_index}.index")
+        metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{document_index}_metadata.json")
 
         if os.path.exists(index_filename) and os.path.exists(metadata_filename):
             self.logger.info(f"Reusing existing FAISS index from {index_filename} (iteration {message.repetition})")
@@ -1611,7 +1626,8 @@ class VectorBuilderAgent(RoutedAgent):
                     batch_metadata.append({
                         "chunk_id": chunk_id,
                         "text": chunk_text,
-                        "batch_id": message.batch_id,
+                        "batch_id": message.batch_id,  # Keep batch_id for state reference
+                        "document_index": document_index,  # Store document_index for index naming
                         "dataset": message.dataset,
                         "setting": message.setting
                     })
@@ -1674,15 +1690,15 @@ class VectorBuilderAgent(RoutedAgent):
 
                 self.logger.info(f"Created FAISS index with {self.faiss_index.ntotal} vectors, dimension {dimension}")
 
-                # Save index to file for reuse
+                # Save index to file for reuse (using document_index for consistent naming)
                 import os
                 index_dir = "vector_indexes"
                 os.makedirs(index_dir, exist_ok=True)
-                index_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}.index")
+                index_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{document_index}.index")
                 faiss.write_index(self.faiss_index, index_filename)
 
                 # Save metadata
-                metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_metadata.json")
+                metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{document_index}_metadata.json")
                 with open(metadata_filename, 'w', encoding='utf-8') as f:
                     json.dump(self.chunk_metadata, f, indent=2, ensure_ascii=False)
 
@@ -1691,10 +1707,10 @@ class VectorBuilderAgent(RoutedAgent):
             except Exception as e:
                 self.logger.error(f"Error creating FAISS index: {e}")
 
-        # Prepare paths for VectorReady message
+        # Prepare paths for VectorReady message (using document_index for consistent naming)
         index_dir = "vector_indexes"
-        index_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}.index")
-        metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{message.batch_id}_metadata.json")
+        index_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{document_index}.index")
+        metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{document_index}_metadata.json")
 
         # Send VectorReady message
         vector_ready_msg = VectorReadyMessage(
@@ -1786,8 +1802,11 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         """Handle VectorRetrievalStart message and execute iterative retrieval."""
         self.logger.info(f"VectorRetrievalPlannerAgent processing batch {message.batch_id} for query: {message.query}")
 
-        # Load the correct FAISS index
-        faiss_index, chunk_metadata = self._load_faiss_index(message.dataset, message.setting, message.batch_id)
+        # Get document_index from shared_state for fault-tolerant index naming
+        document_index = message.shared_state.get("document_index", message.batch_id)
+
+        # Load the correct FAISS index using document_index (not batch_id)
+        faiss_index, chunk_metadata = self._load_faiss_index(message.dataset, message.setting, document_index)
 
         if faiss_index is None:
             self.logger.error(f"Could not load FAISS index for batch {message.batch_id}")
@@ -1821,32 +1840,34 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         # Initialize retrieval context and plan responses
         retrieved_context = ""
         retrieval_plan_responses = []
-        decision_history = []  # Track history of decisions and results
+        query_history = []  # Track history of queries made
         all_selected_documents = []  # Track all selected documents across iterations
         used_document_indices = set()  # Track FAISS indices of already-retrieved documents to avoid duplicates
 
-        # Execute retrieval iterations (max 6)
-        MAX_ITERATIONS = 6
+        # Execute retrieval iterations (fixed number)
+        # TODO: Make this a hyperparameter
+        MAX_ITERATIONS = 5
+        CHUNKS_PER_ITERATION = 3
         for iteration in range(MAX_ITERATIONS):
             self.logger.info(f"Retrieval iteration {iteration + 1}/{MAX_ITERATIONS}")
 
             try:
-                # Format decision history for the prompt
-                if not decision_history:
-                    history_text = "No previous decisions in this session."
+                # Format query history for the prompt
+                if not query_history:
+                    history_text = "No previous queries in this session."
                 else:
                     history_parts = []
-                    for i, entry in enumerate(decision_history, 1):
-                        history_parts.append(f"{i}. Decision: {entry['decision']}\n   Retrieved: {entry['result']}")
-                    history_text = "\n\n".join(history_parts)
+                    for i, query in enumerate(query_history, 1):
+                        history_parts.append(f"{i}. {query}")
+                    history_text = "\n".join(history_parts)
 
-                # Format current context
+                # Format current context (summaries only)
                 if not retrieved_context:
-                    context_text = "No context retrieved yet."
+                    context_text = "No summaries retrieved yet."
                 else:
                     context_text = retrieved_context
 
-                # Prepare base user prompt with query, context, and decision history
+                # Prepare base user prompt with query, summaries, and query history
                 user_prompt_content = self.base_prompt_vector_retrieval_planner.format(
                     message.query, context_text, history_text
                 )
@@ -1873,30 +1894,27 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                     system_prompt=learned_system_prompt,
                     user_prompt=user_prompt_content,
                     llm_response=response.content,
+                    qa_pair_id=message.qa_pair_id,
+                    iteration=message.repetition,
                     additional_metadata={
                         "iteration": iteration + 1,
-                        "information_sufficient": retrieval_response.information_sufficient,
-                        "query": retrieval_response.query if not retrieval_response.information_sufficient else None,
-                        "reasoning_length": len(retrieval_response.reasoning),
-                        "decision_history_length": len(decision_history)
+                        "query": retrieval_response.query,
+                        "query_history_length": len(query_history)
                     }
                 )
 
-                # Store the LLM response
-                retrieval_plan_responses.append(retrieval_response.reasoning)
+                # Store the retrieval query
+                query_summary = f"query='{retrieval_response.query}'"
+                retrieval_plan_responses.append(query_summary)
+                query_history.append(retrieval_response.query)
 
-                # Check if the planner has decided there is sufficient information
-                if retrieval_response.information_sufficient:
-                    self.logger.info(f"Retrieval planner determined information is sufficient after {iteration + 1} iterations")
-                    break
-
-                # Execute vector search with the refined query (returns structured documents)
+                # Execute vector search with the query (returns exactly CHUNKS_PER_ITERATION documents)
                 # Pass used_document_indices to get only new documents
                 retrieved_documents = await self._execute_vector_search(
                     retrieval_response.query,
                     faiss_index,
                     chunk_metadata,
-                    k=5,
+                    k=CHUNKS_PER_ITERATION,
                     used_document_indices=used_document_indices
                 )
 
@@ -1907,18 +1925,32 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                         query=message.query,
                         document=doc,
                         current_state=current_state,
-                        ctx=ctx
+                        ctx=ctx,
+                        qa_pair_id=message.qa_pair_id,
+                        iteration=message.repetition
                     )
                     summarization_tasks.append(task)
 
                 # Wait for all summarizations to complete
                 summaries = await asyncio.gather(*summarization_tasks)
 
-                # Build context from all summaries (no filtering)
+                # Format summaries to add to context
+                # Both planner and answer generator see the same summaries
                 if summaries:
-                    new_context = "\n\n".join([f"Document {i+1} Summary:\n{summary}" for i, summary in enumerate(summaries)])
+                    summary_parts = []
+                    for i, summary in enumerate(summaries, 1):
+                        # Parse JSON to extract only the summary field (not reasoning)
+                        try:
+                            import json
+                            summary_obj = json.loads(summary)
+                            summary_text = summary_obj.get('summary', summary)
+                        except (json.JSONDecodeError, AttributeError):
+                            # If parsing fails, use the raw summary
+                            summary_text = summary
+                        summary_parts.append(f"Document {i}:\n{summary_text}")
+                    formatted_summaries = "\n\n".join(summary_parts)
                 else:
-                    new_context = "No documents retrieved"
+                    formatted_summaries = "No documents retrieved"
 
                 # Track documents with their summaries
                 for doc, summary in zip(retrieved_documents, summaries):
@@ -1926,21 +1958,18 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                 all_selected_documents.extend(retrieved_documents)
 
                 # Add document indices to used set to prevent re-retrieval
+                faiss_indices_this_iteration = []
                 for doc in retrieved_documents:
                     used_document_indices.add(doc['faiss_index'])
+                    faiss_indices_this_iteration.append(doc['faiss_index'])
 
-                # Track this decision and its result in the history
-                decision_entry = {
-                    'decision': f"vector_search('{retrieval_response.query}') -> summarized {len(retrieved_documents)} docs",
-                    'result': new_context
-                }
-                decision_history.append(decision_entry)
+                # Add formatted summaries to retrieved context
+                if formatted_summaries:
+                    retrieved_context += f"\n\nIteration {iteration + 1} results:\n{formatted_summaries}"
 
-                # Add to retrieved context
-                if new_context:
-                    retrieved_context += f"\n\nIteration {iteration + 1} results:\n{new_context}"
-
-                self.logger.info(f"Completed iteration {iteration + 1}, retrieved and summarized {len(retrieved_documents)} docs, context length: {len(retrieved_context)}")
+                self.logger.info(f"Completed iteration {iteration + 1}, retrieved and summarized {len(retrieved_documents)} docs, "
+                               f"FAISS indices: {faiss_indices_this_iteration}, total unique so far: {len(used_document_indices)}, "
+                               f"context length: {len(retrieved_context)}")
 
             except Exception as e:
                 self.logger.error(f"Error in retrieval iteration {iteration + 1}: {e}")
@@ -1950,7 +1979,7 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         current_state["retrieval_plans"] = retrieval_plan_responses
         self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-        # Cleanup retrieval summarizer
+        # Cleanup agents
         await retrieval_summarizer.close()
 
         # Send VectorRetrievalReady message
@@ -2021,8 +2050,9 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
             faiss.normalize_L2(query_vector)
 
             # Retrieve more documents than needed to account for filtering
-            # Start with k*3, but cap at total index size
-            max_retrieve = min(k * 3, faiss_index.ntotal)
+            # Start with k*10 to ensure we get k unique documents even in later iterations
+            # Cap at total index size
+            max_retrieve = min(k * 10, faiss_index.ntotal)  # Retrieve 30 candidates for k=3
 
             # Search for top max_retrieve similar vectors
             scores, indices = faiss_index.search(query_vector, max_retrieve)
@@ -2043,6 +2073,11 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                     # Stop when we have enough unique documents
                     if len(retrieved_documents) >= k:
                         break
+
+            # Log warning if we couldn't retrieve enough unique documents
+            if len(retrieved_documents) < k:
+                self.logger.warning(f"Only retrieved {len(retrieved_documents)} unique documents out of {k} requested. "
+                                  f"Total used so far: {len(used_document_indices)}, searched through top {max_retrieve} candidates.")
 
             return retrieved_documents
 
@@ -2086,62 +2121,62 @@ class RetrievalSummarizerAgent:
 
         self.base_prompt_retrieval_summarizer_vector = base_prompt_retrieval_summarizer_vector
 
-    async def summarize_document(self, query: str, document: Dict[str, Any], current_state: Dict[str, Any], ctx: MessageContext) -> str:
+    async def summarize_document(self, query: str, document: Dict[str, Any], current_state: Dict[str, Any], ctx: MessageContext, qa_pair_id: str = None, iteration: int = None) -> str:
         """
-        Summarize a single document for answering the query.
+        Summarize a single document using simple static prompt (like Self-Refine).
+
+        NOTE: Simplified to use query-agnostic, static summarization without optimization.
+        This matches Self-Refine's approach which showed better stability.
 
         Args:
-            query: The original query
+            query: The original query (not used in simplified version)
             document: Dict with keys 'index', 'score', 'text'
-            current_state: Shared state containing learned prompt
+            current_state: Shared state (not used for summarization prompt anymore)
             ctx: Message context for cancellation
+            qa_pair_id: QA pair ID for logging
+            iteration: Iteration number for logging
 
         Returns:
             Summary of the document
         """
-        # Get learned prompt from state (first iteration uses empty prompt)
-        learned_system_prompt = current_state.get("learned_prompt_retrieval_summarizer_vector", "")
+        # Use simple static prompt (no query, no learned prompt, no structured output)
+        simple_prompt = f"""Summarize the following text concisely, preserving key information:
 
-        # Format document for prompt
-        document_str = f"Score: {document['score']:.4f}\n{document['text']}"
+{document['text']}
 
-        # Prepare prompts
-        user_prompt_content = self.base_prompt_retrieval_summarizer_vector.format(
-            query=query,
-            document=document_str
-        )
+Summary:"""
 
         try:
-            # Create messages
-            system_message = SystemMessage(content=learned_system_prompt)
-            user_message = UserMessage(content=user_prompt_content, source="user")
+            # Create single user message (no system prompt)
+            user_message = UserMessage(content=simple_prompt, source="user")
 
             response = await self.model_client.create(
-                [system_message, user_message],
+                [user_message],
                 cancellation_token=ctx.cancellation_token
             )
 
-            # Parse structured response
+            # Get direct text response (no structured parsing)
             assert isinstance(response.content, str)
-            from parameters import RetrievalSummarizerResponse
-            summarizer_response = RetrievalSummarizerResponse.model_validate_json(response.content)
+            summary = response.content.strip()
 
-            # Log interaction
+            # Log interaction (optional - keep for debugging)
             logger = get_global_prompt_logger()
             logger.log_interaction(
                 agent_name="RetrievalSummarizerAgent",
                 interaction_type="document_summarization",
-                system_prompt=learned_system_prompt,
-                user_prompt=user_prompt_content,
-                llm_response=response.content,
+                system_prompt="",  # No system prompt in simplified version
+                user_prompt=simple_prompt,
+                llm_response=summary,
+                qa_pair_id=qa_pair_id,
+                iteration=iteration,
                 additional_metadata={
                     "document_index": document['index'],
-                    "summary_length": len(summarizer_response.summary),
-                    "reasoning_length": len(summarizer_response.reasoning)
+                    "summary_length": len(summary),
+                    "simplified_mode": True
                 }
             )
 
-            return summarizer_response.summary
+            return summary
 
         except Exception as e:
             self.logger.error(f"Error summarizing document {document['index']}: {e}")
@@ -2166,11 +2201,11 @@ class AnswerGeneratorAgent(RoutedAgent):
         self.shared_state = SharedState("agent_states")
 
         # Import prompts
-        from parameters import base_prompt_answer_generator_vector
+        from parameters import answer_generator_initial_prompt, answer_generator_refinement_prompt
 
         # Initialize Gemini model client with structured output
         self.model_client = OpenAIChatCompletionClient(
-            model="gemini-2.5-flash-lite",
+            model="gemini-2.5-flash",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=llm_keys.GEMINI_KEY,
             model_info={
@@ -2182,7 +2217,8 @@ class AnswerGeneratorAgent(RoutedAgent):
             }
         )
 
-        self.base_prompt_answer_generator_vector = base_prompt_answer_generator_vector
+        self.initial_prompt = answer_generator_initial_prompt
+        self.refinement_prompt = answer_generator_refinement_prompt
 
     @message_handler
     async def handle_answer_generation_start(self, message: AnswerGenerationStartMessage, ctx: MessageContext) -> AnswerGenerationReadyMessage:
@@ -2232,17 +2268,40 @@ class AnswerGeneratorAgent(RoutedAgent):
         else:
             previous_attempts_text = ""
 
-        # Prepare base user prompt with question and retrieved context
-        user_prompt_content = self.base_prompt_answer_generator_vector.format(
-            question=message.question,
-            retrieved_context=message.retrieved_context,
-            critique=""  # Empty critique for initial call
-        )
+        # Prepare user prompt based on iteration (matching Self-Refine's approach)
+        if message.repetition == 0:
+            # First iteration: simple initial prompt
+            user_prompt_content = self.initial_prompt.format(
+                context=message.retrieved_context,
+                question=message.question
+            )
+            self.logger.info(f"Using initial answer generation prompt (iteration 0)")
+        else:
+            # Refinement iteration: show previous answer and critique
+            # Get most recent previous answer and critique
+            if qa_pair_evals:
+                # Sort by repetition to get the most recent one
+                most_recent = max(qa_pair_evals, key=lambda x: x.get('repetition', 0))
+                previous_answer = most_recent.get('generated_answer', '')
+                critique = most_recent.get('evaluation_feedback', '')
+            else:
+                # Fallback (shouldn't happen in refinement iterations)
+                previous_answer = "No previous answer available"
+                critique = "No critique available"
 
-        # Append previous attempts to the prompt
+            user_prompt_content = self.refinement_prompt.format(
+                context=message.retrieved_context,
+                question=message.question,
+                previous_answer=previous_answer,
+                critique=critique
+            )
+            self.logger.info(f"Using refinement prompt (iteration {message.repetition})")
+
+        # Optionally append all previous attempts for additional context
+        # (This is extra context beyond what Self-Refine shows, but maintains VectorRAG's approach)
         if previous_attempts_text:
             user_prompt_content += "\n\n" + previous_attempts_text
-            self.logger.info(f"Including {len(qa_pair_evals)} previous attempt(s) in answer generation prompt")
+            self.logger.info(f"Including {len(qa_pair_evals)} previous attempt(s) as additional context")
 
         try:
             # Create messages with dual-prompt structure
@@ -2266,6 +2325,7 @@ class AnswerGeneratorAgent(RoutedAgent):
                 user_prompt=user_prompt_content,
                 llm_response=generated_answer,
                 qa_pair_id=message.qa_pair_id,
+                iteration=message.repetition,
                 additional_metadata={
                     "question_length": len(message.question),
                     "context_length": len(message.retrieved_context),
@@ -2333,13 +2393,13 @@ class ResponseEvaluatorAgent(RoutedAgent):
         self.shared_state = SharedState("agent_states")
         self.dataset_name = dataset_name
 
-        # Import prompts and response format
-        from parameters import response_evaluator_prompt, ResponseEvaluationResponse
+        # Import prompts
+        from parameters import response_evaluator_prompt
 
         # Load learned gold answer patterns if available
         self.satisfactory_criteria = self._load_gold_patterns()
 
-        # Initialize Gemini model client with structured output
+        # Initialize Gemini model client (without structured output - will parse text)
         self.model_client = OpenAIChatCompletionClient(
             model="gemini-2.5-flash",
             max_tokens=8192,
@@ -2347,12 +2407,10 @@ class ResponseEvaluatorAgent(RoutedAgent):
             api_key=llm_keys.GEMINI_KEY,
             model_info={
                 "vision": False,
-                "function_calling": True,
-                "json_output": True,
+                "function_calling": False,
+                "json_output": False,
                 "family": "unknown",
-                "structured_output": True,
-            },
-            response_format=ResponseEvaluationResponse
+            }
         )
 
         self.response_evaluator_prompt = response_evaluator_prompt
@@ -2441,36 +2499,18 @@ class ResponseEvaluatorAgent(RoutedAgent):
             if eval_resp.get('qa_pair_id') == message.qa_pair_id
         ]
 
-        # Format previous evaluations for context (with FULL answers, not truncated)
-        if qa_pair_evals:
-            prev_evals_text = "\n\n" + "=" * 80 + "\n"
-            prev_evals_text += "PREVIOUS EVALUATIONS FOR THIS QUERY:\n"
-            prev_evals_text += "=" * 80 + "\n"
-            for eval_resp in qa_pair_evals:
-                iter_num = eval_resp.get('repetition', 0)
-                prev_evals_text += f"\n--- Iteration {iter_num} ---\n\n"
-                prev_evals_text += f"Generated Answer (FULL):\n{eval_resp.get('generated_answer', 'N/A')}\n\n"
-                prev_evals_text += f"Evaluation Reasoning:\n{eval_resp.get('evaluation_reasoning', 'N/A')}\n\n"
-                prev_evals_text += f"Critique:\n{eval_resp.get('evaluation_feedback', 'N/A')}\n\n"
-                prev_evals_text += f"Continue Optimization: {eval_resp.get('continue_optimization', False)}\n"
-                prev_evals_text += "-" * 80 + "\n"
-            prev_evals_text += "=" * 80 + "\n"
-        else:
-            prev_evals_text = ""
+        # Don't include previous evaluations in the prompt (to match Self-Refine behavior)
+        # Each iteration is evaluated independently
 
-        # Prepare prompt with query, generated response, previous evaluations, and satisfactory criteria
+        # Prepare prompt with query, generated response, and satisfactory criteria
         prompt_content = self.response_evaluator_prompt.format(
             original_query=message.original_query,
             generated_answer=message.generated_answer,
-            previous_evaluations=prev_evals_text,
             satisfactory_criteria=self.satisfactory_criteria
         )
 
         print(f"   Prompt prepared ({len(prompt_content)} chars)")
-        if prev_evals_text:
-            print(f"   ✓ Including {len(qa_pair_evals)} previous evaluation(s) for this QA pair in prompt")
-        else:
-            print(f"   ℹ️  No previous evaluations (first iteration)")
+        print(f"   ℹ️  Evaluating answer independently (not showing previous iterations to match Self-Refine)")
 
         try:
             # Call LLM for response evaluation
@@ -2481,10 +2521,6 @@ class ResponseEvaluatorAgent(RoutedAgent):
             print("RESPONSE EVALUATOR AGENT - LLM CALL")
             print("=" * 80)
             print(f"System Prompt ({len(prompt_content)} chars):")
-            if prev_evals_text:
-                print(f"\n[Previous Evaluations Section:]")
-                print(prev_evals_text[:300] + "..." if len(prev_evals_text) > 300 else prev_evals_text)
-                print("-" * 80)
             print(f"\n[First 500 chars of full prompt:]")
             print(prompt_content[:500])
             print("-" * 80)
@@ -2505,10 +2541,44 @@ class ResponseEvaluatorAgent(RoutedAgent):
             print(response.content)
             print("=" * 80)
 
-            # Parse structured response
+            # Parse text response (like Self-Refine)
             assert isinstance(response.content, str)
-            from parameters import ResponseEvaluationResponse
-            eval_response = ResponseEvaluationResponse.model_validate_json(response.content)
+            response_text = response.content.strip()
+
+            # Parse DECISION and CRITIQUE from text
+            decision = "NEEDS_REFINEMENT"  # Default
+            critique = ""
+
+            lines = response_text.split('\n')
+            for i, line in enumerate(lines):
+                if line.startswith("DECISION:"):
+                    decision_text = line.replace("DECISION:", "").strip()
+                    if "SATISFACTORY" in decision_text.upper():
+                        decision = "SATISFACTORY"
+                    else:
+                        decision = "NEEDS_REFINEMENT"
+                elif line.startswith("CRITIQUE:"):
+                    critique = line.replace("CRITIQUE:", "").strip()
+                    # Get rest of lines as part of critique
+                    if i + 1 < len(lines):
+                        critique += "\n" + "\n".join(lines[i+1:])
+                    break
+
+            # Map to internal format
+            # SATISFACTORY -> continue_optimization=False
+            # NEEDS_REFINEMENT -> continue_optimization=True
+            continue_optimization = (decision == "NEEDS_REFINEMENT")
+
+            # Create a simple object to hold the parsed values
+            class EvalResponse:
+                def __init__(self, decision, critique, continue_opt):
+                    self.decision = decision
+                    self.critique = critique
+                    self.continue_optimization = continue_opt
+                    self.reasoning = f"Decision: {decision}"  # For backward compatibility
+                    self.missing_keywords = []  # No longer used
+
+            eval_response = EvalResponse(decision, critique, continue_optimization)
 
             # Log LLM interaction
             logger = get_global_prompt_logger()
@@ -2520,6 +2590,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 llm_response=response.content,
                 batch_id=message.batch_id,
                 qa_pair_id=message.qa_pair_id,
+                iteration=message.repetition,
                 additional_metadata={
                     "original_query": message.original_query,
                     "generated_answer_length": len(message.generated_answer),
@@ -2633,7 +2704,7 @@ class BackwardPassAgent(RoutedAgent):
         # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
             model="gemini-2.5-flash-lite",
-            max_tokens=512,
+            max_tokens=4096,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=llm_keys.GEMINI_KEY,
             model_info={
@@ -2694,7 +2765,7 @@ class BackwardPassAgent(RoutedAgent):
             # Prepare optimized prompts to return to BatchOrchestrator (no hyperparameters - fixed chunk size)
             optimized_prompts = {
                 "learned_prompt_answer_generator_vector": current_state.get("learned_prompt_answer_generator_vector", ""),
-                "learned_prompt_retrieval_summarizer_vector": current_state.get("learned_prompt_retrieval_summarizer_vector", ""),
+                "learned_prompt_retrieval_summarizer_vector": "",  # Not used - now using static summarization
                 "learned_prompt_vector_retrieval_planner": current_state.get("learned_prompt_vector_retrieval_planner", "")
             }
 
@@ -2888,7 +2959,7 @@ Continue Optimization: {data.get('continue_optimization', False)}
 
         # Generate optimized prompt using the critique
         optimizer_prompt = self.answer_generation_prompt_optimizer_vector.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, "Please provide the new prompt", add_token_limit=False)
 
         # Limit prompt length to prevent truncation
         MAX_PROMPT_LENGTH = 4000
@@ -2972,64 +3043,15 @@ Evaluation Feedback:
         self.logger.info("Retrieved content critique generated and saved")
 
     async def _generate_retrieval_summarizer_prompt_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieval summarizer prompt (with skip logic)."""
-        self.logger.info("Generating retrieval summarizer prompt critique")
+        """
+        DISABLED: Retrieval summarizer critique and optimization.
 
-        all_evaluation_responses = current_state.get("response_evaluations", [])
-        conversations = current_state.get("conversations_answer_generation", [])
-
-        if not all_evaluation_responses:
-            self.logger.warning("No evaluation data available - skipping retrieval summarizer critique")
-            current_state["retrieval_summarizer_agent_critique"] = "No critique provided"
-            return
-
-        # Get the current retrieval summarizer prompt
-        current_summarizer_prompt = current_state.get("learned_prompt_retrieval_summarizer_vector", "")
-        if not current_summarizer_prompt:
-            from parameters import base_prompt_retrieval_summarizer_vector
-            current_summarizer_prompt = base_prompt_retrieval_summarizer_vector
-
-        # Get previous critique (from retrieved content)
-        previous_critique = current_state.get("retrieved_content_critique", "")
-
-        # Get combined history of responses and critiques
-        response_critique_history = self._format_response_critique_history(conversations, all_evaluation_responses)
-
-        # Format prompt with new structure
-        prompt_content = self.retrieval_summarizer_prompt_gradient_vector.format(
-            current_prompt=current_summarizer_prompt,
-            previous_critique=previous_critique,
-            response_critique_history=response_critique_history
-        )
-
-        # Call LLM with structured output
-        from parameters import PromptCritiqueResponse
-        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
-
-        # Implement skip logic
-        if not critique_response.problem_in_this_component:
-            current_state["retrieval_summarizer_agent_critique"] = "No critique provided"
-            self.logger.info("Retrieval summarizer prompt: No problem detected, skipping optimization")
-            return
-
-        # Problem detected - store critique and optimize
-        critique = critique_response.critique
-        current_state["retrieval_summarizer_agent_critique"] = critique
-
-        # Generate optimized prompt using the critique
-        optimizer_prompt = self.retrieval_summarizer_prompt_optimizer_vector.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
-
-        # Limit prompt length
-        MAX_PROMPT_LENGTH = 4000
-        if len(optimized_prompt) > MAX_PROMPT_LENGTH:
-            optimized_prompt = optimized_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
-
-        is_frozen = self._is_prompt_frozen("retrieval_summarizer_vector", current_state)
-        if not is_frozen:
-            current_state["learned_prompt_retrieval_summarizer_vector"] = optimized_prompt
-
-        log_critique_result(self.logger, "retrieval_summarizer_vector", critique, is_frozen)
+        Now using simple static summarization (like Self-Refine) for better stability.
+        No need to optimize the summarization prompt via backward pass.
+        """
+        self.logger.info("Retrieval summarizer prompt critique: SKIPPED (using static summarization)")
+        current_state["retrieval_summarizer_agent_critique"] = "Skipped - using static summarization"
+        return
 
     async def _generate_retrieval_plan_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for retrieval plans based on plans and contexts."""
@@ -3127,7 +3149,7 @@ Evaluation Feedback:
 
         # Generate optimized prompt using the critique
         optimizer_prompt = self.retrieval_planner_prompt_optimizer_vector.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, "Please provide the new prompt", add_token_limit=False)
 
         # Only update if not frozen
         is_frozen = self._is_prompt_frozen("vector_retrieval_planner", current_state)
@@ -3200,7 +3222,7 @@ Evaluation Feedback:
         critique = critique_response.critique
         current_state["hyperparameters_vector_agent_critique"] = critique
         optimizer_prompt = self.hyperparameters_vector_agent_prompt_optimizer.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx)
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, "Please provide the new prompt", add_token_limit=False)
 
         # Limit prompt length
         MAX_PROMPT_LENGTH = 4000
@@ -3218,14 +3240,17 @@ Evaluation Feedback:
         frozen_prompts = current_state.get("frozen_prompts", [])
         return prompt_type in frozen_prompts
 
-    async def _call_llm(self, prompt_content: str, ctx: MessageContext) -> str:
-        """Helper method to call LLM with given prompt and token limit."""
+    async def _call_llm(self, prompt_content: str, ctx: MessageContext, user_message_content: str = "Please provide your critique and feedback.", add_token_limit: bool = True) -> str:
+        """Helper method to call LLM with given prompt and optional token limit."""
         try:
-            # Add token limit instruction to the prompt
-            enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your critique to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the most critical points and be concise."
+            # Add token limit instruction only for critiques, not for prompt optimization
+            if add_token_limit:
+                enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your critique to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the most critical points and be concise."
+            else:
+                enhanced_prompt = prompt_content
 
             system_message = SystemMessage(content=enhanced_prompt)
-            user_message = UserMessage(content="Please provide your critique and feedback.", source="system")
+            user_message = UserMessage(content=user_message_content, source="system")
 
             response = await self.model_client.create(
                 [system_message, user_message],
@@ -3240,7 +3265,7 @@ Evaluation Feedback:
                 agent_name="BackwardPassAgent",
                 interaction_type="critique_generation",
                 system_prompt=enhanced_prompt,
-                user_prompt="Please provide your critique and feedback.",
+                user_prompt=user_message_content,
                 llm_response=result,
                 additional_metadata={
                     "critique_token_limit": self.critique_token_limit,
@@ -3261,7 +3286,7 @@ Evaluation Feedback:
             # Create a temporary client with the response format
             structured_client = OpenAIChatCompletionClient(
                 model="gemini-2.5-flash-lite",
-                max_tokens=512,
+                max_tokens=4096,
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
                 api_key=llm_keys.GEMINI_KEY,
                 model_info={

@@ -598,6 +598,11 @@ class DatasetAgent(RoutedAgent):
 
         # --- END OF SINGLE QA PROCESSING SECTION ---
 
+        # Get document_index for consistent batch_id (important for fault tolerance)
+        # Use document_index instead of current_qa_index to ensure FAISS indices
+        # are created/reused correctly even when QA pairs are filtered
+        document_index = document_metadata["document_index"]
+
         # Update shared state with single QA pair information
         current_state = self.shared_state.load_state(
             self.dataset_name, self.setting, self.current_qa_index
@@ -625,28 +630,34 @@ class DatasetAgent(RoutedAgent):
 
         # Also create batch_information format that BatchOrchestrator expects
         batch_info_for_orchestrator = {
-            "batch_id": self.current_qa_index,
+            "batch_id": self.current_qa_index,  # Use current_qa_index for state management
             "document_text": example_info["document_text"],
             "qa_pairs": [qa_pair_info],  # Single QA pair in array format
             "total_iterations": self.repetitions  # Required for two-level reset logic
         }
         current_state["batch_information"] = batch_info_for_orchestrator
 
+        # Store document_index in state for reference but keep using current_qa_index as state key
+        current_state["document_index"] = document_index
+
+        # Save state using current_qa_index for state management
         self.shared_state.save_state(
             current_state, self.dataset_name, self.setting, self.current_qa_index
         )
 
-        # Create and send BatchStart message (reusing existing message format but with QA index as batch_id)
+        # Create and send BatchStart message
+        # Note: batch_id is used for state management (current_qa_index)
+        # while document_index (stored in shared_state) is used for FAISS index file naming
         batch_start_msg = BatchStartMessage(
-            batch_id=self.current_qa_index,  # Use QA index as unique identifier
+            batch_id=self.current_qa_index,  # Use current_qa_index for state management
             repetition=self.current_repetition,
             dataset=self.dataset_name,
             setting=self.setting,
             shared_state=current_state
         )
 
-        self.logger.info(f"Sending BatchStart message for QA pair {self.current_qa_index}")
-        self._log_to_file(f"Sending BatchStart message for QA pair {self.current_qa_index}")
+        self.logger.info(f"Sending BatchStart message for QA pair {self.current_qa_index} (document_index={document_index})")
+        self._log_to_file(f"Sending BatchStart message for QA pair {self.current_qa_index} (document_index={document_index})")
 
         try:
             batch_orchestrator_id = AgentId("batch_orchestrator_agent", "default")

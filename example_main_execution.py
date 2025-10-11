@@ -6,9 +6,21 @@ import asyncio
 from autogen_core import SingleThreadedAgentRuntime, AgentId
 from autogen_dataset_agent import create_dataset_agent, DatasetStartMessage
 
-# Import all system agents
+# Import GraphRAG system agents
 from multi_agent_system import create_batch_orchestrator_agent as create_graphrag_orchestrator
-from multi_agent_system_vector import create_batch_orchestrator_agent as create_vectorrag_orchestrator
+
+# Import VectorRAG system agents
+from multi_agent_system_vector import (
+    create_batch_orchestrator_agent as create_vectorrag_orchestrator,
+    create_hyperparameters_vector_agent,
+    create_vector_builder_agent,
+    create_vector_retrieval_planner_agent,
+    create_answer_generator_agent as create_vector_answer_generator,
+    create_response_evaluator_agent as create_vector_response_evaluator,
+    create_backward_pass_agent as create_vector_backward_pass,
+)
+
+# Import All-Context system agents
 from multi_agent_all_context import (
     create_batch_orchestrator_agent as create_allcontext_orchestrator,
     create_answer_generator_agent,
@@ -22,11 +34,11 @@ async def main():
     """Main execution function."""
 
     # Choose system: "graphrag", "vectorrag", or "allcontext"
-    SYSTEM = "allcontext"  # Change this to run different systems
+    SYSTEM = "vectorrag"  # Change this to run different systems
 
     # Configuration
     config = {
-        "dataset": "squality",
+        "dataset": "qmsum",
         "setting": "test",
         "iterations": 2,
         "repetitions": 3,  # Number of QA pairs
@@ -49,8 +61,18 @@ async def main():
             # Register other GraphRAG agents...
 
         elif SYSTEM == "vectorrag":
+            # Register all VectorRAG agents
             await runtime.register("batch_orchestrator_agent", create_vectorrag_orchestrator)
-            # Register other VectorRAG agents...
+            await runtime.register("hyperparameters_vector_agent", create_hyperparameters_vector_agent)
+            await runtime.register("vector_builder_agent", create_vector_builder_agent)
+            await runtime.register("vector_retrieval_planner_agent", create_vector_retrieval_planner_agent)
+            await runtime.register("answer_generator_vector_agent", create_vector_answer_generator)
+            # Pass dataset_name to ResponseEvaluatorAgent for learned patterns loading
+            # Construct dataset_name as "dataset_setting" (e.g., "qmsum_test")
+            dataset_name = f"{config['dataset']}_{config['setting']}"
+            await runtime.register("response_evaluator_agent",
+                                  lambda: create_vector_response_evaluator(dataset_name=dataset_name))
+            await runtime.register("backward_pass_vector_agent", create_vector_backward_pass)
 
         elif SYSTEM == "allcontext":
             # Register All-Context agents

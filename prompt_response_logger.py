@@ -17,12 +17,13 @@ class PromptResponseLogger:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create timestamped log file
+        # Session ID for fallback when qa_pair_id/iteration not provided
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_file = self.log_dir / f"prompts_responses_{timestamp}.jsonl"
-
         self.session_id = timestamp
-        self.interaction_count = 0
+        self.fallback_log_file = self.log_dir / f"prompts_responses_{timestamp}.jsonl"
+
+        # Track interaction counts per file
+        self.interaction_counts = {}
 
     def log_interaction(self,
                        agent_name: str,
@@ -53,11 +54,24 @@ class PromptResponseLogger:
         if _logging_disabled:
             return
 
-        self.interaction_count += 1
+        # Determine which log file to use
+        if qa_pair_id is not None and iteration is not None:
+            # Use QA pair ID and iteration for filename
+            log_file = self.log_dir / f"{qa_pair_id}_iter_{iteration}.jsonl"
+            file_key = f"{qa_pair_id}_iter_{iteration}"
+        else:
+            # Fall back to session-based logging
+            log_file = self.fallback_log_file
+            file_key = "fallback"
+
+        # Increment interaction count for this file
+        if file_key not in self.interaction_counts:
+            self.interaction_counts[file_key] = 0
+        self.interaction_counts[file_key] += 1
 
         log_entry = {
             "session_id": self.session_id,
-            "interaction_id": self.interaction_count,
+            "interaction_id": self.interaction_counts[file_key],
             "timestamp": datetime.now().isoformat(),
             "agent_name": agent_name,
             "interaction_type": interaction_type,
@@ -74,7 +88,7 @@ class PromptResponseLogger:
         }
 
         # Write to JSONL file
-        with open(self.log_file, 'a', encoding='utf-8') as f:
+        with open(log_file, 'a', encoding='utf-8') as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
 
     def log_critique_generation(self,
@@ -121,14 +135,21 @@ class PromptResponseLogger:
         )
 
     def create_summary_report(self) -> str:
-        """Create a human-readable summary report."""
-        if not self.log_file.exists():
-            return "No log file found."
+        """Create a human-readable summary report from all log files."""
+        # Find all log files in the directory
+        log_files = list(self.log_dir.glob("*.jsonl"))
+
+        if not log_files:
+            return "No log files found."
 
         interactions = []
-        with open(self.log_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                interactions.append(json.loads(line))
+        for log_file in log_files:
+            with open(log_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        interactions.append(json.loads(line))
+                    except:
+                        continue
 
         report_file = self.log_dir / f"summary_report_{self.session_id}.md"
 
@@ -136,6 +157,7 @@ class PromptResponseLogger:
             f.write(f"# GraphRAG Prompt/Response Summary Report\n\n")
             f.write(f"**Session ID:** {self.session_id}\n")
             f.write(f"**Total Interactions:** {len(interactions)}\n")
+            f.write(f"**Total Log Files:** {len(log_files)}\n")
             f.write(f"**Generated:** {datetime.now().isoformat()}\n\n")
 
             # Group by interaction type
@@ -194,7 +216,7 @@ def initialize_prompt_logging(log_dir: str = "prompt_response_logs"):
         return
 
     _global_logger = PromptResponseLogger(log_dir)
-    print(f"Prompt response logging initialized. Logs will be saved to: {_global_logger.log_file}")
+    print(f"Prompt response logging initialized. Logs will be saved to: {_global_logger.log_dir}")
 
 
 def finalize_prompt_logging() -> str:

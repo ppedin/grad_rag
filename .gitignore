@@ -14,6 +14,18 @@ agent_states/
 generated_graphs/
 .claude/
 
+# Organized script folders (non-core)
+scripts/
+tests/
+output/
+
+# Log files and output traces
+*.log
+*_trace*.txt
+*_comparison*.txt
+*_degradation*.txt
+*_wins*.txt
+temp_*.txt
 
 # Test files
 test_*.py
@@ -22,18 +34,22 @@ llm_keys.py
 demo_*
 validate_*
 
+# Log and state directories
 frozen_prompts/
 training_logs/
 vector_indexes/
-agent_logs/
-agent_states/
 evaluation_logs/
-frozen_prompts/
 prompt_response_logs/
 step_execution_logs/
 test_agent_states/
-training_logs/
 transition_logs/
 standardized_evaluation_logs/
 results/
 test_community_logs/
+learned_patterns/
+
+# Archived and organized folders
+archived_analysis/
+archived_results/
+docs/
+dataset_converters/

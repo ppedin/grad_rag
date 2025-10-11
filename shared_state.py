@@ -200,6 +200,10 @@ class SharedState:
         # Preserve document text and example information that should persist
         fresh_state["full_document_text"] = current_state.get("full_document_text", "")
         fresh_state["example_information"] = current_state.get("example_information", {})
+
+        # Preserve document_index for fault-tolerant FAISS index naming
+        if "document_index" in current_state:
+            fresh_state["document_index"] = current_state["document_index"]
         fresh_state["batch_information"] = current_state.get("batch_information", {})
 
         # CRITICAL FIX: Explicitly clear all learned prompt keys to prevent leakage between QA pairs
@@ -277,6 +281,10 @@ class SharedState:
         # Preserve document text and example information that should persist through iterations
         new_state["full_document_text"] = current_state.get("full_document_text", "")
         new_state["example_information"] = current_state.get("example_information", {})
+
+        # Preserve document_index for fault-tolerant FAISS index naming
+        if "document_index" in current_state:
+            new_state["document_index"] = current_state["document_index"]
         new_state["batch_information"] = current_state.get("batch_information", {})
 
         # Preserve missing keywords from previous iteration's evaluation for focused refinement
