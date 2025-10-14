@@ -1,6 +1,6 @@
 """
 Multi-Agent GraphRAG System with AutoGen Core API.
-Includes BatchOrchestratorAgent and HyperparametersGraphAgent.
+Includes BatchOrchestratorAgent for orchestrating the GraphRAG pipeline.
 """
 
 import json
@@ -9,7 +9,7 @@ import statistics
 import asyncio
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 from pydantic import BaseModel
 
@@ -32,6 +32,7 @@ from datasets_schema import Question
 from eval_functions import evaluate_rouge_score
 import llm_keys
 from autogen_dataset_agent import BatchStartMessage, BatchReadyMessage
+from parameters import IssueType
 
 
 # ===== LOGGING CONFIGURATION =====
@@ -113,8 +114,7 @@ __all__ = [
     'enable_console_logging',
     'disable_prompt_response_logging',
     'enable_prompt_response_logging',
-    'BatchOrchestratorAgent',
-    'HyperparametersGraphAgent'
+    'BatchOrchestratorAgent'
 ]
 
 
@@ -168,14 +168,6 @@ async def retry_api_call_with_backoff(api_call_func, max_retries: int = 10, init
 # BatchStartMessage and BatchReadyMessage are imported above
 
 # New messages for orchestration workflow
-class HyperparametersGraphStartMessage(BaseModel):
-    qa_pair_id: str
-    qa_pair: Dict[str, Any]
-    batch_id: int
-    repetition: int
-    dataset: str
-    setting: str
-
 class GraphStartMessage(BaseModel):
     batch_id: int
     repetition: int
@@ -191,6 +183,7 @@ class GraphReadyMessage(BaseModel):
     connectivity_metrics: Dict[str, Any]
     dataset: str
     setting: str
+    all_community_summaries: str  # Concatenated summaries of all communities
 
 class GraphRetrievalStartMessage(BaseModel):
     batch_id: int
@@ -207,12 +200,6 @@ class GraphRetrievalReadyMessage(BaseModel):
     retrieved_context: str
     dataset: str
     setting: str
-
-class HyperparametersGraphReadyMessage(BaseModel):
-    qa_pair_id: str
-    chunk_size: int
-    batch_id: int
-    repetition: int
 
 class AnswerGenerationStartMessage(BaseModel):
     qa_pair_id: str
@@ -238,11 +225,15 @@ class ResponseEvaluationStartMessage(BaseModel):
     repetition: int
     dataset: str
     setting: str
+    unfound_keywords_history: List[str] = []  # Keywords that were NOT found in previous iterations
+    community_summaries: str = ""  # Concatenated community summaries for context-aware keyword selection
 
 class ResponseEvaluationReadyMessage(BaseModel):
     qa_pair_id: str
     evaluation_result: Dict[str, Any]
     continue_optimization: bool
+    issue_type: IssueType = IssueType.SATISFACTORY
+    missing_keywords: List[str] = []  # Direct attribute for consistent access
     batch_id: int
     repetition: int
 
@@ -265,17 +256,49 @@ class BackwardPassStartMessage(BaseModel):
     dataset: str
     setting: str
     all_qa_results: List[Dict[str, Any]]
+    issue_type: IssueType = IssueType.CONTENT_ISSUE
 
 class BackwardPassReadyMessage(BaseModel):
     batch_id: int
     repetition: int
     backward_pass_results: Dict[str, Any]
 
-# Response format for HyperparametersGraphAgent
-class HyperparametersGraphResponse(BaseModel):
-    reasoning: str
-    chunk_size: int
-    confidence_score: float
+class CommunityAnswerStartMessage(BaseModel):
+    """Message to request community-level answer generation."""
+    community_id: str
+    community_summary: str
+    question: str
+    qa_pair_id: str
+    batch_id: int
+    repetition: int
+    dataset: str
+    setting: str
+
+class CommunityAnswerReadyMessage(BaseModel):
+    """Response from community-level answer generation."""
+    community_id: str
+    is_useful: bool
+    partial_answer: str
+    qa_pair_id: str
+    batch_id: int
+    repetition: int
+
+class FinalAnswerStartMessage(BaseModel):
+    """Message to request final answer generation from community answers."""
+    qa_pair_id: str
+    question: str
+    useful_community_answers: List[Dict[str, str]]  # List of {"community_id": ..., "answer": ...}
+    batch_id: int
+    repetition: int
+    dataset: str
+    setting: str
+
+class FinalAnswerReadyMessage(BaseModel):
+    """Response from final answer generation."""
+    qa_pair_id: str
+    generated_answer: str
+    batch_id: int
+    repetition: int
 
 
 # ===== BATCH ORCHESTRATOR AGENT =====
@@ -467,6 +490,12 @@ class BatchOrchestratorAgent(RoutedAgent):
                             agent_name="BatchOrchestratorAgent"
                         )
 
+                        # CRITICAL: Store current QA pair ID and iteration in shared state for logging (AFTER reset)
+                        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+                        current_state["current_qa_pair_id"] = qa_pair_id
+                        current_state["current_iteration"] = iteration
+                        self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+
                         # Process the QA pair for this iteration with proper error handling
                         iteration_results = await self._process_qa_pair_iteration(
                             qa_pair_id, qa_pair, iteration, message, ctx
@@ -656,6 +685,12 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Clear graph data for new QA pair
             self.shared_state.clear_graph_data(self.current_dataset, self.current_setting)
 
+            # Clear unfound keywords history for new QA pair
+            current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
+            current_state["unfound_keywords_history"] = []
+            self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, self.current_batch_id)
+            self.logger.info(f"Cleared unfound keywords history for new QA pair {qa_pair_id}")
+
             # Validate complete reset
             if not self._validate_reset_checkpoints(qa_pair_id, iteration, "complete"):
                 self.logger.error(f"Complete reset validation failed for {qa_pair_id}")
@@ -717,132 +752,154 @@ class BatchOrchestratorAgent(RoutedAgent):
         step_start_time = datetime.now()
 
         try:
-            # Step 1: HyperparametersGraphAgent
-            self.logger.info(f"Step 1: Executing HyperparametersGraphAgent for {qa_pair_id}")
+            # Use fixed chunk size of 300 words
+            FIXED_CHUNK_SIZE = 500
+            self.logger.info(f"Using fixed chunk size: {FIXED_CHUNK_SIZE} words")
 
-            # Log execution start
-            exec_logger.log_agent_start(
-                agent_name="HyperparametersGraphAgent",
-                message_type="HyperparametersRequestMessage",
-                batch_id=str(message.batch_id),
-                qa_pair_id=qa_pair_id,
-                iteration=iteration
-            )
+            # Log intermediate output
+            intermediate_outputs["hyperparameters"] = {
+                "chunk_size": FIXED_CHUNK_SIZE,
+                "fixed": True
+            }
 
-            step_logger.log_step(
-                step_name="hyperparameters_generation",
-                status=StepStatus.STARTED,
-                agent_name="HyperparametersGraphAgent",
-                input_data_summary=f"QA pair {qa_pair_id}, question length: {len(qa_pair.get('question', ''))}"
-            )
+            # Step 1: GraphBuilderAgent
+            # Check if we should skip graph rebuilding for style issues
+            skip_graph_rebuild = False
+            if iteration > 0:
+                current_state_check = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+                stored_issue_type_prev = current_state_check.get(f"issue_type_{qa_pair_id}", IssueType.CONTENT_ISSUE)
 
-            step_agent_start = datetime.now()
-            try:
-                hyperparams_response = await self._execute_hyperparameters_agent(qa_pair_id, qa_pair, iteration)
+                print(f"\n{'='*80}")
+                print(f"🔍 GRAPH REBUILD CHECK for iteration {iteration}")
+                print(f"🔍 Retrieved stored_issue_type_prev: {stored_issue_type_prev} (type: {type(stored_issue_type_prev)})")
 
-                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
-                step_logger.log_step(
-                    step_name="hyperparameters_generation",
-                    status=StepStatus.COMPLETED,
-                    agent_name="HyperparametersGraphAgent",
-                    execution_time_ms=step_execution_time,
-                    output_data_summary=f"chunk_size: {getattr(hyperparams_response, 'chunk_size', 'N/A')}"
-                )
+                # Handle both enum objects and string values from shared state
+                if isinstance(stored_issue_type_prev, str):
+                    try:
+                        issue_type_prev = IssueType(stored_issue_type_prev)
+                        print(f"✅ STRING->ENUM: Converted '{stored_issue_type_prev}' to {issue_type_prev}")
+                    except ValueError:
+                        issue_type_prev = IssueType.CONTENT_ISSUE
+                        print(f"❌ Invalid string, defaulting to CONTENT_ISSUE")
+                elif isinstance(stored_issue_type_prev, IssueType):
+                    issue_type_prev = stored_issue_type_prev
+                    print(f"✅ Already enum: {issue_type_prev}")
+                else:
+                    issue_type_prev = IssueType.CONTENT_ISSUE
+                    print(f"❌ Unexpected type, defaulting to CONTENT_ISSUE")
 
-                # Log execution success
-                exec_logger.log_agent_success(
-                    agent_name="HyperparametersGraphAgent",
-                    message_type="HyperparametersRequestMessage",
-                    result_summary=f"chunk_size: {getattr(hyperparams_response, 'chunk_size', 512)}"
-                )
+                print(f"🔍 issue_type_prev == IssueType.STYLE_ISSUE? {issue_type_prev == IssueType.STYLE_ISSUE}")
+                self.logger.info(f"Previous iteration issue_type: {issue_type_prev} (type: {type(issue_type_prev)})")
 
-                # Log intermediate output
-                intermediate_outputs["hyperparameters"] = {
-                    "chunk_size": getattr(hyperparams_response, 'chunk_size', 512),
-                    "processing_time_ms": step_execution_time
-                }
+                if issue_type_prev == IssueType.STYLE_ISSUE:
+                    skip_graph_rebuild = True
+                    print(f"✅ SKIPPING graph rebuild - will reuse existing graph")
+                    print(f"{'='*80}\n")
+                    self.logger.info(f"🎨 STYLE ISSUE: Reusing existing graph from previous iteration (skipping GraphBuilder)")
+                else:
+                    print(f"❌ NOT skipping graph rebuild - will build new graph")
+                    print(f"{'='*80}\n")
 
-            except Exception as e:
-                step_execution_time = (datetime.now() - step_agent_start).total_seconds() * 1000
-                step_logger.log_step(
-                    step_name="hyperparameters_generation",
-                    status=StepStatus.FAILED,
-                    agent_name="HyperparametersGraphAgent",
-                    execution_time_ms=step_execution_time,
-                    error_message=str(e)
-                )
-
-                # Log execution error
-                exec_logger.log_agent_error(
-                    agent_name="HyperparametersGraphAgent",
-                    message_type="HyperparametersRequestMessage",
-                    error=e,
-                    error_context="Failed during hyperparameters generation"
-                )
-
-                self.logger.warning(f"HyperparametersGraphAgent failed, using fallback: {e}")
-                hyperparams_response = await self.handle_agent_failure("hyperparameters_graph_agent", qa_pair_id, iteration, e)
-
-                intermediate_outputs["hyperparameters"] = {
-                    "error": str(e),
-                    "fallback_used": True,
-                    "processing_time_ms": step_execution_time
-                }
-
-            # Step 2: GraphBuilderAgent
-            self.logger.info(f"Step 2: Executing GraphBuilderAgent for {qa_pair_id}")
-            exec_logger.log_agent_start(
-                agent_name="GraphBuilderAgent",
-                message_type="GraphBuildMessage",
-                batch_id=str(message.batch_id),
-                qa_pair_id=qa_pair_id,
-                iteration=iteration
-            )
-            try:
-                graph_response = await self._execute_graph_builder_agent(hyperparams_response, iteration)
-                exec_logger.log_agent_success(
+            if not skip_graph_rebuild:
+                self.logger.info(f"Step 1: Executing GraphBuilderAgent for {qa_pair_id}")
+                exec_logger.log_agent_start(
                     agent_name="GraphBuilderAgent",
                     message_type="GraphBuildMessage",
-                    result_summary="Graph built successfully"
+                    batch_id=str(message.batch_id),
+                    qa_pair_id=qa_pair_id,
+                    iteration=iteration
                 )
-            except Exception as e:
-                exec_logger.log_agent_error(
-                    agent_name="GraphBuilderAgent",
-                    message_type="GraphBuildMessage",
-                    error=e,
-                    error_context="Failed during graph building"
-                )
-                self.logger.warning(f"GraphBuilderAgent failed, using fallback: {e}")
-                graph_response = await self.handle_agent_failure("graph_builder_agent", qa_pair_id, iteration, e)
+                try:
+                    graph_response = await self._execute_graph_builder_agent(FIXED_CHUNK_SIZE, iteration)
+                    exec_logger.log_agent_success(
+                        agent_name="GraphBuilderAgent",
+                        message_type="GraphBuildMessage",
+                        result_summary="Graph built successfully"
+                    )
 
-            # Step 3: GraphRetrievalAgent
-            self.logger.info(f"Step 3: Executing GraphRetrievalPlannerAgent for {qa_pair_id}")
-            exec_logger.log_agent_start(
-                agent_name="GraphRetrievalPlannerAgent",
-                message_type="GraphRetrievalMessage",
-                batch_id=str(message.batch_id),
-                qa_pair_id=qa_pair_id,
-                iteration=iteration
-            )
-            try:
-                retrieval_response = await self._execute_graph_retrieval_agent(graph_response, qa_pair)
-                exec_logger.log_agent_success(
-                    agent_name="GraphRetrievalPlannerAgent",
-                    message_type="GraphRetrievalMessage",
-                    result_summary=f"Retrieved {len(getattr(retrieval_response, 'retrieved_contexts', []))} contexts"
-                )
-            except Exception as e:
-                exec_logger.log_agent_error(
-                    agent_name="GraphRetrievalPlannerAgent",
-                    message_type="GraphRetrievalMessage",
-                    error=e,
-                    error_context="Failed during graph retrieval"
-                )
-                self.logger.warning(f"GraphRetrievalPlannerAgent failed, using fallback: {e}")
-                retrieval_response = await self.handle_agent_failure("graph_retrieval_planner_agent", qa_pair_id, iteration, e)
+                    # Store graph response for potential reuse in style-only iterations
+                    current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+                    current_state["last_graph_response"] = {
+                        "batch_id": graph_response.batch_id,
+                        "repetition": graph_response.repetition,
+                        "dataset": graph_response.dataset,
+                        "setting": graph_response.setting,
+                        "all_community_summaries": graph_response.all_community_summaries,
+                        "graph_description": getattr(graph_response, 'graph_description', ''),
+                        "connectivity_metrics": getattr(graph_response, 'connectivity_metrics', {})
+                    }
+                    self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+                    self.logger.info(f"Stored graph response for potential reuse")
 
-            # Step 4: AnswerGeneratorAgent
-            self.logger.info(f"Step 4: Executing AnswerGeneratorAgent for {qa_pair_id}")
+                except Exception as e:
+                    exec_logger.log_agent_error(
+                        agent_name="GraphBuilderAgent",
+                        message_type="GraphBuildMessage",
+                        error=e,
+                        error_context="Failed during graph building"
+                    )
+                    self.logger.warning(f"GraphBuilderAgent failed, using fallback: {e}")
+                    graph_response = await self.handle_agent_failure("graph_builder_agent", qa_pair_id, iteration, e)
+            else:
+                # Reuse graph from previous iteration
+                self.logger.info(f"Reusing graph from iteration {iteration - 1}")
+                current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+                previous_graph_data = current_state.get("last_graph_response")
+                if previous_graph_data:
+                    # Reconstruct GraphReadyMessage from stored data
+                    from multi_agent_system import GraphReadyMessage
+                    graph_response = GraphReadyMessage(
+                        batch_id=previous_graph_data["batch_id"],
+                        repetition=iteration,  # Use current iteration number
+                        dataset=previous_graph_data["dataset"],
+                        setting=previous_graph_data["setting"],
+                        all_community_summaries=previous_graph_data["all_community_summaries"],
+                        graph_description=previous_graph_data.get("graph_description", ""),
+                        connectivity_metrics=previous_graph_data.get("connectivity_metrics", {})
+                    )
+                    self.logger.info(f"Successfully loaded previous graph response")
+                    exec_logger.log_state_transition(
+                        transition_type="graph_reused",
+                        from_state="style_issue_detected",
+                        to_state="answer_generation",
+                        metadata={"reason": "style_issue_graph_reuse", "qa_pair_id": qa_pair_id, "iteration": iteration}
+                    )
+                else:
+                    self.logger.error(f"Failed to load previous graph response, rebuilding...")
+                    # Fallback: rebuild graph anyway
+                    graph_response = await self._execute_graph_builder_agent(FIXED_CHUNK_SIZE, iteration)
+
+            # Step 3: AnswerGeneratorAgent (receives all community summaries directly from GraphBuilderAgent)
+            self.logger.info(f"Step 3: Executing AnswerGeneratorAgent for {qa_pair_id}")
+
+            # Get issue type from shared state (for iterations > 0)
+            issue_type_for_answer_gen = IssueType.CONTENT_ISSUE  # Default for first iteration
+            if iteration > 0:
+                current_state_for_issue = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+                stored_issue_type = current_state_for_issue.get(f"issue_type_{qa_pair_id}", IssueType.CONTENT_ISSUE)
+
+                print(f"\n{'='*80}")
+                print(f"🔍 RAW RETRIEVAL: stored_issue_type = {stored_issue_type} (type: {type(stored_issue_type)})")
+
+                # Handle both enum objects and string values from shared state
+                if isinstance(stored_issue_type, str):
+                    try:
+                        issue_type_for_answer_gen = IssueType(stored_issue_type)
+                        print(f"✅ STRING->ENUM: Converted '{stored_issue_type}' to {issue_type_for_answer_gen}")
+                    except ValueError:
+                        print(f"❌ Invalid issue_type string '{stored_issue_type}', defaulting to CONTENT_ISSUE")
+                        issue_type_for_answer_gen = IssueType.CONTENT_ISSUE
+                elif isinstance(stored_issue_type, IssueType):
+                    issue_type_for_answer_gen = stored_issue_type
+                    print(f"✅ ENUM: Issue type is already enum: {issue_type_for_answer_gen}")
+                else:
+                    print(f"❌ Unexpected issue_type type '{type(stored_issue_type)}', defaulting to CONTENT_ISSUE")
+                    issue_type_for_answer_gen = IssueType.CONTENT_ISSUE
+
+                print(f"✅ FINAL: Retrieved issue_type for iteration {iteration}: {issue_type_for_answer_gen} (type: {type(issue_type_for_answer_gen)})")
+                print(f"✅ PASSING TO _execute_answer_generator_agent: {issue_type_for_answer_gen}")
+                print(f"{'='*80}\n")
+
             exec_logger.log_agent_start(
                 agent_name="AnswerGeneratorAgent",
                 message_type="AnswerGenerationMessage",
@@ -851,7 +908,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                 iteration=iteration
             )
             try:
-                answer_response = await self._execute_answer_generator_agent(retrieval_response, qa_pair)
+                answer_response = await self._execute_answer_generator_agent(graph_response, qa_pair, issue_type_for_answer_gen)
                 exec_logger.log_agent_success(
                     agent_name="AnswerGeneratorAgent",
                     message_type="AnswerGenerationMessage",
@@ -867,8 +924,8 @@ class BatchOrchestratorAgent(RoutedAgent):
                 self.logger.warning(f"AnswerGeneratorAgent failed, using fallback: {e}")
                 answer_response = await self.handle_agent_failure("answer_generator_agent", qa_pair_id, iteration, e)
 
-            # Step 5: ResponseEvaluatorAgent
-            self.logger.info(f"Step 5: Executing ResponseEvaluatorAgent for {qa_pair_id}")
+            # Step 4: ResponseEvaluatorAgent
+            self.logger.info(f"Step 4: Executing ResponseEvaluatorAgent for {qa_pair_id}")
             exec_logger.log_agent_start(
                 agent_name="ResponseEvaluatorAgent",
                 message_type="EvaluationMessage",
@@ -893,33 +950,67 @@ class BatchOrchestratorAgent(RoutedAgent):
                 self.logger.warning(f"ResponseEvaluatorAgent failed, using fallback: {e}")
                 evaluation_response = await self.handle_agent_failure("response_evaluator_agent", qa_pair_id, iteration, e)
 
-            # Step 6: BackwardPassAgent (generates optimized prompts for next iteration)
-            self.logger.info(f"Step 6: Executing BackwardPassAgent for {qa_pair_id}")
+            # Step 5: BackwardPassAgent (generates optimized prompts for next iteration)
+            self.logger.info(f"Step 5: Executing BackwardPassAgent for {qa_pair_id}")
             backward_pass_response = None
 
             # Check if we should continue optimization
             should_continue = evaluation_response.continue_optimization
+            issue_type = evaluation_response.issue_type
             is_last_iteration = iteration >= message.shared_state.get("batch_information", {}).get("total_iterations", 3) - 1
 
-            # Store continue_optimization flag and missing keywords in shared state for next iteration
+            # Store continue_optimization flag, issue_type, and missing keywords in shared state for next iteration
             current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
             current_state[f"continue_optimization_{qa_pair_id}"] = should_continue
 
+            # Debug: Log what we're storing
+            print(f"\n{'='*80}")
+            print(f"💾 STORING issue_type: {issue_type} (type: {type(issue_type)})")
+            current_state[f"issue_type_{qa_pair_id}"] = issue_type
+            print(f"💾 STORED in state at key 'issue_type_{qa_pair_id}': {current_state[f'issue_type_{qa_pair_id}']} (type: {type(current_state[f'issue_type_{qa_pair_id}'])})")
+            print(f"{'='*80}\n")
+
             # Store missing keywords for focused graph refinement in next iteration
-            if should_continue and hasattr(evaluation_response, 'evaluation_result'):
-                missing_keywords = evaluation_response.evaluation_result.get("missing_keywords", [])
-                if missing_keywords:
+            if should_continue:
+                missing_keywords = evaluation_response.missing_keywords  # Direct attribute access
+
+                print(f"\n{'='*80}")
+                print(f"📝 STORING KEYWORDS FOR NEXT ITERATION (Iteration {iteration})")
+                print(f"{'='*80}")
+
+                # Only store keywords for CONTENT issues
+                if issue_type == IssueType.CONTENT_ISSUE and missing_keywords:
                     current_state["missing_keywords_for_refinement"] = missing_keywords
-                    self.logger.info(f"📝 [ITERATION {iteration}] SAVING KEYWORDS: Stored {len(missing_keywords)} keywords for next iteration")
+                    print(f"Issue Type: CONTENT_ISSUE")
+                    print(f"Action: STORING keywords for graph refinement")
+                    print(f"Keywords: {missing_keywords}")
+                    print(f"Keyword count: {len(missing_keywords)}")
+                    self.logger.info(f"📝 [ITERATION {iteration}] CONTENT ISSUE: Stored {len(missing_keywords)} keywords for graph refinement")
                     self.logger.info(f"📝 Keywords: {missing_keywords}")
                     self.logger.info(f"📝 State keys after saving: {list(current_state.keys())}")
+                elif issue_type == IssueType.STYLE_ISSUE:
+                    # For style issues, clear keywords (no graph refinement needed)
+                    current_state["missing_keywords_for_refinement"] = []
+                    print(f"Issue Type: STYLE_ISSUE")
+                    print(f"Action: CLEARING keywords (no graph refinement needed)")
+                    self.logger.info(f"📝 [ITERATION {iteration}] STYLE ISSUE: No keywords needed (reusing existing graph)")
                 else:
                     # Clear keywords if none provided
                     current_state["missing_keywords_for_refinement"] = []
+                    print(f"Issue Type: {issue_type}")
+                    print(f"Action: CLEARING keywords (none provided)")
                     self.logger.info(f"📝 [ITERATION {iteration}] No keywords provided, clearing keywords")
+
+                print(f"{'='*80}\n")
             else:
                 # Clear keywords if not continuing
                 current_state["missing_keywords_for_refinement"] = []
+                print(f"\n{'='*80}")
+                print(f"📝 CLEARING KEYWORDS (Iteration {iteration})")
+                print(f"{'='*80}")
+                print(f"Reason: should_continue={should_continue}, has evaluation_result={hasattr(evaluation_response, 'evaluation_result')}")
+                print(f"Action: Not continuing to next iteration")
+                print(f"{'='*80}\n")
                 self.logger.info(f"📝 [ITERATION {iteration}] Not continuing, clearing keywords")
 
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
@@ -952,11 +1043,11 @@ class BatchOrchestratorAgent(RoutedAgent):
                     iteration=iteration
                 )
                 try:
-                    backward_pass_response = await self._execute_backward_pass_agent(evaluation_response, iteration)
+                    backward_pass_response = await self._execute_backward_pass_agent(evaluation_response, iteration, issue_type)
                     exec_logger.log_agent_success(
                         agent_name="BackwardPassAgent",
                         message_type="BackwardPassMessage",
-                        result_summary="Backward pass completed successfully"
+                        result_summary=f"Backward pass completed successfully (issue_type: {issue_type})"
                     )
                 except Exception as e:
                     exec_logger.log_agent_error(
@@ -973,7 +1064,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             self.logger.info(f"ROUGE score computed: {rouge_score:.4f} for {qa_pair_id}")
 
             # Validate all responses exist
-            if not all([hyperparams_response, graph_response, retrieval_response, answer_response, evaluation_response]):
+            if not all([graph_response, answer_response, evaluation_response]):
                 raise Exception("One or more critical agent responses missing")
 
             # Calculate total execution time
@@ -989,9 +1080,9 @@ class BatchOrchestratorAgent(RoutedAgent):
                     "connectivity_metrics": getattr(graph_response, 'connectivity_metrics', {}),
                     "comprehensive_statistics": comprehensive_graph_stats
                 },
-                "retrieval": {
-                    "retrieved_context": getattr(retrieval_response, 'retrieved_context', 'N/A'),
-                    "context_length": len(getattr(retrieval_response, 'retrieved_context', ''))
+                "community_summaries": {
+                    "all_summaries": getattr(graph_response, 'all_community_summaries', 'N/A'),
+                    "summaries_length": len(getattr(graph_response, 'all_community_summaries', ''))
                 },
                 "answer_generation": {
                     "generated_answer": getattr(answer_response, 'generated_answer', 'N/A'),
@@ -1016,11 +1107,11 @@ class BatchOrchestratorAgent(RoutedAgent):
                 generated_answer=getattr(answer_response, 'generated_answer', 'N/A'),
                 rouge_scores=rouge_scores,
                 hyperparameters={
-                    "chunk_size": getattr(hyperparams_response, 'chunk_size', 512),
-                    "graph_hyperparameters": getattr(hyperparams_response, '__dict__', {})
+                    "chunk_size": FIXED_CHUNK_SIZE,
+                    "fixed": True
                 },
                 graph_metrics=comprehensive_graph_stats,
-                retrieval_context=getattr(retrieval_response, 'retrieved_context', 'N/A'),
+                retrieval_context=getattr(graph_response, 'all_community_summaries', 'N/A'),
                 execution_time_seconds=total_execution_time,
                 additional_metrics={
                     "evaluation_result": getattr(evaluation_response, 'evaluation_result', {}),
@@ -1037,8 +1128,8 @@ class BatchOrchestratorAgent(RoutedAgent):
                 rouge_scores=rouge_scores,
                 intermediate_outputs=intermediate_outputs,
                 hyperparameters={
-                    "chunk_size": getattr(hyperparams_response, 'chunk_size', 512),
-                    "graph_hyperparameters": getattr(hyperparams_response, '__dict__', {})
+                    "chunk_size": FIXED_CHUNK_SIZE,
+                    "fixed": True
                 },
                 execution_time_seconds=total_execution_time,
                 system_specific_metrics=comprehensive_graph_stats
@@ -1059,10 +1150,10 @@ class BatchOrchestratorAgent(RoutedAgent):
                 "qa_pair_id": qa_pair_id,
                 "iteration": iteration,
                 "timestamp": datetime.now().isoformat(),
-                "hyperparameters": {"chunk_size": getattr(hyperparams_response, 'chunk_size', 512)},
+                "hyperparameters": {"chunk_size": FIXED_CHUNK_SIZE, "fixed": True},
                 "graph_description": getattr(graph_response, 'graph_description', 'N/A'),
                 "community_summarization_logs": community_summarization_logs,  # Add community summarization logs
-                "retrieved_context": getattr(retrieval_response, 'retrieved_context', 'N/A'),
+                "all_community_summaries": getattr(graph_response, 'all_community_summaries', 'N/A'),
                 "generated_answer": getattr(answer_response, 'generated_answer', 'N/A'),
                 "evaluation_result": getattr(evaluation_response, 'evaluation_result', {}),
                 "rouge_score": rouge_score,
@@ -1093,22 +1184,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                 "pipeline_success": False
             }
 
-    async def _execute_hyperparameters_agent(self, qa_pair_id: str, qa_pair: Dict[str, Any],
-                                           iteration: int) -> HyperparametersGraphReadyMessage:
-        """Execute HyperparametersGraphAgent with current system prompt."""
-        hyperparams_msg = HyperparametersGraphStartMessage(
-            qa_pair_id=qa_pair_id,
-            qa_pair=qa_pair,
-            batch_id=self.current_batch_id,
-            repetition=iteration,
-            dataset=self.current_dataset,
-            setting=self.current_setting
-        )
-
-        hyperparams_agent_id = AgentId("hyperparameters_graph_agent", "default")
-        return await self.send_message(hyperparams_msg, hyperparams_agent_id)
-
-    async def _execute_graph_builder_agent(self, hyperparams_response: HyperparametersGraphReadyMessage,
+    async def _execute_graph_builder_agent(self, chunk_size: int,
                                          iteration: int) -> GraphReadyMessage:
         """Execute GraphBuilderAgent with appropriate mode (create vs refine)."""
         current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
@@ -1120,9 +1196,9 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.logger.info(f"📖 Keywords found in state: {keywords_in_state} (count: {len(keywords_in_state)})")
 
         graph_start_msg = GraphStartMessage(
-            batch_id=hyperparams_response.batch_id,
+            batch_id=self.current_batch_id,
             repetition=iteration,
-            chunk_size=hyperparams_response.chunk_size,
+            chunk_size=chunk_size,
             dataset=self.current_dataset,
             setting=self.current_setting,
             shared_state=current_state
@@ -1149,27 +1225,200 @@ class BatchOrchestratorAgent(RoutedAgent):
         retrieval_agent_id = AgentId("graph_retrieval_planner_agent", "default")
         return await self.send_message(retrieval_start_msg, retrieval_agent_id)
 
-    async def _execute_answer_generator_agent(self, retrieval_response: GraphRetrievalReadyMessage,
-                                            qa_pair: Dict[str, Any]) -> AnswerGenerationReadyMessage:
-        """Execute AnswerGeneratorAgent."""
+    async def _execute_answer_generator_agent(self, graph_response: GraphReadyMessage,
+                                            qa_pair: Dict[str, Any],
+                                            issue_type: IssueType = IssueType.CONTENT_ISSUE) -> AnswerGenerationReadyMessage:
+        """
+        Execute two-stage answer generation:
+        1. Parallel community-level answer generation (skip for STYLE_ISSUE with existing answers)
+        2. Final answer synthesis from useful community answers
+        """
         qa_pair_id = qa_pair.get("question_id", "unknown")
+        question = qa_pair.get("question", "")
 
-        answer_gen_msg = AnswerGenerationStartMessage(
+        self.logger.info(f"Starting two-stage answer generation for QA {qa_pair_id}")
+
+        # Step 1: Check if we should reuse community answers (style issue only)
+        current_state = self.shared_state.load_state(graph_response.dataset, graph_response.setting, graph_response.batch_id)
+
+        reuse_community_answers = False
+        useful_community_answers = []
+
+        # Debug: Log the comparison values
+        print(f"\n{'='*80}")
+        print(f"🔍 REUSE CHECK FOR QA: {qa_pair_id}")
+        print(f"🔍 Issue type received: {issue_type} (type: {type(issue_type)})")
+        print(f"🔍 Repetition: {graph_response.repetition}")
+        print(f"🔍 repetition > 0? {graph_response.repetition > 0}")
+        print(f"🔍 IssueType.STYLE_ISSUE = {IssueType.STYLE_ISSUE} (type: {type(IssueType.STYLE_ISSUE)})")
+        print(f"🔍 issue_type == IssueType.STYLE_ISSUE? {issue_type == IssueType.STYLE_ISSUE}")
+        print(f"🔍 Combined condition (repetition > 0 AND style_issue)? {graph_response.repetition > 0 and issue_type == IssueType.STYLE_ISSUE}")
+        print(f"{'='*80}\n")
+
+        if graph_response.repetition > 0 and issue_type == IssueType.STYLE_ISSUE:
+            # For style issues after first iteration, try to reuse community answers
+            print(f"✅ ENTERING REUSE BLOCK - Style issue detected in iteration {graph_response.repetition}")
+            previous_community_answers = current_state.get("last_useful_community_answers", [])
+            print(f"Found {len(previous_community_answers)} previous community answers in state")
+            if previous_community_answers:
+                reuse_community_answers = True
+                useful_community_answers = previous_community_answers
+                print(f"🎨 STYLE ISSUE: Reusing {len(useful_community_answers)} community answers from previous iteration")
+                print(f"Skipping CommunityAnswerGeneratorAgent (Stage 1) - going directly to FinalAnswerGenerator")
+                self.logger.info(f"🎨 STYLE ISSUE: Reusing {len(useful_community_answers)} community answers from previous iteration")
+                self.logger.info(f"Skipping CommunityAnswerGeneratorAgent (Stage 1) - going directly to FinalAnswerGenerator")
+            else:
+                print(f"⚠️ STYLE ISSUE but no previous community answers found, running full two-stage")
+                self.logger.warning(f"STYLE ISSUE but no previous community answers found, running full two-stage")
+        else:
+            print(f"❌ NOT entering reuse block - will regenerate community answers")
+
+        if not reuse_community_answers:
+            # Run full two-stage process - get community summaries
+            community_summaries_dict = current_state.get("community_summaries", {})
+
+            # DEBUG: Print what we found
+            print(f"\n{'='*80}")
+            print(f"DEBUG: TWO-STAGE ANSWER GENERATION CHECK")
+            print(f"{'='*80}")
+            print(f"community_summaries_dict type: {type(community_summaries_dict)}")
+            print(f"community_summaries_dict length: {len(community_summaries_dict) if isinstance(community_summaries_dict, dict) else 'N/A'}")
+            if isinstance(community_summaries_dict, dict) and community_summaries_dict:
+                print(f"community_summaries_dict keys: {list(community_summaries_dict.keys())[:5]}")  # First 5 keys
+                print(f"✓ Two-stage answer generation will be used (parallel community generators)")
+            else:
+                print(f"⚠️  community_summaries_dict is EMPTY or not a dict!")
+                print(f"Available state keys: {list(current_state.keys())}")
+            print(f"{'='*80}\n")
+
+            if not community_summaries_dict:
+                print(f"\n⚠️  FALLBACK TRIGGERED: Using old single-stage approach")
+                print(f"This means parallel community generators will NOT be executed")
+                print(f"FinalAnswerGenerator will NOT be called\n")
+                # Fallback: use old single-stage approach if community summaries not available
+                answer_gen_msg = AnswerGenerationStartMessage(
+                    qa_pair_id=qa_pair_id,
+                    question=question,
+                    retrieved_context=graph_response.all_community_summaries,
+                    batch_id=graph_response.batch_id,
+                    repetition=graph_response.repetition,
+                    dataset=graph_response.dataset,
+                    setting=graph_response.setting
+                )
+                answer_gen_agent_id = AgentId("answer_generator_agent", "default")
+                return await self.send_message(answer_gen_msg, answer_gen_agent_id)
+
+            self.logger.info(f"Processing {len(community_summaries_dict)} communities in parallel")
+
+            # Step 2: Create parallel tasks for all community answer generators
+            # Use a single registered community answer generator agent for all communities
+            community_answer_agent_id = AgentId("community_answer_generator", "default")
+            community_tasks = []
+            community_ids = []
+
+            for community_id, community_summary in community_summaries_dict.items():
+                community_msg = CommunityAnswerStartMessage(
+                    community_id=community_id,
+                    community_summary=community_summary,
+                    question=question,
+                    qa_pair_id=qa_pair_id,
+                    batch_id=graph_response.batch_id,
+                    repetition=graph_response.repetition,
+                    dataset=graph_response.dataset,
+                    setting=graph_response.setting
+                )
+
+                task = self.send_message(community_msg, community_answer_agent_id)
+                community_tasks.append(task)
+                community_ids.append(community_id)
+
+            # Step 3: Execute all community answer generations in parallel
+            self.logger.info(f"Executing {len(community_tasks)} community answer generators in parallel")
+            community_responses = await asyncio.gather(*community_tasks, return_exceptions=True)
+
+            # Step 4: Filter useful community answers
+            for community_id, response in zip(community_ids, community_responses):
+                if isinstance(response, Exception):
+                    self.logger.error(f"Community answer generation failed for {community_id}: {response}")
+                    continue
+
+                if response.is_useful and response.partial_answer:
+                    useful_community_answers.append({
+                        "community_id": community_id,
+                        "answer": response.partial_answer
+                    })
+                    self.logger.info(f"Community {community_id}: USEFUL (answer length: {len(response.partial_answer)})")
+                else:
+                    self.logger.info(f"Community {community_id}: NOT USEFUL")
+
+            self.logger.info(f"Filtered {len(useful_community_answers)}/{len(community_summaries_dict)} useful community answers")
+
+            # Store useful community answers for potential reuse in style-only iterations
+            current_state = self.shared_state.load_state(graph_response.dataset, graph_response.setting, graph_response.batch_id)
+            current_state["last_useful_community_answers"] = useful_community_answers
+            self.shared_state.save_state(current_state, graph_response.dataset, graph_response.setting, graph_response.batch_id)
+            print(f"\n{'='*80}")
+            print(f"💾 STORED {len(useful_community_answers)} community answers for potential reuse")
+            print(f"💾 Key: 'last_useful_community_answers'")
+            print(f"💾 Dataset: {graph_response.dataset}, Setting: {graph_response.setting}, Batch: {graph_response.batch_id}")
+            print(f"{'='*80}\n")
+            self.logger.info(f"Stored {len(useful_community_answers)} useful community answers for potential reuse")
+
+        # Step 5: Synthesize final answer from useful community answers
+        if not useful_community_answers:
+            self.logger.warning("No useful community answers found, using fallback")
+            # Fallback: create a simple answer indicating no useful information
+            return AnswerGenerationReadyMessage(
+                qa_pair_id=qa_pair_id,
+                generated_answer="Based on the available information, I cannot provide a comprehensive answer to this question.",
+                batch_id=graph_response.batch_id,
+                repetition=graph_response.repetition
+            )
+
+        final_answer_msg = FinalAnswerStartMessage(
             qa_pair_id=qa_pair_id,
-            question=qa_pair.get("question", ""),
-            retrieved_context=retrieval_response.retrieved_context,
-            batch_id=retrieval_response.batch_id,
-            repetition=retrieval_response.repetition,
-            dataset=retrieval_response.dataset,
-            setting=retrieval_response.setting
+            question=question,
+            useful_community_answers=useful_community_answers,
+            batch_id=graph_response.batch_id,
+            repetition=graph_response.repetition,
+            dataset=graph_response.dataset,
+            setting=graph_response.setting
         )
 
         answer_gen_agent_id = AgentId("answer_generator_agent", "default")
-        return await self.send_message(answer_gen_msg, answer_gen_agent_id)
+        final_response = await self.send_message(final_answer_msg, answer_gen_agent_id)
+
+        # Convert FinalAnswerReadyMessage to AnswerGenerationReadyMessage for compatibility
+        return AnswerGenerationReadyMessage(
+            qa_pair_id=final_response.qa_pair_id,
+            generated_answer=final_response.generated_answer,
+            batch_id=final_response.batch_id,
+            repetition=final_response.repetition
+        )
 
     async def _execute_response_evaluator_agent(self, answer_response: AnswerGenerationReadyMessage,
                                               qa_pair: Dict[str, Any]) -> ResponseEvaluationReadyMessage:
         """Execute ResponseEvaluatorAgent."""
+        # Get unfound keywords history and community summaries from shared state
+        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
+        unfound_keywords_history = current_state.get("unfound_keywords_history", [])
+
+        # Retrieve community summaries from last_graph_response for context-aware keyword selection
+        last_graph_response = current_state.get("last_graph_response", {})
+        community_summaries = last_graph_response.get("all_community_summaries", "")
+
+        # Debug logging
+        print(f"\n{'='*80}")
+        print(f"RESPONSE EVALUATOR - CONTEXT RETRIEVAL CHECK")
+        print(f"{'='*80}")
+        print(f"last_graph_response keys: {list(last_graph_response.keys())}")
+        print(f"community_summaries length: {len(community_summaries) if community_summaries else 0} chars")
+        if community_summaries:
+            print(f"community_summaries preview (first 200 chars): {community_summaries[:200]}...")
+        else:
+            print(f"⚠️  WARNING: community_summaries is EMPTY")
+        print(f"{'='*80}\n")
+
         eval_start_msg = ResponseEvaluationStartMessage(
             qa_pair_id=answer_response.qa_pair_id,
             original_query=qa_pair.get("question", ""),
@@ -1178,14 +1427,17 @@ class BatchOrchestratorAgent(RoutedAgent):
             batch_id=answer_response.batch_id,
             repetition=answer_response.repetition,
             dataset=self.current_dataset,
-            setting=self.current_setting
+            setting=self.current_setting,
+            unfound_keywords_history=unfound_keywords_history,
+            community_summaries=community_summaries
         )
 
         response_eval_agent_id = AgentId("response_evaluator_agent", "default")
         return await self.send_message(eval_start_msg, response_eval_agent_id)
 
     async def _execute_backward_pass_agent(self, evaluation_response: ResponseEvaluationReadyMessage,
-                                         iteration: int) -> Optional[BackwardPassReadyMessage]:
+                                         iteration: int,
+                                         issue_type: IssueType = IssueType.CONTENT_ISSUE) -> Optional[BackwardPassReadyMessage]:
         """Execute BackwardPassAgent to generate optimized prompts."""
         if iteration == 0:
             # For first iteration, generate initial critiques
@@ -1194,7 +1446,8 @@ class BatchOrchestratorAgent(RoutedAgent):
                 repetition=iteration,
                 dataset=self.current_dataset,
                 setting=self.current_setting,
-                all_qa_results=[evaluation_response.evaluation_result]
+                all_qa_results=[evaluation_response.evaluation_result],
+                issue_type=issue_type
             )
         else:
             # For subsequent iterations, use previous results for critique
@@ -1206,7 +1459,8 @@ class BatchOrchestratorAgent(RoutedAgent):
                 repetition=iteration,
                 dataset=self.current_dataset,
                 setting=self.current_setting,
-                all_qa_results=all_results
+                all_qa_results=all_results,
+                issue_type=issue_type
             )
 
         try:
@@ -1618,9 +1872,7 @@ class BatchOrchestratorAgent(RoutedAgent):
 
         # Fallback to simulation based on agent type
         try:
-            if agent_name == "hyperparameters_graph_agent":
-                return await self._simulate_hyperparameters_response(qa_pair_id, iteration)
-            elif agent_name == "graph_builder_agent":
+            if agent_name == "graph_builder_agent":
                 return await self._simulate_graph_builder_response(iteration)
             elif agent_name == "graph_retrieval_planner_agent":
                 return await self._simulate_retrieval_response(qa_pair_id)
@@ -1637,16 +1889,6 @@ class BatchOrchestratorAgent(RoutedAgent):
         except Exception as fallback_error:
             self.logger.error(f"Fallback strategy failed for {agent_name}: {fallback_error}")
             return None
-
-    async def _simulate_hyperparameters_response(self, qa_pair_id: str, iteration: int) -> HyperparametersGraphReadyMessage:
-        """Fallback simulation for HyperparametersGraphAgent."""
-        self.logger.info(f"Simulating hyperparameters response for {qa_pair_id}")
-        return HyperparametersGraphReadyMessage(
-            qa_pair_id=qa_pair_id,
-            chunk_size=512,  # Default chunk size
-            batch_id=self.current_batch_id,
-            repetition=iteration
-        )
 
     async def _simulate_graph_builder_response(self, iteration: int) -> GraphReadyMessage:
         """Fallback simulation for GraphBuilderAgent."""
@@ -1686,7 +1928,23 @@ class BatchOrchestratorAgent(RoutedAgent):
         self.logger.info(f"Simulating evaluation response for {qa_pair_id}")
         return ResponseEvaluationReadyMessage(
             qa_pair_id=qa_pair_id,
-            evaluation_result={"score": 0.5, "quality": "simulated"},
+            evaluation_result={
+                "score": 0.5,
+                "quality": "simulated",
+                "qa_pair_id": qa_pair_id,
+                "original_query": "",
+                "generated_answer": "",
+                "evaluation_reasoning": "Simulated response due to agent failure",
+                "evaluation_feedback": "",
+                "missing_keywords": [],
+                "continue_optimization": False,
+                "issue_type": IssueType.SATISFACTORY,
+                "repetition": 0,
+                "timestamp": datetime.now().isoformat()
+            },
+            continue_optimization=False,
+            issue_type=IssueType.SATISFACTORY,
+            missing_keywords=[],
             batch_id=self.current_batch_id,
             repetition=0
         )
@@ -1887,148 +2145,11 @@ class BatchOrchestratorAgent(RoutedAgent):
             self.logger.error(f"Error collecting graph statistics: {e}")
             return {"connectivity_metrics": {}}
 
-
-
-# ===== HYPERPARAMETERS GRAPH AGENT =====
-
-class HyperparametersGraphAgent(RoutedAgent):
-    """
-    Agent that determines graph construction hyperparameters using LLM reasoning.
-    """
-
-    def __init__(self, name: str) -> None:
-        super().__init__(name)
-        self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.hyperparameters_graph")
-        self.shared_state = SharedState("agent_states")
-
-        # Initialize Gemini model client with structured output
-        self.model_client = OpenAIChatCompletionClient(
-            model="gemini-2.5-flash-lite",
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            api_key=llm_keys.GEMINI_KEY,
-            model_info={
-                "vision": False,
-                "function_calling": True,
-                "json_output": True,
-                "family": "unknown",
-                "structured_output": True,
-            },
-            response_format=HyperparametersGraphResponse
-        )
-
-        # Base prompt for hyperparameters determination
-        from parameters import base_prompt_hyperparameters_graph
-        self.base_prompt_hyperparameters_graph = base_prompt_hyperparameters_graph
-
-    @message_handler
-    async def handle_hyperparameters_graph_start(
-        self, message: HyperparametersGraphStartMessage, ctx: MessageContext
-    ) -> HyperparametersGraphReadyMessage:
-        """Handle HyperparametersGraphStart message and generate hyperparameters using LLM."""
-        self.logger.info(f"HyperparametersGraphAgent processing QA pair {message.qa_pair_id}")
-
-        try:
-            # Load shared state to get learned system prompt
-            current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-
-            # For first repetition (repetition=0), start with empty system prompt to avoid data leakage
-            if message.repetition == 0:
-                learned_system_prompt = ""
-                self.logger.info(f"First repetition for QA pair {message.qa_pair_id} - using empty system prompt")
-            else:
-                learned_system_prompt = current_state.get("learned_prompt_hyperparameters_graph", "")
-
-            # Extract question from QA pair
-            qa_pair = message.qa_pair
-            question = qa_pair.get("question", "")
-
-            # Use generic description for text sample
-            text_sample = "Meeting transcripts"
-
-            # Prepare base prompt (without critique)
-            prompt_content = self.base_prompt_hyperparameters_graph.format(
-                text=text_sample,
-                question=question
-            ) + "\n Chunk size cannot be lower than 128."
-
-            # Call LLM with structured output using learned system prompt
-            system_message = SystemMessage(content=learned_system_prompt)
-            user_message = UserMessage(content=prompt_content, source="user")
-
-            response = await self.model_client.create(
-                [system_message, user_message],
-                cancellation_token=ctx.cancellation_token
-            )
-
-            # Log LLM interaction
-            logger = get_global_prompt_logger()
-            logger.log_interaction(
-                agent_name="HyperparametersGraphAgent",
-                interaction_type="hyperparameters_recommendation",
-                system_prompt=learned_system_prompt,
-                user_prompt=prompt_content,
-                llm_response=response.content if isinstance(response.content, str) else str(response.content),
-                batch_id=message.batch_id,
-                qa_pair_id=message.qa_pair_id,
-                additional_metadata={
-                    "text_sample": text_sample,
-                    "question": question
-                }
-            )
-
-            # Parse structured response
-            assert isinstance(response.content, str)
-            hyperparams_response = HyperparametersGraphResponse.model_validate_json(response.content)
-
-            log_agent_action(self.logger, "HyperparametersGraph", "LLM recommendation",
-                            chunk_size=hyperparams_response.chunk_size,
-                            confidence=f"{hyperparams_response.confidence_score:.2f}",
-                            reasoning=hyperparams_response.reasoning)
-
-            # Save chunk_size to shared state
-            rag_hyperparams = current_state.get("rag_hyperparameters", {})
-            rag_hyperparams["chunk_size"] = hyperparams_response.chunk_size
-            rag_hyperparams["chunk_size_reasoning"] = hyperparams_response.reasoning
-            rag_hyperparams["chunk_size_confidence"] = hyperparams_response.confidence_score
-            current_state["rag_hyperparameters"] = rag_hyperparams
-
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
-
-            # Return HyperparametersGraphReady message
-            ready_msg = HyperparametersGraphReadyMessage(
-                qa_pair_id=message.qa_pair_id,
-                chunk_size=hyperparams_response.chunk_size,
-                batch_id=message.batch_id,
-                repetition=message.repetition
-            )
-
-            self.logger.info(f"Returning HyperparametersGraphReady for QA pair {message.qa_pair_id}")
-            return ready_msg
-
-        except Exception as e:
-            self.logger.error(f"Error in LLM call: {e}")
-            # Return default response on error
-            return HyperparametersGraphReadyMessage(
-                qa_pair_id=message.qa_pair_id,
-                chunk_size=512,  # Default chunk size
-                batch_id=message.batch_id,
-                repetition=message.repetition
-            )
-
-    async def close(self) -> None:
-        """Close the model client."""
-        await self.model_client.close()
-
-
 # ===== FACTORY FUNCTIONS =====
 
 def create_batch_orchestrator_agent() -> BatchOrchestratorAgent:
     """Factory function to create BatchOrchestratorAgent instances."""
     return BatchOrchestratorAgent("batch_orchestrator_agent")
-
-def create_hyperparameters_graph_agent() -> HyperparametersGraphAgent:
-    """Factory function to create HyperparametersGraphAgent instances."""
-    return HyperparametersGraphAgent("hyperparameters_graph_agent")
 
 
 # ===== GRAPH BUILDER AGENT =====
@@ -2060,33 +2181,229 @@ class GraphBuilderAgent(RoutedAgent):
                 "function_calling": False,
                 "json_output": False,
                 "family": "unknown",
-                "structured_output": True,
-            },
-            response_format=GraphBuilderResponse
+                "structured_output": False,
+            }
         )
 
         self.model_client_refinement = OpenAIChatCompletionClient(
+            model="gemini-2.5-flash",  # Using Gemini for graph refinement
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": False,
+                "json_output": False,
+                "family": "unknown",
+                "structured_output": False,
+            }
+        )
+
+        # Separate client for community summarization (plain text output)
+        self.model_client_summarization = OpenAIChatCompletionClient(
             model="gemini-2.5-flash-lite",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=llm_keys.GEMINI_KEY,
             model_info={
                 "vision": False,
-                "function_calling": True,
-                "json_output": True,
+                "function_calling": False,
+                "json_output": False,
                 "family": "unknown",
-                "structured_output": True,
-            },
-            response_format=GraphRefinementResponse
+                "structured_output": False,
+            }
+            # No response_format - allows plain text responses
         )
 
         self.base_prompt_graph_builder = base_prompt_graph_builder
         self.base_prompt_graph_refinement = base_prompt_graph_refinement
-        
+
+
+    def _parse_graph_builder_response(self, response_text: str) -> 'GraphBuilderResponse':
+        """
+        Parse text response into GraphBuilderResponse Pydantic model.
+        Handles JSON extraction from markdown code blocks and validates structure.
+        """
+        import re
+        import json
+        from pydantic import ValidationError
+        from parameters import GraphBuilderResponse
+
+        try:
+            # Try extracting from markdown code block first
+            json_match = re.search(r'```json\s*\n(.*?)\n```', response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # Try finding JSON object in the response
+                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                else:
+                    # Last resort: try the entire response
+                    json_str = response_text.strip()
+
+            # Parse JSON
+            data = json.loads(json_str)
+
+            # Validate with Pydantic
+            return GraphBuilderResponse.model_validate(data)
+
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON parsing failed for graph builder response: {e}")
+            self.logger.error(f"Response text (first 1000 chars): {response_text[:1000]}")
+            raise ValueError(f"Failed to parse graph builder response as JSON: {e}")
+        except ValidationError as e:
+            self.logger.error(f"Pydantic validation failed for graph builder response: {e}")
+            self.logger.error(f"Parsed data: {json.dumps(data, indent=2)[:500]}")
+            raise ValueError(f"Graph builder response format invalid: {e}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error parsing graph builder response: {e}")
+            raise ValueError(f"Failed to parse graph builder response: {e}")
+
+    def _parse_graph_refinement_response(self, response_text: str) -> 'GraphRefinementResponse':
+        """
+        Parse text response into GraphRefinementResponse Pydantic model.
+        Handles JSON extraction from markdown code blocks and validates structure.
+        """
+        import re
+        import json
+        from pydantic import ValidationError
+        from parameters import GraphRefinementResponse
+
+        try:
+            # Try extracting from markdown code block first
+            json_match = re.search(r'```json\s*\n(.*?)\n```', response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # Try finding JSON object in the response
+                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                else:
+                    # Last resort: try the entire response
+                    json_str = response_text.strip()
+
+            # Parse JSON
+            data = json.loads(json_str)
+
+            # Validate with Pydantic
+            return GraphRefinementResponse.model_validate(data)
+
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON parsing failed for graph refinement response: {e}")
+            self.logger.error(f"Response text (first 1000 chars): {response_text[:1000]}")
+            raise ValueError(f"Failed to parse graph refinement response as JSON: {e}")
+        except ValidationError as e:
+            self.logger.error(f"Pydantic validation failed for graph refinement response: {e}")
+            self.logger.error(f"Parsed data: {json.dumps(data, indent=2)[:500]}")
+            raise ValueError(f"Graph refinement response format invalid: {e}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error parsing graph refinement response: {e}")
+            raise ValueError(f"Failed to parse graph refinement response: {e}")
+
+    def _parse_graph_refinement_tuples(self, response_text: str) -> 'GraphRefinementResponse':
+        """
+        Parse tuple format response into GraphRefinementResponse Pydantic model.
+        Expected format:
+        ("entity"<|>name<|>type<|>description)
+        ("relationship"<|>type<|>source<|>target<|>description)
+        """
+        import re
+        from parameters import GraphRefinementResponse, Entity, Relationship, Triplet, TUPLE_DELIMITER
+
+        entities = []
+        relationships = []
+        triplets = []
+
+        lines = response_text.strip().split('\n')
+        failed_lines = []
+        total_non_empty_lines = 0
+
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            total_non_empty_lines += 1
+
+            try:
+                # Parse entity tuples: ("entity"<|>name<|>type<|>description)
+                entity_pattern = r'\("entity"' + re.escape(TUPLE_DELIMITER) + r'([^' + re.escape(TUPLE_DELIMITER) + r']+)' + re.escape(TUPLE_DELIMITER) + r'([^' + re.escape(TUPLE_DELIMITER) + r']+)' + re.escape(TUPLE_DELIMITER) + r'([^)]+)\)'
+                entity_match = re.match(entity_pattern, line)
+
+                if entity_match:
+                    name, entity_type, description = entity_match.groups()
+                    entities.append(Entity(
+                        name=name.strip(),
+                        type=entity_type.strip(),
+                        description=description.strip()
+                    ))
+                    continue
+
+                # Parse relationship tuples: ("relationship"<|>type<|>source<|>target<|>description)
+                rel_pattern = r'\("relationship"' + re.escape(TUPLE_DELIMITER) + r'([^' + re.escape(TUPLE_DELIMITER) + r']+)' + re.escape(TUPLE_DELIMITER) + r'([^' + re.escape(TUPLE_DELIMITER) + r']+)' + re.escape(TUPLE_DELIMITER) + r'([^' + re.escape(TUPLE_DELIMITER) + r']+)' + re.escape(TUPLE_DELIMITER) + r'([^)]+)\)'
+                rel_match = re.match(rel_pattern, line)
+
+                if rel_match:
+                    rel_type, source, target, description = rel_match.groups()
+                    relationships.append(Relationship(
+                        source_entity=source.strip(),
+                        target_entity=target.strip(),
+                        relationship_type=rel_type.strip(),
+                        description=description.strip(),
+                        evidence=""  # Empty evidence for tuple format
+                    ))
+                    # Also create triplet
+                    triplets.append(Triplet(
+                        subject=source.strip(),
+                        predicate=rel_type.strip(),
+                        object=target.strip()
+                    ))
+                    continue
+
+                # If line doesn't match either pattern, log warning and track
+                if line:
+                    failed_lines.append((line_num, line[:100]))
+                    self.logger.warning(f"Line {line_num} doesn't match tuple format: {line[:100]}")
+
+            except Exception as e:
+                self.logger.error(f"Error parsing line {line_num}: {e}")
+                failed_lines.append((line_num, line[:100]))
+                continue
+
+        # Summary logging
+        success_count = len(entities) + len(relationships)
+        self.logger.info(f"Tuple parsing: {len(entities)} entities, {len(relationships)} relationships from {total_non_empty_lines} lines")
+
+        if failed_lines:
+            failure_rate = len(failed_lines) / total_non_empty_lines * 100 if total_non_empty_lines > 0 else 0
+            self.logger.warning(
+                f"⚠️  {len(failed_lines)} of {total_non_empty_lines} lines failed to parse ({failure_rate:.1f}% failure rate). "
+                f"First 3 failed lines: {failed_lines[:3]}"
+            )
+
+        if total_non_empty_lines > 0 and success_count == 0:
+            self.logger.error(
+                f"❌ COMPLETE PARSING FAILURE: 0 items extracted from {total_non_empty_lines} lines. "
+                f"LLM likely returned wrong format. Expected tuple format with <|> delimiter."
+            )
+
+        return GraphRefinementResponse(
+            new_entities=entities,
+            new_relationships=relationships,
+            new_triplets=triplets,
+            reasoning="Extracted from tuple format"
+        )
 
     @message_handler
     async def handle_graph_start(self, message: GraphStartMessage, ctx: MessageContext) -> GraphReadyMessage:
         """Handle GraphStart message by chunking text and building/refining graph."""
         self.logger.info(f"GraphBuilderAgent processing batch {message.batch_id} with chunk_size {message.chunk_size}")
+
+        # Store message attributes for logging in _process_chunk and _process_refinement_chunk
+        self.current_batch_id = message.batch_id
+        self.current_dataset = message.dataset
+        self.current_setting = message.setting
 
         # Load shared state
         current_state = message.shared_state
@@ -2120,6 +2437,13 @@ class GraphBuilderAgent(RoutedAgent):
         # Determine if this is graph creation (first iteration) or refinement (subsequent iterations)
         is_first_iteration = message.repetition == 0
         self.logger.info(f"Graph mode: {'Creation' if is_first_iteration else 'Refinement'} (iteration {message.repetition})")
+
+        print(f"\n{'='*80}")
+        print(f"🔧 GRAPH BUILDING MODE DECISION")
+        print(f"{'='*80}")
+        print(f"Iteration: {message.repetition}")
+        print(f"Mode: {'CREATION (first iteration)' if is_first_iteration else 'REFINEMENT (subsequent iteration)'}")
+        print(f"{'='*80}\n")
 
         if not corpus:
             self.logger.error("No document text found in any expected location!")
@@ -2178,6 +2502,14 @@ class GraphBuilderAgent(RoutedAgent):
             missing_keywords = current_state.get("missing_keywords_for_refinement", [])
             self.logger.info(f"🔍 Keywords retrieved: {missing_keywords} (count: {len(missing_keywords)})")
 
+            print(f"\n{'='*80}")
+            print(f"🔍 MISSING KEYWORDS CHECK (Iteration {message.repetition})")
+            print(f"{'='*80}")
+            print(f"Keywords for refinement: {missing_keywords}")
+            print(f"Keyword count: {len(missing_keywords)}")
+            print(f"State has 'missing_keywords_for_refinement' key: {'missing_keywords_for_refinement' in current_state}")
+            print(f"{'='*80}\n")
+
             # If no keywords provided, skip refinement and reuse previous graph
             if not missing_keywords:
                 print(f"\n{'='*80}")
@@ -2201,9 +2533,38 @@ class GraphBuilderAgent(RoutedAgent):
 
             else:
                 # Focused refinement: extract context around missing keywords
+                print(f"\n{'='*80}")
+                print(f"🎯 FOCUSED REFINEMENT MODE ACTIVATED")
+                print(f"{'='*80}")
+                print(f"Keywords to search: {missing_keywords}")
+                print(f"Keyword count: {len(missing_keywords)}")
+                print(f"Corpus length: {len(corpus)} characters")
+                print(f"Context window: 800 characters")
+                print(f"{'='*80}\n")
+
                 self.logger.info(f"🎯 FOCUSED REFINEMENT MODE: extracting context for {len(missing_keywords)} keywords")
                 self.logger.info(f"Missing keywords: {missing_keywords}")
-                focused_text = self._extract_focused_context(corpus, missing_keywords, context_window=800)
+                focused_text, unfound_keywords = self._extract_focused_context(corpus, missing_keywords, context_window=800)
+
+                # Store unfound keywords in history for response evaluator
+                unfound_keywords_history = current_state.get("unfound_keywords_history", [])
+                if unfound_keywords:
+                    unfound_keywords_history.extend(unfound_keywords)
+                    # Deduplicate while preserving order
+                    unfound_keywords_history = list(dict.fromkeys(unfound_keywords_history))
+                    self.logger.info(f"📝 Storing {len(unfound_keywords)} unfound keywords: {unfound_keywords}")
+                    self.logger.info(f"📝 Total unfound keywords history: {len(unfound_keywords_history)} keywords")
+                current_state["unfound_keywords_history"] = unfound_keywords_history
+                self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+
+                print(f"\n{'='*80}")
+                print(f"📊 FOCUSED CONTEXT EXTRACTION RESULT")
+                print(f"{'='*80}")
+                print(f"Focused text extracted: {'YES' if focused_text else 'NO'}")
+                print(f"Focused text length: {len(focused_text) if focused_text else 0} characters")
+                print(f"Unfound keywords: {unfound_keywords if unfound_keywords else 'None'}")
+                print(f"Decision: {'PROCEED WITH REFINEMENT' if focused_text else 'SKIP REFINEMENT (no co-occurrence contexts found)'}")
+                print(f"{'='*80}\n")
 
                 if focused_text:
                     # Split focused text into chunks
@@ -2217,23 +2578,70 @@ class GraphBuilderAgent(RoutedAgent):
                     self.logger.info(f"🎯 TEXT REDUCTION: {full_corpus_size} → {focused_size} chars ({reduction_pct:.1f}% reduction)")
                     self.logger.info(f"🎯 CHUNK REDUCTION: {full_chunks_count} → {len(chunks)} chunks (processing only {len(chunks)/full_chunks_count*100:.1f}% of full corpus)")
                     self.logger.info(f"🎯 LLM CALLS SAVED: {full_chunks_count - len(chunks)} fewer calls to graph extraction LLM")
+
+                    self.logger.info(f"Split text into {len(chunks)} chunks for graph refinement")
+
+                    print(f"\n{'='*80}")
+                    print(f"🚀 STARTING GRAPH REFINEMENT EXECUTION")
+                    print(f"{'='*80}")
+                    print(f"Model: gemini-2.5-flash (Gemini)")
+                    print(f"Chunks to process: {len(chunks)}")
+                    print(f"Full corpus chunks (if not focused): {full_chunks_count}")
+                    print(f"LLM calls saved: {full_chunks_count - len(chunks)}")
+                    print(f"Text reduction: {reduction_pct:.1f}%")
+                    print(f"Learned system prompt length: {len(learned_system_prompt)} chars")
+                    print(f"{'='*80}\n")
+
+                    # Save refinement prompt template to shared state
+                    current_state["graph_refinement_prompt"] = self.base_prompt_graph_refinement
+
+                    # Process refinement (without passing existing graph summary to the prompt)
+                    new_entities, new_relationships, new_triplets = await self._process_graph_refinement(
+                        chunks, learned_system_prompt, ctx
+                    )
+
+                    print(f"\n{'='*80}")
+                    print(f"✅ GRAPH REFINEMENT COMPLETED")
+                    print(f"{'='*80}")
+                    print(f"New entities extracted: {len(new_entities)}")
+                    print(f"New relationships extracted: {len(new_relationships)}")
+                    print(f"New triplets extracted: {len(new_triplets)}")
+                    print(f"{'='*80}\n")
+
+                    # Validate refinement results
+                    if len(chunks) > 0 and len(new_entities) == 0 and len(new_relationships) == 0:
+                        self.logger.error(
+                            f"⚠️  REFINEMENT FAILURE: Processed {len(chunks)} chunks but extracted 0 entities and 0 relationships. "
+                            f"This likely indicates a parsing error or incorrect LLM response format. "
+                            f"Check logs for parsing errors or tuple format validation warnings."
+                        )
+                    elif len(new_entities) == 0 and len(new_relationships) == 0:
+                        self.logger.warning(
+                            f"⚠️  Refinement produced no new entities or relationships from {len(chunks)} chunks. "
+                            f"This may be expected if focused text contains no new information."
+                        )
+                    else:
+                        self.logger.info(f"✓ Refinement successful: extracted {len(new_entities)} new entities, {len(new_relationships)} new relationships")
+
+                    # For refinement, merge new entities/relationships with existing ones
+                    existing_entities, existing_relationships, existing_triplets = await self._load_existing_graph_data()
+
+                    # Clear refinement_skipped flag since we performed refinement
+                    current_state["refinement_skipped"] = False
+                    self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
                 else:
-                    # Fallback to full corpus if no contexts found
-                    self.logger.warning("⚠️  No context found for keywords, falling back to full corpus")
-                    chunks = self._split_text_into_chunks(corpus, message.chunk_size)
+                    # No co-occurrence contexts found - skip refinement and reuse existing graph
+                    self.logger.info("⏭️  SKIPPING graph refinement - no co-occurrence contexts found, reusing previous graph and communities")
 
-                self.logger.info(f"Split text into {len(chunks)} chunks for graph refinement")
+                    # Load existing graph data (don't create new entities/relationships)
+                    existing_entities, existing_relationships, existing_triplets = await self._load_existing_graph_data()
 
-                # Save refinement prompt template to shared state
-                current_state["graph_refinement_prompt"] = self.base_prompt_graph_refinement
+                    # Set new entities to empty (no refinement performed)
+                    new_entities, new_relationships, new_triplets = [], [], []
 
-                # Process refinement (without passing existing graph summary to the prompt)
-                new_entities, new_relationships, new_triplets = await self._process_graph_refinement(
-                    chunks, learned_system_prompt, ctx
-                )
-
-                # For refinement, merge new entities/relationships with existing ones
-                existing_entities, existing_relationships, existing_triplets = await self._load_existing_graph_data()
+                    # Signal to retrieval agent that it should reuse community summaries
+                    current_state["refinement_skipped"] = True
+                    self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
                 # Log existing entities details
                 if existing_entities:
@@ -2267,6 +2675,10 @@ class GraphBuilderAgent(RoutedAgent):
         all_entities, all_relationships, all_triplets = self._resolve_entities(
             all_entities, all_relationships, all_triplets
         )
+
+        # Add placeholder entities for missing relationship endpoints
+        # This ensures all relationships can be created even if the LLM didn't explicitly define some entities
+        all_entities = self._add_placeholder_entities(all_entities, all_relationships)
 
         # Convert to memgraph JSON format and save to file (with iteration-based edge weighting)
         graph_json = self._convert_to_memgraph_format(all_entities, all_relationships, all_triplets, iteration=message.repetition)
@@ -2325,6 +2737,17 @@ class GraphBuilderAgent(RoutedAgent):
                 type_desc = ", ".join([f"{count} {etype}" for etype, count in sorted(entity_types.items(), key=lambda x: x[1], reverse=True)[:5]])
                 graph_description += f"Main entity types: {type_desc}."
 
+                # Check for high ratio of undefined entities
+                undefined_count = entity_types.get("undefined", 0)
+                if undefined_count > 0:
+                    undefined_ratio = (undefined_count / len(all_entities)) * 100
+                    self.logger.info(f"Graph contains {undefined_count} undefined entities ({undefined_ratio:.1f}%)")
+                    if undefined_ratio > 20:
+                        self.logger.warning(
+                            f"High ratio of undefined entities ({undefined_ratio:.1f}%) - "
+                            f"LLM may be producing inconsistent entity references in relationships"
+                        )
+
             # Save to shared state
             current_state["graph_description"] = graph_description
             current_state["graph_statistics"] = connectivity_metrics
@@ -2339,6 +2762,46 @@ class GraphBuilderAgent(RoutedAgent):
                 "total_relationships": len(all_relationships) if all_relationships else 0
             }
 
+        # Perform community detection and summarization
+        self.logger.info("Starting community detection and summarization")
+        all_community_summaries = ""
+        try:
+            from community_graph_utils import load_and_process_graph
+            from parameters import default_community_levels
+
+            # Load and process graph with community detection
+            community_manager = await load_and_process_graph(
+                graph_filename,
+                self.model_client_summarization,  # Use plain text LLM client for summarization
+                embedding_model=None,  # Use TF-IDF fallback
+                learned_prompt="",  # Always use base prompt, no optimization
+                community_levels=default_community_levels  # Use configured level filter
+            )
+
+            if community_manager and community_manager.community_summaries:
+                # Concatenate all community summaries
+                all_summaries = []
+                for comm_id, summary in community_manager.community_summaries.items():
+                    all_summaries.append(f"Community {comm_id}:\n{summary}\n")
+
+                all_community_summaries = "\n".join(all_summaries)
+                self.logger.info(f"Generated summaries for {len(community_manager.community_summaries)} communities")
+                self.logger.info(f"Total community summaries length: {len(all_community_summaries)} characters")
+
+                # Store community summaries in shared state for logging
+                current_state["community_summaries"] = community_manager.community_summaries
+                current_state["community_summarization_logs"] = community_manager.community_summarization_logs
+                self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            else:
+                self.logger.warning("No communities detected or community manager failed")
+                all_community_summaries = "No communities detected in the knowledge graph."
+
+        except Exception as e:
+            self.logger.error(f"Error during community detection and summarization: {e}")
+            import traceback
+            traceback.print_exc()
+            all_community_summaries = f"Error during community detection: {str(e)}"
+
         # Send GraphReady message
         graph_ready_msg = GraphReadyMessage(
             batch_id=message.batch_id,
@@ -2346,10 +2809,11 @@ class GraphBuilderAgent(RoutedAgent):
             graph_description=graph_description,
             connectivity_metrics=connectivity_metrics,
             dataset=message.dataset,
-            setting=message.setting
+            setting=message.setting,
+            all_community_summaries=all_community_summaries
         )
 
-        self.logger.info(f"Returning GraphReady for batch {message.batch_id}")
+        self.logger.info(f"Returning GraphReady for batch {message.batch_id} with {len(all_community_summaries)} chars of community summaries")
 
         # Return the GraphReady message
         return graph_ready_msg
@@ -2375,21 +2839,26 @@ class GraphBuilderAgent(RoutedAgent):
 
         return chunks
 
-    def _extract_focused_context(self, text: str, keywords: List[str], context_window: int = 300) -> str:
+    def _extract_focused_context(self, text: str, keywords: List[str], context_window: int = 300, max_contexts: int = 30) -> Tuple[str, List[str]]:
         """
         Extract context windows where at least TWO keywords co-occur.
         Uses exact matching first, then falls back to fuzzy matching if needed.
+
+        Includes anti-explosion mechanisms:
+        - Merges overlapping contexts (>50% overlap)
+        - Limits total contexts to max_contexts to prevent chunk explosion
 
         Args:
             text: The full document text
             keywords: List of keywords/phrases to search for
             context_window: Number of characters to include before and after keyword matches
+            max_contexts: Maximum number of contexts to return (prevents explosion)
 
         Returns:
-            Concatenated context windows containing at least 2 keywords
+            Tuple of (concatenated context windows, list of keywords that were not found)
         """
         if not keywords:
-            return ""
+            return "", []
 
         if len(keywords) == 1:
             # If only one keyword, fall back to single keyword matching
@@ -2461,9 +2930,9 @@ class GraphBuilderAgent(RoutedAgent):
                     word_overlap = len(keyword_words & sentence_words) / len(keyword_words) if keyword_words else 0
 
                     # Consider it a match if either:
-                    # 1. Similarity ratio is high (> 0.6)
-                    # 2. Significant word overlap (> 0.5) and some similarity (> 0.3)
-                    if similarity > 0.6 or (word_overlap > 0.5 and similarity > 0.3):
+                    # 1. Similarity ratio is moderate (> 0.4) - MORE PERMISSIVE
+                    # 2. Significant word overlap (> 0.4) and some similarity (> 0.2) - MORE PERMISSIVE
+                    if similarity > 0.4 or (word_overlap > 0.4 and similarity > 0.2):
                         best_matches.append((sentence, similarity, word_overlap))
 
                 # Sort by similarity and take top matches
@@ -2498,10 +2967,13 @@ class GraphBuilderAgent(RoutedAgent):
             print(f"✗ Need at least 2 keywords found for co-occurrence, but only found {len(keyword_positions)}")
             print(f"{'='*80}\n")
             self.logger.warning(f"✗ Insufficient keywords for co-occurrence ({len(keyword_positions)}/2 minimum)")
-            return ""
+            # Return unfound keywords
+            still_missing = list(set(keywords) - keywords_found)
+            return "", still_missing
 
         # Find all contexts where at least 2 keywords co-occur
-        contexts = []
+        # Store contexts with position info: (start, end, text, keywords_in_window)
+        context_candidates = []
         seen_contexts = set()
         co_occurrence_count = 0
 
@@ -2529,31 +3001,94 @@ class GraphBuilderAgent(RoutedAgent):
 
                     if context_hash not in seen_contexts:
                         seen_contexts.add(context_hash)
-                        contexts.append(context)
+                        context_candidates.append((context_start, context_end, context, keywords_in_window))
                         co_occurrence_count += 1
                         print(f"  ✓ Co-occurrence found: {list(keywords_in_window)} at position {start1}")
 
         print(f"\n{'='*80}")
-        print(f"🔍 KEYWORD SEARCH - Final Results")
+        print(f"🔧 CONTEXT OPTIMIZATION - Merging & Limiting")
         print(f"{'='*80}")
+        print(f"Initial contexts extracted: {len(context_candidates)}")
 
-        if contexts:
-            print(f"✓ Found {len(contexts)} context windows with keyword co-occurrence")
-            print(f"✓ Total extracted text: {sum(len(c) for c in contexts)} chars")
-            print(f"{'='*80}\n")
-            self.logger.info(f"✓ Extracted {len(contexts)} context windows with co-occurrence")
-        else:
+        # Calculate unfound keywords for return
+        still_missing = list(set(keywords) - keywords_found)
+
+        if not context_candidates:
             print(f"✗ No contexts with keyword co-occurrence found")
             print(f"{'='*80}\n")
             self.logger.warning(f"✗ No contexts with keyword co-occurrence found")
-            return ""
+            return "", still_missing
+
+        # SOLUTION 1: Merge overlapping contexts
+        # Sort contexts by start position
+        context_candidates.sort(key=lambda x: x[0])
+
+        merged_contexts = []
+        current_start, current_end, current_text, current_keywords = context_candidates[0]
+
+        for i in range(1, len(context_candidates)):
+            next_start, next_end, next_text, next_keywords = context_candidates[i]
+
+            # Calculate overlap: contexts overlap if one starts before the other ends
+            overlap_start = max(current_start, next_start)
+            overlap_end = min(current_end, next_end)
+            overlap_length = max(0, overlap_end - overlap_start)
+
+            # Calculate overlap percentage relative to smaller context
+            smaller_length = min(current_end - current_start, next_end - next_start)
+            overlap_pct = (overlap_length / smaller_length * 100) if smaller_length > 0 else 0
+
+            # Merge if overlap is > 50%
+            if overlap_pct > 50:
+                # Merge: extend current context to include next context
+                current_end = max(current_end, next_end)
+                current_start = min(current_start, next_start)
+                # Re-extract text from merged range
+                current_text = text[current_start:current_end].strip()
+                # Combine keywords
+                current_keywords = current_keywords | next_keywords
+                print(f"  ✓ Merged contexts (overlap: {overlap_pct:.1f}%): positions {next_start}-{next_end} into {current_start}-{current_end}")
+            else:
+                # No significant overlap, save current and start new
+                merged_contexts.append((current_start, current_end, current_text, current_keywords))
+                current_start, current_end, current_text, current_keywords = next_start, next_end, next_text, next_keywords
+
+        # Don't forget the last context
+        merged_contexts.append((current_start, current_end, current_text, current_keywords))
+
+        print(f"After merging: {len(merged_contexts)} contexts")
+        self.logger.info(f"🔧 Merged overlapping contexts: {len(context_candidates)} → {len(merged_contexts)}")
+
+        # SOLUTION 2: Limit number of contexts to prevent explosion
+        if len(merged_contexts) > max_contexts:
+            # Sort by keyword density (more keywords = higher priority)
+            merged_contexts.sort(key=lambda x: len(x[3]), reverse=True)
+            # Keep only top max_contexts
+            limited_contexts = merged_contexts[:max_contexts]
+            # Re-sort by position for coherent concatenation
+            limited_contexts.sort(key=lambda x: x[0])
+            print(f"Applied context limit: {len(merged_contexts)} → {max_contexts} contexts (keeping highest keyword density)")
+            self.logger.info(f"🔧 Limited contexts to prevent explosion: {len(merged_contexts)} → {max_contexts}")
+            merged_contexts = limited_contexts
+
+        # Extract just the text from the (start, end, text, keywords) tuples
+        contexts = [ctx[2] for ctx in merged_contexts]
+
+        print(f"\n{'='*80}")
+        print(f"🔍 KEYWORD SEARCH - Final Results")
+        print(f"{'='*80}")
+        print(f"✓ Final contexts after optimization: {len(contexts)}")
+        print(f"✓ Total extracted text: {sum(len(c) for c in contexts)} chars")
+        print(f"{'='*80}\n")
+        self.logger.info(f"✓ Extracted {len(contexts)} context windows after merging & limiting")
 
         # Concatenate all contexts with separators
         focused_text = "\n\n---\n\n".join(contexts)
 
         self.logger.info(f"Extracted {len(contexts)} context windows with keyword co-occurrence (total length: {len(focused_text)} chars)")
+        self.logger.info(f"Keywords NOT found: {still_missing}")
 
-        return focused_text
+        return focused_text, still_missing
 
     async def _process_chunk(self, chunk: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
         """Process a text chunk to extract entities and relationships."""
@@ -2570,6 +3105,15 @@ class GraphBuilderAgent(RoutedAgent):
         )
 
         # Log LLM interaction
+        # Get current QA pair and iteration from shared state for logging
+        try:
+            current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
+            current_qa_pair_id = current_state.get("current_qa_pair_id", None)
+            current_iteration = current_state.get("current_iteration", None)
+        except Exception:
+            current_qa_pair_id = None
+            current_iteration = None
+
         logger = get_global_prompt_logger()
         logger.log_interaction(
             agent_name="GraphBuilderAgent",
@@ -2577,16 +3121,18 @@ class GraphBuilderAgent(RoutedAgent):
             system_prompt=learned_system_prompt,
             user_prompt=prompt_content,
             llm_response=response.content if isinstance(response.content, str) else str(response.content),
+            batch_id=self.current_batch_id,
+            qa_pair_id=current_qa_pair_id,
+            iteration=current_iteration,
             additional_metadata={
                 "chunk_length": len(chunk),
                 "mode": "creation"
             }
         )
 
-        # Parse structured response
+        # Parse structured response using custom parser
         assert isinstance(response.content, str)
-        from parameters import GraphBuilderResponse
-        graph_response = GraphBuilderResponse.model_validate_json(response.content)
+        graph_response = self._parse_graph_builder_response(response.content)
 
         return graph_response.entities, graph_response.relationships, graph_response.triplets
 
@@ -2618,9 +3164,8 @@ class GraphBuilderAgent(RoutedAgent):
                 "type": entity.type
             }
 
-            # Add entity properties to node properties
-            for prop in entity.properties:
-                properties[prop.key] = prop.value
+            # Add entity description to node properties
+            properties["description"] = entity.description
 
             node = {
                 "id": node_id,
@@ -2635,7 +3180,7 @@ class GraphBuilderAgent(RoutedAgent):
         # Weight formula: log(iteration + 1) + 1 for less aggressive weighting
         # iteration 0 -> weight 1.0, iteration 1 -> weight 1.69, iteration 2 -> weight 2.10, etc.
         import math
-        edge_weight = math.log(iteration + 1) + 1
+        edge_weight = 1
         rel_id_counter = 2000  # Start with high numbers to avoid conflicts
         for relationship in relationships:
             # Get node IDs for start and end nodes
@@ -2662,6 +3207,58 @@ class GraphBuilderAgent(RoutedAgent):
                 rel_id_counter += 1
 
         return memgraph_items
+
+    def _add_placeholder_entities(self, entities: List, relationships: List) -> List:
+        """
+        Add placeholder Entity objects for entities referenced in relationships
+        but not explicitly defined.
+
+        Args:
+            entities: List of explicitly defined entities
+            relationships: List of relationships
+
+        Returns:
+            Updated entity list including placeholders
+        """
+        from parameters import Entity
+
+        # Get set of existing entity names
+        existing_names = {entity.name for entity in entities}
+
+        # Find missing entity names referenced in relationships
+        missing_names = set()
+        for rel in relationships:
+            # Check source entity
+            if rel.source_entity and rel.source_entity.strip():
+                if rel.source_entity not in existing_names:
+                    missing_names.add(rel.source_entity)
+
+            # Check target entity
+            if rel.target_entity and rel.target_entity.strip():
+                if rel.target_entity not in existing_names:
+                    missing_names.add(rel.target_entity)
+
+        # Create placeholder entities with undefined type and description
+        placeholder_entities = []
+        for name in missing_names:
+            placeholder = Entity(
+                name=name,
+                type="undefined",
+                description="undefined"
+            )
+            placeholder_entities.append(placeholder)
+
+        # Log if placeholders were created
+        if placeholder_entities:
+            missing_names_sorted = sorted(list(missing_names))
+            self.logger.warning(
+                f"Auto-created {len(placeholder_entities)} undefined nodes for entities "
+                f"referenced in relationships but not defined by LLM: "
+                f"{missing_names_sorted[:10]}{'...' if len(missing_names) > 10 else ''}"
+            )
+
+        # Return merged list
+        return list(entities) + placeholder_entities
 
     async def _process_graph_creation(self, chunks: List[str], learned_system_prompt: str, ctx: MessageContext) -> tuple:
         """Process chunks for graph creation mode."""
@@ -2707,16 +3304,22 @@ class GraphBuilderAgent(RoutedAgent):
         # Process all chunks asynchronously for better time efficiency
         self.logger.info(f"Starting concurrent refinement processing of {len(chunks)} chunks")
 
+        # Track chunk processing results
+        chunks_with_results = 0
+        chunks_with_no_results = 0
+
         # Create tasks for all chunks
         async def process_refinement_chunk_with_index(i: int, chunk: str) -> tuple:
             """Wrapper to process refinement chunk with index for logging and error handling."""
             try:
                 self.logger.info(f"Processing refinement chunk {i+1}/{len(chunks)}")
                 entities, relationships, triplets = await self._process_refinement_chunk(chunk, learned_system_prompt, ctx)
-                self.logger.info(f"Completed refinement chunk {i+1}/{len(chunks)}")
+                self.logger.info(f"Completed refinement chunk {i+1}/{len(chunks)}: {len(entities)} entities, {len(relationships)} relationships")
                 return entities, relationships, triplets
             except Exception as e:
-                self.logger.error(f"Error processing refinement chunk {i+1}: {e}")
+                self.logger.error(f"❌ Error processing refinement chunk {i+1}: {e}")
+                import traceback
+                self.logger.error(f"Traceback: {traceback.format_exc()}")
                 return [], [], []  # Return empty results for failed chunks
 
         # Execute all chunk processing tasks concurrently
@@ -2724,13 +3327,26 @@ class GraphBuilderAgent(RoutedAgent):
         tasks = [process_refinement_chunk_with_index(i, chunk) for i, chunk in enumerate(chunks)]
         chunk_results = await asyncio.gather(*tasks, return_exceptions=False)
 
-        # Aggregate results from all chunks
-        for entities, relationships, triplets in chunk_results:
+        # Aggregate results from all chunks and track statistics
+        for i, (entities, relationships, triplets) in enumerate(chunk_results):
+            if len(entities) > 0 or len(relationships) > 0:
+                chunks_with_results += 1
+            else:
+                chunks_with_no_results += 1
+
             all_entities.extend(entities)
             all_relationships.extend(relationships)
             all_triplets.extend(triplets)
 
         self.logger.info(f"Completed concurrent refinement processing of all {len(chunks)} chunks")
+        self.logger.info(f"Chunk results: {chunks_with_results} chunks with data, {chunks_with_no_results} chunks with no data")
+
+        # Warn if many chunks produced no results
+        if len(chunks) > 0 and chunks_with_no_results / len(chunks) > 0.5:
+            self.logger.warning(
+                f"⚠️  More than 50% of chunks ({chunks_with_no_results}/{len(chunks)}) produced no results. "
+                f"This may indicate parsing errors or LLM format issues."
+            )
 
         log_agent_action(self.logger, "GraphRefinement", "LLM refinement",
                         entities=len(all_entities),
@@ -2741,56 +3357,104 @@ class GraphBuilderAgent(RoutedAgent):
 
     async def _process_refinement_chunk(self, chunk: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
         """Process a single text chunk for graph refinement."""
-        # Prepare the refinement prompt (no existing graph summary)
-        user_prompt = self.base_prompt_graph_refinement.format(chunk)
+        # Extract only the output format section from base_prompt_graph_refinement
+        # The base prompt contains steps, examples, constraints, text placeholder, and output format
+        # We need to extract only the abstract output format (from "# Output Format" onwards)
+        base_prompt_lines = self.base_prompt_graph_refinement.split('\n')
 
-        # Add instruction to focus on entity/relationship types from system prompt
-        type_focus_instruction = (
-            "\n\n" + "=" * 80 + "\n"
-            "CRITICAL CONSTRAINT:\n"
-            "=" * 80 + "\n"
-            "Extract ONLY entities and relationships that are explicitly required by the system prompt.\n"
-            "- DO NOT extract any entity types not mentioned in the system prompt\n"
-            "- DO NOT extract any relationship types not mentioned in the system prompt\n"
-            "- DO NOT include any information that is not directly useful for satisfying the system prompt requirements\n"
-            "- If an entity or relationship does not fit the categories defined in the system prompt, SKIP it entirely\n"
-            "- Focus exclusively on what the system prompt asks for - nothing more, nothing less\n"
-            "=" * 80 + "\n"
-        )
-        user_prompt += type_focus_instruction
+        # Find the "# Output Format" section
+        output_format_start = None
+        for i, line in enumerate(base_prompt_lines):
+            if line.strip() == "# Output Format":
+                output_format_start = i
+                break
 
-        # Create complete prompt with optional system message
-        if learned_system_prompt:
-            messages = [
-                SystemMessage(content=learned_system_prompt),
-                UserMessage(content=user_prompt, source="user")
-            ]
+        # Extract the output format section
+        if output_format_start is not None:
+            output_format_section = '\n'.join(base_prompt_lines[output_format_start:])
         else:
-            messages = [UserMessage(content=user_prompt, source="user")]
+            # Fallback if structure changes - use the full base prompt
+            output_format_section = self.base_prompt_graph_refinement.format(chunk)
+
+        # Build the user prompt: Learned Prompt + Text + Output Format
+        if learned_system_prompt:
+            user_prompt = learned_system_prompt
+            user_prompt += "\n\n" + "=" * 80 + "\n"
+            user_prompt += "# Text to Analyze\n\n"
+            user_prompt += chunk
+            user_prompt += "\n\n" + "=" * 80 + "\n"
+            user_prompt += output_format_section
+        else:
+            # If no learned prompt, use the original base prompt
+            user_prompt = self.base_prompt_graph_refinement.format(chunk)
+
+        # Create messages with empty system prompt (only user message)
+        messages = [UserMessage(content=user_prompt, source="user")]
 
         # Use refinement model client
         response = await self.model_client_refinement.create(messages, cancellation_token=ctx.cancellation_token)
 
         # Log LLM interaction
+        # Get current QA pair and iteration from shared state for logging
+        try:
+            current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, self.current_batch_id)
+            current_qa_pair_id = current_state.get("current_qa_pair_id", None)
+            current_iteration = current_state.get("current_iteration", None)
+        except Exception:
+            current_qa_pair_id = None
+            current_iteration = None
+
         logger = get_global_prompt_logger()
         logger.log_interaction(
             agent_name="GraphBuilderAgent",
             interaction_type="graph_refinement",
-            system_prompt=learned_system_prompt if learned_system_prompt else "",
+            system_prompt="",  # System prompt is now empty
             user_prompt=user_prompt,
             llm_response=response.content if isinstance(response.content, str) else str(response.content),
+            batch_id=self.current_batch_id,
+            qa_pair_id=current_qa_pair_id,
+            iteration=current_iteration,
             additional_metadata={
                 "chunk_length": len(chunk),
                 "mode": "refinement"
             }
         )
 
-        # Parse structured response
-        assert isinstance(response.content, str)
-        from parameters import GraphRefinementResponse
-        refinement_response = GraphRefinementResponse.model_validate_json(response.content)
+        # Parse structured response using tuple parser
+        if not isinstance(response.content, str):
+            self.logger.error(f"Unexpected response type from LLM: {type(response.content)}. Expected string.")
+            self.logger.error(f"Response content: {response.content}")
+            return [], [], []
 
-        return refinement_response.new_entities, refinement_response.new_relationships, refinement_response.new_triplets
+        # Try tuple parsing first
+        try:
+            refinement_response = self._parse_graph_refinement_tuples(response.content)
+
+            # Check if parsing produced any results
+            if (len(refinement_response.new_entities) == 0 and
+                len(refinement_response.new_relationships) == 0 and
+                len(response.content.strip()) > 100):
+                # Response has content but no entities/relationships extracted
+                self.logger.warning(
+                    f"Tuple parsing extracted 0 entities and 0 relationships from {len(response.content)} character response. "
+                    f"LLM may have returned wrong format. First 500 chars of response:\n{response.content[:500]}"
+                )
+
+                # Try JSON parsing as fallback
+                self.logger.info("Attempting fallback to JSON parsing...")
+                try:
+                    refinement_response = self._parse_graph_refinement_response(response.content)
+                    self.logger.info(f"✓ JSON fallback successful: {len(refinement_response.new_entities)} entities, {len(refinement_response.new_relationships)} relationships")
+                except Exception as json_error:
+                    self.logger.error(f"JSON fallback parsing also failed: {json_error}")
+                    # Return the original (empty) tuple parsing result
+
+            return refinement_response.new_entities, refinement_response.new_relationships, refinement_response.new_triplets
+
+        except Exception as e:
+            self.logger.error(f"Failed to parse refinement response: {e}")
+            self.logger.error(f"Response content (first 1000 chars): {response.content[:1000]}")
+            return [], [], []
 
     async def _get_existing_graph_summary(self) -> str:
         """Get a summary of the existing graph from Memgraph."""
@@ -2808,7 +3472,7 @@ class GraphBuilderAgent(RoutedAgent):
             # Try to load the existing graph file to get the actual entities/relationships
             import os
             import json
-            from parameters import Entity, Relationship, Triplet, EntityProperty
+            from parameters import Entity, Relationship, Triplet
 
             graphs_dir = "graphs"
             # We need to figure out the current batch info to find the right file
@@ -2850,17 +3514,13 @@ class GraphBuilderAgent(RoutedAgent):
                     # Convert back to Entity format
                     props = item.get("properties", {})
 
-                    # Create entity properties list from additional properties
-                    entity_properties = []
-                    for key, value in props.items():
-                        if key not in ["name", "type"]:  # Skip main fields
-                            entity_prop = EntityProperty(key=key, value=str(value))
-                            entity_properties.append(entity_prop)
+                    # Extract description from properties
+                    description = props.get("description", "")
 
                     entity = Entity(
                         name=props.get("name", ""),
                         type=props.get("type", ""),
-                        properties=entity_properties
+                        description=description
                     )
                     entities.append(entity)
 
@@ -3001,19 +3661,18 @@ class GraphBuilderAgent(RoutedAgent):
                 # Merge entities in this cluster
                 primary_entity = cluster[0]  # Use first entity as primary
 
-                # Merge properties from all entities in the cluster
-                merged_properties = list(primary_entity.properties)  # Start with primary entity's properties
-                property_keys_seen = {prop.key for prop in primary_entity.properties}
+                # Merge descriptions from all entities in the cluster
+                merged_description = primary_entity.description
+                descriptions_seen = {primary_entity.description}
 
                 for entity in cluster[1:]:  # Skip primary entity, start from second
-                    for prop in entity.properties:
-                        # Add property if key is not already present
-                        if prop.key not in property_keys_seen:
-                            merged_properties.append(prop)
-                            property_keys_seen.add(prop.key)
+                    # Add description if it's different and adds new information
+                    if entity.description and entity.description not in descriptions_seen:
+                        merged_description += "; " + entity.description
+                        descriptions_seen.add(entity.description)
 
-                # Update primary entity with merged properties
-                primary_entity.properties = merged_properties
+                # Update primary entity with merged description
+                primary_entity.description = merged_description
 
                 # Collect all names for mapping
                 for entity in cluster:
@@ -3141,7 +3800,6 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
         # Initialize community graph manager
         self.community_manager = None
         self.current_graph_file = None
-        self.last_community_prompt = ""  # Track last used community summarizer prompt
 
     @message_handler
     async def handle_graph_retrieval_start(self, message: GraphRetrievalStartMessage, ctx: MessageContext) -> GraphRetrievalReadyMessage:
@@ -3164,9 +3822,8 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                     setting=message.setting
                 )
 
-            # Load shared state to check for learned community summarizer prompt
+            # Load shared state
             current_state = message.shared_state
-            learned_community_prompt = current_state.get("learned_prompt_community_summarizer", "")
 
             # Check if refinement was skipped (no missing keywords)
             refinement_skipped = current_state.get("refinement_skipped", False)
@@ -3176,12 +3833,10 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
             # 1. No community manager exists yet
             # 2. Graph file has changed (different filename)
             # 3. Graph content has changed (refinement in iteration 1+) AND refinement wasn't skipped
-            # 4. Learned community summarizer prompt has changed
             should_reprocess = (
                 self.community_manager is None or
                 self.current_graph_file != graph_filename or
-                (message.repetition > 0 and not refinement_skipped) or  # Only reprocess if graph was actually refined
-                (learned_community_prompt != self.last_community_prompt and not refinement_skipped)
+                (message.repetition > 0 and not refinement_skipped)  # Only reprocess if graph was actually refined
             )
 
             if should_reprocess:
@@ -3191,13 +3846,9 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                     self.logger.info(f"Graph file changed, reprocessing: {graph_filename}")
                 elif message.repetition > 0:
                     self.logger.info(f"Graph was refined in iteration {message.repetition}, reprocessing to detect communities with new relationships")
-                    if learned_community_prompt != self.last_community_prompt:
-                        self.logger.info(f"Additionally, learned community summarizer prompt changed (prev: {len(self.last_community_prompt)} chars, new: {len(learned_community_prompt)} chars)")
-                else:
-                    self.logger.info(f"Learned community summarizer prompt updated, re-summarizing communities")
-                    self.logger.info(f"Previous prompt length: {len(self.last_community_prompt) if hasattr(self, 'last_community_prompt') else 0}, New prompt length: {len(learned_community_prompt)}")
 
                 from community_graph_utils import load_and_process_graph
+                from parameters import default_community_levels
                 import json
 
                 # Log what's in the file before loading
@@ -3210,16 +3861,14 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 except Exception as e:
                     self.logger.error(f"Error reading graph file for verification: {e}")
 
-                if learned_community_prompt:
-                    self.logger.info(f"Using learned community summarizer prompt ({len(learned_community_prompt)} chars)")
-                else:
-                    self.logger.info("No learned community summarizer prompt found, using base prompt")
+                self.logger.info("Using base community summarizer prompt (no optimization)")
 
                 self.community_manager = await load_and_process_graph(
                     graph_filename,
                     self.summarizer_client,
                     embedding_model=None,  # Use TF-IDF fallback
-                    learned_prompt=learned_community_prompt
+                    learned_prompt="",  # Always use base prompt, no optimization
+                    community_levels=default_community_levels  # Use configured level filter
                 )
 
                 if self.community_manager is None:
@@ -3233,7 +3882,6 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                     )
 
                 self.current_graph_file = graph_filename
-                self.last_community_prompt = learned_community_prompt  # Track the prompt we used
                 self.logger.info(f"Successfully processed graph with {len(self.community_manager.communities)} communities")
 
                 # Store community summaries in shared state for backward pass critique
@@ -3248,7 +3896,7 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                     print(f"\n{'='*80}")
                     print(f"⏭️  SKIPPING COMMUNITY REPROCESSING")
                     print(f"{'='*80}")
-                    print(f"Reason: Graph refinement was skipped (no missing keywords)")
+                    print(f"Reason: Graph refinement was skipped (no missing keywords or no co-occurrence contexts found)")
                     print(f"Action: Reusing existing community manager and summaries from previous iteration")
                     print(f"{'='*80}\n")
                     self.logger.info(f"⏭️  SKIPPING community reprocessing - refinement was skipped, reusing existing communities")
@@ -3311,6 +3959,10 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                 )
 
                 # Log LLM interaction
+                # Get current QA pair and iteration from shared state for logging
+                current_qa_pair_id = current_state.get("current_qa_pair_id", None)
+                current_iteration = current_state.get("current_iteration", None)
+
                 logger = get_global_prompt_logger()
                 logger.log_interaction(
                     agent_name="GraphRetrievalPlannerAgent",
@@ -3319,7 +3971,8 @@ class GraphRetrievalPlannerAgent(RoutedAgent):
                     user_prompt=prompt_content,
                     llm_response=response.content if isinstance(response.content, str) else str(response.content),
                     batch_id=message.batch_id,
-                    iteration=1,
+                    qa_pair_id=current_qa_pair_id,
+                    iteration=current_iteration,
                     additional_metadata={
                         "query": message.query,
                         "available_communities": len(community_titles)
@@ -3457,14 +4110,185 @@ def create_graph_retrieval_planner_agent() -> GraphRetrievalPlannerAgent:
     return GraphRetrievalPlannerAgent("graph_retrieval_planner_agent")
 
 
-class AnswerGeneratorAgent(RoutedAgent):
+# ===== COMMUNITY ANSWER GENERATOR AGENT =====
+
+class CommunityAnswerGeneratorAgent(RoutedAgent):
     """
-    Agent that generates answers using retrieved context and LLM reasoning.
+    Agent that generates partial answers from individual community summaries.
+    Evaluates if the community is useful and provides a partial answer if so.
+    Uses Gemini Lite for fast parallel processing.
     """
 
     def __init__(self, name: str) -> None:
         super().__init__(name)
-        self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.answer_generator")
+        self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.community_answer_generator")
+        self.shared_state = SharedState("agent_states")
+
+        # Initialize Gemini Flash Lite model client for fast parallel processing
+        self.model_client = OpenAIChatCompletionClient(
+            model="gemini-2.5-flash-lite",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=llm_keys.GEMINI_KEY,
+            model_info={
+                "vision": False,
+                "function_calling": False,
+                "json_output": False,
+                "family": "unknown",
+                "structured_output": False,
+            }
+        )
+
+    @message_handler
+    async def handle_community_answer_start(self, message: CommunityAnswerStartMessage, ctx: MessageContext) -> CommunityAnswerReadyMessage:
+        """Handle CommunityAnswerStart message and generate partial answer from community summary."""
+        self.logger.info(f"CommunityAnswerGenerator processing community {message.community_id} for QA {message.qa_pair_id}")
+
+        # CommunityAnswerGeneratorAgent does NOT use learned system prompt
+        # Only the FinalAnswerGenerator uses the learned system prompt
+        # This ensures community-level answers remain consistent and are not affected by test-time training
+        learned_system_prompt = ""
+
+        # Create prompt for community-level answer generation
+        user_prompt = f"""You are analyzing a community summary from a knowledge graph to help answer a question.
+
+Question: {message.question}
+
+Community Summary:
+{message.community_summary}
+
+Your task:
+1. Analyze the community summary and identify which parts (if any) relate to the question.
+2. Decide if this community provides useful information:
+   - YES: If the community contains information that directly or indirectly helps answer the question
+   - NO: If the community discusses unrelated topics or lacks relevant information
+3. If useful, provide a partial answer based on this community's information.
+
+═══════════════════════════════════════════════════════════════
+CORE PRINCIPLE: Be INCLUSIVE, not exclusive
+═══════════════════════════════════════════════════════════════
+
+A community is USEFUL if it mentions:
+1. **Named entities** from the question (people, places, objects, events)
+2. **Related entities** that interact with, describe, or contextualize the named entities
+3. **Relevant concepts** even without specific names (e.g., "relationships" for a relationship question)
+4. **Contextual information** that provides background or setting for the question's focus
+
+A community is NOT USEFUL only if:
+- It discusses completely different topics with no overlap
+- It contains zero mentions of entities/concepts related to the question
+- It describes purely technical/environmental details with no relevance to the question's focus
+
+
+IMPORTANT: Your partial answer should be comprehensive, not overly concise:
+- Include ALL relevant information from the community that could help answer the question
+- Filter out only truly irrelevant details that don't relate to the question
+- Provide sufficient detail and context - don't just give brief snippets
+- Think: "What would be most helpful for someone synthesizing multiple community answers?"
+
+Format your response as:
+USEFULNESS: [YES/NO]
+ANSWER: [If YES: Provide a comprehensive partial answer based on this community's information, including all relevant details. If NO: Write "Not applicable"]"""
+
+        try:
+            # Call LLM for community-level answer generation
+            from autogen_core.models import UserMessage
+
+            # No system message - only user prompt
+            messages = [UserMessage(content=user_prompt, source="user")]
+
+            # Use retry logic
+            async def api_call():
+                return await self.model_client.create(
+                    messages,
+                    cancellation_token=ctx.cancellation_token
+                )
+
+            response = await retry_api_call_with_backoff(api_call)
+
+            # Get generated response
+            generated_response = response.content if isinstance(response.content, str) else str(response.content)
+
+            # Parse usefulness and answer
+            is_useful = False
+            partial_answer = ""
+
+            if "USEFULNESS:" in generated_response and "ANSWER:" in generated_response:
+                # Extract usefulness
+                usefulness_parts = generated_response.split("USEFULNESS:", 1)[1].split("ANSWER:", 1)
+                usefulness_value = usefulness_parts[0].strip().upper()
+                is_useful = "YES" in usefulness_value
+
+                # Extract answer
+                partial_answer = usefulness_parts[1].strip() if is_useful else ""
+            else:
+                # Fallback parsing
+                is_useful = False
+                partial_answer = ""
+
+            self.logger.info(f"Community {message.community_id}: useful={is_useful}, answer_length={len(partial_answer)}")
+
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            if logger:
+                logger.log_interaction(
+                    agent_name="CommunityAnswerGeneratorAgent",
+                    interaction_type="community_answer_generation",
+                    system_prompt=learned_system_prompt,
+                    user_prompt=user_prompt,
+                    llm_response=generated_response,
+                    batch_id=message.batch_id,
+                    qa_pair_id=message.qa_pair_id,
+                    iteration=message.repetition,
+                    additional_metadata={
+                        "community_id": message.community_id,
+                        "is_useful": is_useful,
+                        "partial_answer_length": len(partial_answer)
+                    }
+                )
+
+            # Return CommunityAnswerReady message
+            return CommunityAnswerReadyMessage(
+                community_id=message.community_id,
+                is_useful=is_useful,
+                partial_answer=partial_answer,
+                qa_pair_id=message.qa_pair_id,
+                batch_id=message.batch_id,
+                repetition=message.repetition
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error in community answer generation: {e}")
+            # Return non-useful result on error
+            return CommunityAnswerReadyMessage(
+                community_id=message.community_id,
+                is_useful=False,
+                partial_answer="",
+                qa_pair_id=message.qa_pair_id,
+                batch_id=message.batch_id,
+                repetition=message.repetition
+            )
+
+    async def close(self) -> None:
+        """Close the model client."""
+        await self.model_client.close()
+
+
+def create_community_answer_generator_agent() -> CommunityAnswerGeneratorAgent:
+    """Factory function to create CommunityAnswerGeneratorAgent instance."""
+    return CommunityAnswerGeneratorAgent("community_answer_generator")
+
+
+# ===== FINAL ANSWER GENERATOR AGENT (formerly AnswerGeneratorAgent) =====
+
+class AnswerGeneratorAgent(RoutedAgent):
+    """
+    Final Answer Generator: Synthesizes community-level answers into a final answer.
+    Renamed from original AnswerGeneratorAgent to clarify its new role.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.logger = logging.getLogger(f"{TRACE_LOGGER_NAME}.final_answer_generator")
         self.shared_state = SharedState("agent_states")
 
         # Import prompts
@@ -3571,6 +4395,7 @@ class AnswerGeneratorAgent(RoutedAgent):
                 llm_response=generated_answer,
                 batch_id=message.batch_id,
                 qa_pair_id=message.qa_pair_id,
+                iteration=message.repetition,
                 additional_metadata={
                     "question": message.question,
                     "retrieved_context_length": len(message.retrieved_context),
@@ -3614,6 +4439,130 @@ class AnswerGeneratorAgent(RoutedAgent):
             # Raise exception to stop pipeline - don't continue with bad data
             raise RuntimeError(f"Failed to generate answer for QA pair {message.qa_pair_id} after multiple retries: {e}")
 
+    @message_handler
+    async def handle_final_answer_start(self, message: FinalAnswerStartMessage, ctx: MessageContext) -> FinalAnswerReadyMessage:
+        """Handle FinalAnswerStart message and synthesize community answers into final answer."""
+        self.logger.info(f"FinalAnswerGenerator synthesizing {len(message.useful_community_answers)} community answers for QA {message.qa_pair_id}")
+
+        # Load shared state to get learned system prompt
+        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+
+        # Use the same learned prompt as community generators
+        if message.repetition == 0:
+            learned_system_prompt = ""
+        else:
+            learned_system_prompt = current_state.get("learned_prompt_answer_generator_graph", "")
+
+        # Get previous responses and evaluations for this QA pair
+        all_evaluation_responses = current_state.get("response_evaluations", [])
+        qa_pair_evals = [
+            eval_resp for eval_resp in all_evaluation_responses
+            if eval_resp.get('qa_pair_id') == message.qa_pair_id
+        ]
+
+        # Format previous attempts
+        previous_attempts_text = ""
+        if qa_pair_evals:
+            previous_attempts_text = "\n\n" + "=" * 80 + "\n"
+            previous_attempts_text += "PREVIOUS ATTEMPTS FOR THIS QUESTION:\n"
+            previous_attempts_text += "=" * 80 + "\n\n"
+
+            for eval_resp in qa_pair_evals:
+                iter_num = eval_resp.get('repetition', 0)
+                generated_ans = eval_resp.get('generated_answer', 'N/A')
+                reasoning = eval_resp.get('evaluation_reasoning', 'N/A')
+                critique = eval_resp.get('evaluation_feedback', 'N/A')
+
+                previous_attempts_text += f"--- Iteration {iter_num} ---\n\n"
+                previous_attempts_text += f"Generated Answer:\n{generated_ans}\n\n"
+                previous_attempts_text += f"Evaluation Reasoning:\n{reasoning}\n\n"
+                previous_attempts_text += f"Critique and Suggestions:\n{critique}\n\n"
+                previous_attempts_text += "-" * 80 + "\n\n"
+
+            previous_attempts_text += "=" * 80 + "\n"
+            previous_attempts_text += "END OF PREVIOUS ATTEMPTS\n"
+            previous_attempts_text += "=" * 80 + "\n\n"
+
+        # Format community answers
+        community_answers_text = "INFORMATION FROM KNOWLEDGE GRAPH COMMUNITIES:\n\n"
+        for i, community_ans in enumerate(message.useful_community_answers, 1):
+            community_answers_text += f"Community {community_ans['community_id']}:\n"
+            community_answers_text += f"{community_ans['answer']}\n\n"
+
+        # Create final answer generation prompt
+        user_prompt = f"""You are given partial answers from multiple communities in a knowledge graph. Synthesize these into a comprehensive final answer.
+
+Question: {message.question}
+
+{community_answers_text}
+
+Your task: Synthesize the information from all communities into a coherent, comprehensive final answer to the question. Combine related information, resolve any contradictions, and present a unified response.
+
+{previous_attempts_text}
+
+Provide only the final synthesized answer without meta-commentary."""
+
+        try:
+            # Call LLM for final answer generation
+            system_message = SystemMessage(content=learned_system_prompt)
+            user_message = UserMessage(content=user_prompt, source="user")
+
+            async def api_call():
+                return await self.model_client.create(
+                    [system_message, user_message],
+                    cancellation_token=ctx.cancellation_token
+                )
+
+            response = await retry_api_call_with_backoff(api_call)
+            generated_answer = response.content if isinstance(response.content, str) else str(response.content)
+
+            # Log LLM interaction
+            logger = get_global_prompt_logger()
+            if logger:
+                logger.log_interaction(
+                    agent_name="FinalAnswerGenerator",
+                    interaction_type="final_answer_generation",
+                    system_prompt=learned_system_prompt,
+                    user_prompt=user_prompt,
+                    llm_response=generated_answer,
+                    batch_id=message.batch_id,
+                    qa_pair_id=message.qa_pair_id,
+                    iteration=message.repetition,
+                    additional_metadata={
+                        "question": message.question,
+                        "num_community_answers": len(message.useful_community_answers),
+                        "answer_length": len(generated_answer)
+                    }
+                )
+
+            log_qa_processing(self.logger, message.qa_pair_id, "Generated final answer", generated_answer)
+
+            # Store conversation in shared state
+            conversation_entry = {
+                "qa_pair_id": message.qa_pair_id,
+                "question": message.question,
+                "community_answers": message.useful_community_answers,
+                "prompt": user_prompt,
+                "generated_answer": generated_answer,
+                "repetition": message.repetition
+            }
+
+            conversations = current_state.get("conversations_answer_generation", [])
+            conversations.append(conversation_entry)
+            current_state["conversations_answer_generation"] = conversations
+            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+
+            return FinalAnswerReadyMessage(
+                qa_pair_id=message.qa_pair_id,
+                generated_answer=generated_answer,
+                batch_id=message.batch_id,
+                repetition=message.repetition
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error in final answer generation: {e}")
+            raise RuntimeError(f"Failed to generate final answer for QA pair {message.qa_pair_id}: {e}")
+
     async def close(self) -> None:
         """Close the model client."""
         await self.model_client.close()
@@ -3633,7 +4582,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
         self.dataset_name = dataset_name
 
         # Import prompts and response format
-        from parameters import response_evaluator_prompt, ResponseEvaluationResponse
+        from parameters import response_evaluator_prompt_graph, ResponseEvaluationResponse
 
         # Load learned gold answer patterns if available
         self.satisfactory_criteria = self._load_gold_patterns()
@@ -3654,7 +4603,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
             response_format=ResponseEvaluationResponse
         )
 
-        self.response_evaluator_prompt = response_evaluator_prompt
+        self.response_evaluator_prompt = response_evaluator_prompt_graph
 
     def _load_gold_patterns(self) -> str:
         """Load learned gold answer patterns from file. Raises error if not found."""
@@ -3688,49 +4637,42 @@ class ResponseEvaluatorAgent(RoutedAgent):
         print(f"\n🔍 ResponseEvaluatorAgent: Starting evaluation for QA pair {message.qa_pair_id}")
         print(f"   Query: {message.original_query[:100]}...")
         print(f"   Answer length: {len(message.generated_answer)} chars")
+        print(f"   Community summaries received: {len(message.community_summaries) if message.community_summaries else 0} chars")
 
         self.logger.info(f"ResponseEvaluatorAgent evaluating QA pair {message.qa_pair_id}")
 
-        # Load previous evaluations from shared state
-        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-        all_evaluation_responses = current_state.get("response_evaluations", [])
+        # Don't include previous evaluations in the prompt (to match Vector RAG behavior)
+        # Each iteration is evaluated independently
 
-        # Filter previous evaluations for this specific QA pair only
-        qa_pair_evals = [
-            eval_resp for eval_resp in all_evaluation_responses
-            if eval_resp.get('qa_pair_id') == message.qa_pair_id
-        ]
-
-        # Format previous evaluations for context (with FULL answers, not truncated)
-        if qa_pair_evals:
-            prev_evals_text = "\n\n" + "=" * 80 + "\n"
-            prev_evals_text += "PREVIOUS EVALUATIONS FOR THIS QUERY:\n"
-            prev_evals_text += "=" * 80 + "\n"
-            for eval_resp in qa_pair_evals:
-                iter_num = eval_resp.get('repetition', 0)
-                prev_evals_text += f"\n--- Iteration {iter_num} ---\n\n"
-                prev_evals_text += f"Generated Answer (FULL):\n{eval_resp.get('generated_answer', 'N/A')}\n\n"
-                prev_evals_text += f"Evaluation Reasoning:\n{eval_resp.get('evaluation_reasoning', 'N/A')}\n\n"
-                prev_evals_text += f"Critique:\n{eval_resp.get('evaluation_feedback', 'N/A')}\n\n"
-                prev_evals_text += f"Continue Optimization: {eval_resp.get('continue_optimization', False)}\n"
-                prev_evals_text += "-" * 80 + "\n"
-            prev_evals_text += "=" * 80 + "\n"
+        # Format unfound keywords history for display
+        if message.unfound_keywords_history:
+            unfound_keywords_text = "\n\n**KEYWORDS ALREADY TRIED (DO NOT REPEAT):**\nThe following keywords were suggested in previous iterations but were NOT found in the document:\n" + ", ".join(message.unfound_keywords_history)
         else:
-            prev_evals_text = ""
+            unfound_keywords_text = ""
 
-        # Prepare prompt with query, generated response, previous evaluations, and satisfactory criteria
+        # Format community summaries for context-aware keyword selection
+        if message.community_summaries and message.community_summaries.strip():
+            # Truncate if too long to fit within token limits
+            max_context_length = 4000  # characters
+            context_text = message.community_summaries
+            if len(context_text) > max_context_length:
+                context_text = context_text[:max_context_length] + "\n\n[... context truncated for brevity ...]"
+
+            community_context = context_text
+        else:
+            community_context = "No context available from knowledge graph retrieval."
+
+        # Prepare prompt with query, generated response, retrieved context, satisfactory criteria, and unfound keywords
         prompt_content = self.response_evaluator_prompt.format(
             original_query=message.original_query,
             generated_answer=message.generated_answer,
-            previous_evaluations=prev_evals_text,
-            satisfactory_criteria=self.satisfactory_criteria
+            satisfactory_criteria=self.satisfactory_criteria,
+            community_summaries=community_context,
+            unfound_keywords_history=unfound_keywords_text
         )
 
         print(f"   Prompt prepared ({len(prompt_content)} chars)")
-        if prev_evals_text:
-            print(f"   ✓ Including {len(qa_pair_evals)} previous evaluation(s) for this QA pair in prompt")
-        else:
-            print(f"   ℹ️  No previous evaluations (first iteration)")
+        print(f"   ℹ️  Evaluating answer independently (not showing previous iterations to match Vector RAG)")
 
         try:
             # Call LLM for response evaluation
@@ -3741,10 +4683,6 @@ class ResponseEvaluatorAgent(RoutedAgent):
             print("RESPONSE EVALUATOR AGENT - LLM CALL")
             print("=" * 80)
             print(f"System Prompt ({len(prompt_content)} chars):")
-            if prev_evals_text:
-                print(f"\n[Previous Evaluations Section:]")
-                print(prev_evals_text[:300] + "..." if len(prev_evals_text) > 300 else prev_evals_text)
-                print("-" * 80)
             print(f"\n[First 500 chars of full prompt:]")
             print(prompt_content[:500])
             print("-" * 80)
@@ -3780,16 +4718,18 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 llm_response=response.content,
                 batch_id=message.batch_id,
                 qa_pair_id=message.qa_pair_id,
+                iteration=message.repetition,
                 additional_metadata={
                     "original_query": message.original_query,
                     "generated_answer_length": len(message.generated_answer),
                     "continue_optimization": eval_response.continue_optimization,
+                    "issue_type": eval_response.issue_type,
                     "critique_length": len(eval_response.critique)
                 }
             )
 
             log_qa_processing(self.logger, message.qa_pair_id,
-                            f"Evaluation completed - continue: {eval_response.continue_optimization}",
+                            f"Evaluation completed - continue: {eval_response.continue_optimization}, issue_type: {eval_response.issue_type}",
                             f"Reasoning: {eval_response.reasoning}\nCritique: {eval_response.critique}\nMissing Keywords: {eval_response.missing_keywords}")
 
             # Create evaluation result dictionary (excluding gold answers to prevent data leakage)
@@ -3801,6 +4741,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 "evaluation_feedback": eval_response.critique,
                 "missing_keywords": eval_response.missing_keywords,
                 "continue_optimization": eval_response.continue_optimization,
+                "issue_type": eval_response.issue_type,
                 "repetition": message.repetition,
                 "timestamp": datetime.now().isoformat()
             }
@@ -3817,6 +4758,8 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 qa_pair_id=message.qa_pair_id,
                 evaluation_result=evaluation_data,
                 continue_optimization=eval_response.continue_optimization,
+                issue_type=eval_response.issue_type,
+                missing_keywords=eval_response.missing_keywords,  # Direct attribute for consistent access
                 batch_id=message.batch_id,
                 repetition=message.repetition
             )
@@ -3883,18 +4826,10 @@ class BackwardPassAgent(RoutedAgent):
         # Import gradient prompts and optimizer prompts
         from parameters import (
             generation_prompt_gradient_prompt,
-            retrieved_content_gradient_prompt_graph,
-            retrieval_plan_gradient_prompt_graph,
-            retrieval_planning_prompt_gradient_prompt,
             graph_gradient_prompt,
             graph_extraction_prompt_gradient_prompt,
-            rag_hyperparameters_agent_gradient_prompt,
             answer_generation_prompt_optimizer,
-            retrieval_planner_prompt_optimizer,
             graph_builder_prompt_optimizer,
-            hyperparameters_graph_agent_prompt_optimizer,
-            community_summarizer_gradient_prompt,
-            community_summarizer_prompt_optimizer,
             PromptCritiqueResponse,
             ContentCritiqueResponse
         )
@@ -3902,7 +4837,6 @@ class BackwardPassAgent(RoutedAgent):
         # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
             model="gemini-2.5-flash-lite",
-            max_tokens=512,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=llm_keys.GEMINI_KEY,
             model_info={
@@ -3916,20 +4850,12 @@ class BackwardPassAgent(RoutedAgent):
 
         # Store all gradient prompts and optimizer prompts
         self.generation_prompt_gradient_prompt = generation_prompt_gradient_prompt
-        self.retrieved_content_gradient_prompt_graph = retrieved_content_gradient_prompt_graph
-        self.retrieval_plan_gradient_prompt_graph = retrieval_plan_gradient_prompt_graph
-        self.retrieval_planning_prompt_gradient_prompt = retrieval_planning_prompt_gradient_prompt
         self.graph_gradient_prompt = graph_gradient_prompt
         self.graph_extraction_prompt_gradient_prompt = graph_extraction_prompt_gradient_prompt
-        self.rag_hyperparameters_agent_gradient_prompt = rag_hyperparameters_agent_gradient_prompt
 
         # Store optimizer prompts
         self.answer_generation_prompt_optimizer = answer_generation_prompt_optimizer
-        self.retrieval_planner_prompt_optimizer = retrieval_planner_prompt_optimizer
         self.graph_builder_prompt_optimizer = graph_builder_prompt_optimizer
-        self.hyperparameters_graph_agent_prompt_optimizer = hyperparameters_graph_agent_prompt_optimizer
-        self.community_summarizer_gradient_prompt = community_summarizer_gradient_prompt
-        self.community_summarizer_prompt_optimizer = community_summarizer_prompt_optimizer
 
     @message_handler
     async def handle_backward_pass_start(self, message: BackwardPassStartMessage, ctx: MessageContext) -> BackwardPassReadyMessage:
@@ -3938,6 +4864,7 @@ class BackwardPassAgent(RoutedAgent):
         Generates appropriate critiques based on iteration context.
         """
         self.logger.info(f"BackwardPassAgent processing backward pass for batch {message.batch_id}, repetition {message.repetition}")
+        self.logger.info(f"Issue type: {message.issue_type}")
 
         # Load shared state with correct dataset and setting parameters
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
@@ -3952,40 +4879,41 @@ class BackwardPassAgent(RoutedAgent):
         batch_info["current_repetition"] = message.repetition
         batch_info["current_qa_pair_id"] = current_qa_pair_id
         batch_info["current_iteration"] = current_iteration
+        batch_info["issue_type"] = message.issue_type
         current_state["batch_information"] = batch_info
 
         try:
-            # Step 1: Generate answer generation critique
-            await self._generate_answer_generation_critique(current_state, ctx)
+            # Step 1: ALWAYS generate answer generation critique (both content and style issues)
+            await self._generate_answer_generation_critique(current_state, ctx, message.batch_id, message.repetition)
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-            # Step 2: Generate retrieved content critique
-            await self._generate_retrieved_content_critique(current_state, ctx)
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            # Conditional critique generation based on issue type
+            if message.issue_type == IssueType.CONTENT_ISSUE:
+                # Content issue: Generate critiques for ALL agents (full backward pass)
+                self.logger.info(f"CONTENT ISSUE detected - performing FULL backward pass (all agents)")
 
-            # Step 3: Generate retrieval plan critique
-            await self._generate_retrieval_plan_critique(current_state, ctx)
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+                # Step 2: Generate graph critique
+                await self._generate_graph_critique(current_state, ctx, message.batch_id, message.repetition)
+                self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-            # Step 4: Generate retrieval planning prompt critique
-            await self._generate_retrieval_planning_prompt_critique(current_state, ctx)
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+                # Step 3: Generate graph builder critique
+                await self._generate_graph_builder_critique(current_state, ctx, message.batch_id, message.repetition)
+                self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
-            # Step 4.5: Generate community summarizer critique (after retrieval planner, uses retrieved content critique)
-            await self._generate_community_summarizer_critique(current_state, ctx)
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            elif message.issue_type == IssueType.STYLE_ISSUE:
+                # Style issue: SKIP graph and graph builder critiques
+                self.logger.info(f"STYLE ISSUE detected - performing PARTIAL backward pass (answer generation ONLY)")
+                self.logger.info(f"Skipping graph critique and graph builder critique")
+                # Don't generate graph or graph builder critiques
+                # They will not be updated, so the next iteration will reuse the existing graph
 
-            # Step 5: Generate graph critique
-            await self._generate_graph_critique(current_state, ctx)
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
-
-            # Step 6: Generate graph builder critique
-            await self._generate_graph_builder_critique(current_state, ctx)
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
-
-            # Step 7: Generate hyperparameters critique
-            await self._generate_hyperparameters_critique(current_state, ctx)
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            else:
+                # Satisfactory or unknown: default to full backward pass for safety
+                self.logger.warning(f"Unknown issue type {message.issue_type}, defaulting to full backward pass")
+                await self._generate_graph_critique(current_state, ctx, message.batch_id, message.repetition)
+                self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+                await self._generate_graph_builder_critique(current_state, ctx, message.batch_id, message.repetition)
+                self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
 
             # Final save to ensure everything is persisted
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
@@ -3993,19 +4921,13 @@ class BackwardPassAgent(RoutedAgent):
             # Extract optimized prompts for QA pair prompt lifecycle
             optimized_prompts = {
                 # Store the actual learned system prompts that agents will use
-                "learned_prompt_hyperparameters_graph": current_state.get("learned_prompt_hyperparameters_graph", ""),
                 "learned_prompt_answer_generator_graph": current_state.get("learned_prompt_answer_generator_graph", ""),
-                "learned_prompt_graph_retrieval_planner": current_state.get("learned_prompt_graph_retrieval_planner", ""),
                 "learned_prompt_graph_builder": current_state.get("learned_prompt_graph_builder", ""),
                 "learned_prompt_graph_refinement": current_state.get("learned_prompt_graph_refinement", ""),
-                "learned_prompt_community_summarizer": current_state.get("learned_prompt_community_summarizer", ""),
                 # Also store critiques and prompt templates for reference
-                "hyperparameters_graph_agent_critique": current_state.get("hyperparameters_graph_agent_critique", ""),
                 "graph_builder_agent_critique": current_state.get("graph_builder_agent_critique", ""),
-                "retrieval_planner_agent_critique": current_state.get("retrieval_planner_agent_critique", ""),
                 "answer_generation_critique": current_state.get("answer_generation_critique", ""),
-                "graph_builder_prompt": current_state.get("graph_builder_prompt", ""),
-                "retrieval_prompt": current_state.get("retrieval_prompt", "")
+                "graph_builder_prompt": current_state.get("graph_builder_prompt", "")
             }
 
             # Log the critique generation context
@@ -4029,18 +4951,12 @@ class BackwardPassAgent(RoutedAgent):
                     "optimized_prompts": optimized_prompts,
                     "critiques_updated": [
                         "answer_generation_critique",
-                        "retrieved_content_critique",
-                        "retrieval_plan_critique",
-                        "retrieval_planner_agent_critique",
                         "graph_critique",
-                        "graph_builder_agent_critique",
-                        "hyperparameters_graph_agent_critique"
+                        "graph_builder_agent_critique"
                     ],
                     "learned_prompts_generated": [
                         "learned_prompt_answer_generator_graph",
-                        "learned_prompt_graph_retrieval_planner",
-                        "learned_prompt_graph_builder",
-                        "learned_prompt_hyperparameters_graph"
+                        "learned_prompt_graph_builder"
                     ]
                 }
             )
@@ -4078,7 +4994,7 @@ class BackwardPassAgent(RoutedAgent):
 
         return "\n\n".join(formatted_evals)
 
-    async def _generate_answer_generation_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
+    async def _generate_answer_generation_critique(self, current_state: Dict[str, Any], ctx: MessageContext, batch_id: int, repetition: int) -> None:
         """Generate critique for answer generation prompt (with skip logic)."""
         self.logger.info("Generating answer generation critique")
 
@@ -4110,7 +5026,7 @@ class BackwardPassAgent(RoutedAgent):
 
         # Call LLM with structured output
         from parameters import PromptCritiqueResponse
-        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse, batch_id=batch_id, repetition=repetition)
 
         # Implement skip logic
         if not critique_response.problem_in_this_component:
@@ -4125,7 +5041,7 @@ class BackwardPassAgent(RoutedAgent):
 
         # Generate optimized prompt using the critique
         optimizer_prompt = self.answer_generation_prompt_optimizer.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
+        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", batch_id=batch_id, repetition=repetition, user_prompt="Generate the optimized system prompt.")
 
         # Limit prompt length to prevent truncation
         MAX_PROMPT_LENGTH = 4000
@@ -4141,157 +5057,7 @@ class BackwardPassAgent(RoutedAgent):
 
         log_critique_result(self.logger, "answer_generator_graph", critique, is_frozen)
 
-    async def _generate_retrieved_content_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieved content (no skip logic)."""
-        self.logger.info("Generating retrieved content critique")
-
-        all_retrieved_contexts = current_state.get("retrieved_contexts", [])
-        all_evaluation_responses = current_state.get("response_evaluations", [])
-
-        # Get current repetition from batch info
-        batch_info = current_state.get("batch_information", {})
-        current_repetition = batch_info.get("current_repetition", 0)
-
-        # Extract retrieved contexts for current iteration
-        retrieved_contexts = []
-        for ctx_entry in all_retrieved_contexts:
-            if isinstance(ctx_entry, dict) and "repetition" in ctx_entry:
-                if ctx_entry.get("repetition") == current_repetition:
-                    retrieved_contexts.append(ctx_entry.get("retrieved_context", ""))
-
-        if not all_evaluation_responses or not retrieved_contexts:
-            self.logger.warning("No evaluation or context data available - skipping retrieved content critique")
-            current_state["retrieved_content_critique"] = "No critique provided"
-            return
-
-        if len(retrieved_contexts) != 1:
-            self.logger.error(f"Expected exactly 1 retrieved context per iteration, but got {len(retrieved_contexts)}")
-            current_state["retrieved_content_critique"] = "No critique provided"
-            return
-
-        # Get retrieved content
-        context = retrieved_contexts[0]
-
-        # Get previous critique (empty - only reads response evaluator)
-        previous_critique = ""
-
-        # Get response evaluator output (all iterations)
-        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
-
-        # Log context size
-        context_length = len(str(context))
-        self.logger.info(f"Retrieved context length: {context_length} characters")
-
-        # Format prompt with new structure
-        prompt_content = self.retrieved_content_gradient_prompt_graph.format(
-            retrieved_content=context,
-            previous_critique=previous_critique,
-            response_evaluator_output=response_evaluator_output
-        )
-
-        # Call LLM with structured output (ContentCritiqueResponse - no skip logic)
-        from parameters import ContentCritiqueResponse
-        critique_response = await self._call_llm_structured(prompt_content, ctx, ContentCritiqueResponse)
-
-        # Store critique (always, no skip logic for content critiques)
-        current_state["retrieved_content_critique"] = critique_response.critique
-
-        self.logger.info("Retrieved content critique generated and saved")
-
-    async def _generate_retrieval_plan_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieval plan (no skip logic)."""
-        self.logger.info("Generating retrieval plan critique")
-
-        retrieval_plans = current_state.get("retrieval_plans", [])
-        all_evaluation_responses = current_state.get("response_evaluations", [])
-
-        if not retrieval_plans or not all_evaluation_responses:
-            self.logger.warning("Missing retrieval plans or evaluation for critique")
-            current_state["retrieval_plan_critique"] = "No critique provided"
-            return
-
-        # Get complete retrieval plan
-        complete_retrieval_plan = "\n".join([f"Move {i+1}: {plan}" for i, plan in enumerate(retrieval_plans)])
-
-        # Get previous critique (from retrieved content)
-        previous_critique = current_state.get("retrieved_content_critique", "")
-
-        # Get response evaluator output (all iterations)
-        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
-
-        # Format prompt with new structure
-        prompt_content = self.retrieval_plan_gradient_prompt_graph.format(
-            retrieval_plan=complete_retrieval_plan,
-            previous_critique=previous_critique,
-            response_evaluator_output=response_evaluator_output
-        )
-
-        # Call LLM with structured output (ContentCritiqueResponse - no skip logic)
-        from parameters import ContentCritiqueResponse
-        critique_response = await self._call_llm_structured(prompt_content, ctx, ContentCritiqueResponse)
-
-        # Store critique (always, no skip logic)
-        current_state["retrieval_plan_critique"] = critique_response.critique
-
-        self.logger.info("Retrieval plan critique generated and saved")
-
-    async def _generate_retrieval_planning_prompt_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieval planning prompt (with skip logic)."""
-        self.logger.info("Generating retrieval planning prompt critique")
-
-        retrieval_prompt = current_state.get("retrieval_prompt", "")
-        all_evaluation_responses = current_state.get("response_evaluations", [])
-
-        if not retrieval_prompt or not all_evaluation_responses:
-            self.logger.warning("Missing retrieval prompt or evaluation for critique")
-            current_state["retrieval_planner_agent_critique"] = "No critique provided"
-            return
-
-        # Get the current retrieval planning prompt
-        current_retrieval_prompt = current_state.get("learned_prompt_graph_retrieval_planner", "")
-        if not current_retrieval_prompt:
-            from parameters import base_prompt_graph_retrieval_planner
-            current_retrieval_prompt = base_prompt_graph_retrieval_planner
-
-        # Get previous critique (from retrieval plan)
-        previous_critique = current_state.get("retrieval_plan_critique", "")
-
-        # Get response evaluator output (all iterations)
-        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
-
-        # Format prompt with new structure
-        prompt_content = self.retrieval_planning_prompt_gradient_prompt.format(
-            current_prompt=current_retrieval_prompt,
-            previous_critique=previous_critique,
-            response_evaluator_output=response_evaluator_output
-        )
-
-        # Call LLM with structured output
-        from parameters import PromptCritiqueResponse
-        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
-
-        # Implement skip logic
-        if not critique_response.problem_in_this_component:
-            current_state["retrieval_planner_agent_critique"] = "No critique provided"
-            self.logger.info("Retrieval planning prompt: No problem detected, skipping optimization")
-            return
-
-        # Problem detected - store critique and optimize
-        critique = critique_response.critique
-        current_state["retrieval_planner_agent_critique"] = critique
-
-        # Generate optimized prompt using the critique
-        optimizer_prompt = self.retrieval_planner_prompt_optimizer.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
-
-        # Only update if not frozen
-        is_frozen = self._is_prompt_frozen("graph_retrieval_planner", current_state)
-        if not is_frozen:
-            current_state["learned_prompt_graph_retrieval_planner"] = optimized_prompt
-
-        log_critique_result(self.logger, "graph_retrieval_planner", critique, is_frozen)
-
-    async def _generate_graph_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
+    async def _generate_graph_critique(self, current_state: Dict[str, Any], ctx: MessageContext, batch_id: int, repetition: int) -> None:
         """Generate critique for graph (no skip logic)."""
         self.logger.info("Generating graph critique")
 
@@ -4318,14 +5084,14 @@ class BackwardPassAgent(RoutedAgent):
 
         # Call LLM with structured output (ContentCritiqueResponse - no skip logic)
         from parameters import ContentCritiqueResponse
-        critique_response = await self._call_llm_structured(prompt_content, ctx, ContentCritiqueResponse)
+        critique_response = await self._call_llm_structured(prompt_content, ctx, ContentCritiqueResponse, batch_id=batch_id, repetition=repetition)
 
         # Store critique (always, no skip logic)
         current_state["graph_critique"] = critique_response.critique
 
         self.logger.info("Graph critique generated and saved")
 
-    async def _generate_graph_builder_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
+    async def _generate_graph_builder_critique(self, current_state: Dict[str, Any], ctx: MessageContext, batch_id: int, repetition: int) -> None:
         """Generate critique for graph builder/refinement prompt (with skip logic)."""
 
         batch_info = current_state.get("batch_information", {})
@@ -4366,30 +5132,41 @@ class BackwardPassAgent(RoutedAgent):
 
             # Call LLM with structured output
             from parameters import PromptCritiqueResponse
-            critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+            critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse, batch_id=batch_id, repetition=repetition)
 
             # Implement skip logic
             if not critique_response.problem_in_this_component:
                 current_state["graph_builder_agent_critique"] = "No critique provided"
                 self.logger.info("Graph builder prompt: No problem detected, skipping optimization")
+                print("\n" + "="*80)
+                print("GRAPH BUILDER PROMPT OPTIMIZER - SKIPPED (Iteration 0)")
+                print("="*80)
+                print("Reason: PromptCritiqueResponse.problem_in_this_component = False")
+                print("No optimization needed for graph builder prompt")
+                print("="*80 + "\n")
                 return
 
             # Problem detected
             critique = critique_response.critique
             current_state["graph_builder_agent_critique"] = critique
 
-            # Generate optimized prompt
-            optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
-            optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
-            MAX_PROMPT_LENGTH = 4000
+            optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
+
+
+            # Increased limit to accommodate full 5-section prompts with examples in tuple format
+            MAX_PROMPT_LENGTH = 20000
             if len(optimized_prompt) > MAX_PROMPT_LENGTH:
                 self.logger.warning(f"Optimized graph builder prompt too long ({len(optimized_prompt)} chars), truncating")
                 optimized_prompt = optimized_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
+                print(f"⚠️  WARNING: Prompt truncated from {len(optimized_prompt)} to {MAX_PROMPT_LENGTH} chars\n")
 
             is_frozen = self._is_prompt_frozen("graph_builder", current_state)
             if not is_frozen:
                 current_state["learned_prompt_graph_builder"] = optimized_prompt
+                print(f"✓ Stored optimized prompt in 'learned_prompt_graph_builder'\n")
+            else:
+                print(f"⚠️  Prompt is FROZEN - not storing optimized prompt\n")
 
         else:
             # Subsequent iterations: optimize graph refinement prompt
@@ -4416,170 +5193,57 @@ class BackwardPassAgent(RoutedAgent):
 
             # Call LLM with structured output
             from parameters import PromptCritiqueResponse
-            critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+            critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse, batch_id=batch_id, repetition=repetition)
 
             # Implement skip logic
             if not critique_response.problem_in_this_component:
                 current_state["graph_refinement_agent_critique"] = "No critique provided"
                 self.logger.info("Graph refinement prompt: No problem detected, skipping optimization")
+                print("\n" + "="*80)
+                print(f"GRAPH REFINEMENT PROMPT OPTIMIZER - SKIPPED (Iteration {current_repetition})")
+                print("="*80)
+                print("Reason: PromptCritiqueResponse.problem_in_this_component = False")
+                print("No optimization needed for graph refinement prompt")
+                print("="*80 + "\n")
                 return
 
             # Problem detected
             critique = critique_response.critique
             current_state["graph_refinement_agent_critique"] = critique
 
-            # Generate optimized refinement prompt
-            optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
-            optimized_refinement_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
 
-            MAX_PROMPT_LENGTH = 4000
+            optimizer_prompt = self.graph_builder_prompt_optimizer.format(critique)
+
+
+            optimized_refinement_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", batch_id=batch_id, repetition=repetition, user_prompt="Generate the optimized system prompt.")
+
+
+            # Increased limit to accommodate full 5-section prompts with examples in tuple format
+            MAX_PROMPT_LENGTH = 10000
             if len(optimized_refinement_prompt) > MAX_PROMPT_LENGTH:
                 self.logger.warning(f"Optimized refinement prompt too long ({len(optimized_refinement_prompt)} chars), truncating")
                 optimized_refinement_prompt = optimized_refinement_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
+                print(f"⚠️  WARNING: Prompt truncated from {len(optimized_refinement_prompt)} to {MAX_PROMPT_LENGTH} chars\n")
 
             is_frozen = self._is_prompt_frozen("graph_refinement", current_state)
             if not is_frozen:
                 current_state["learned_prompt_graph_refinement"] = optimized_refinement_prompt
+                print(f"✓ Stored optimized prompt in 'learned_prompt_graph_refinement'\n")
+            else:
+                print(f"⚠️  Prompt is FROZEN - not storing optimized prompt\n")
 
             log_critique_result(self.logger, "graph_refinement", critique, is_frozen)
-
-    async def _generate_hyperparameters_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for hyperparameters agent prompt (with skip logic)."""
-        self.logger.info("Generating hyperparameters critique")
-
-        all_evaluation_responses = current_state.get("response_evaluations", [])
-
-        if not all_evaluation_responses:
-            self.logger.warning("No evaluation data available - skipping hyperparameters critique")
-            current_state["hyperparameters_graph_agent_critique"] = "No critique provided"
-            return
-
-        # Get the current hyperparameters prompt
-        current_hyperparameters_prompt = current_state.get("learned_prompt_hyperparameters_graph", "")
-        if not current_hyperparameters_prompt:
-            from parameters import base_prompt_hyperparameters_graph
-            current_hyperparameters_prompt = base_prompt_hyperparameters_graph
-
-        # Get previous critique (from graph builder or graph refinement)
-        previous_critique = current_state.get("graph_builder_agent_critique", "") or current_state.get("graph_refinement_agent_critique", "")
-
-        # Get response evaluator output (all iterations)
-        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
-
-        # Format prompt with new structure
-        prompt_content = self.rag_hyperparameters_agent_gradient_prompt.format(
-            current_prompt=current_hyperparameters_prompt,
-            previous_critique=previous_critique,
-            response_evaluator_output=response_evaluator_output
-        )
-
-        # Call LLM with structured output
-        from parameters import PromptCritiqueResponse
-        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
-
-        # Implement skip logic
-        if not critique_response.problem_in_this_component:
-            current_state["hyperparameters_graph_agent_critique"] = "No critique provided"
-            self.logger.info("Hyperparameters prompt: No problem detected, skipping optimization")
-            return
-
-        # Problem detected - store critique and optimize
-        critique = critique_response.critique
-        current_state["hyperparameters_graph_agent_critique"] = critique
-
-        # Generate optimized prompt using the critique
-        optimizer_prompt = self.hyperparameters_graph_agent_prompt_optimizer.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
-
-        # Limit prompt length to prevent truncation
-        MAX_PROMPT_LENGTH = 4000
-        if len(optimized_prompt) > MAX_PROMPT_LENGTH:
-            self.logger.warning(f"Optimized hyperparameters prompt too long ({len(optimized_prompt)} chars), truncating to {MAX_PROMPT_LENGTH}")
-            optimized_prompt = optimized_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
-
-        # Only update if not frozen
-        is_frozen = self._is_prompt_frozen("hyperparameters_graph", current_state)
-        if not is_frozen:
-            current_state["learned_prompt_hyperparameters_graph"] = optimized_prompt
-            self.logger.info(f"Stored optimized hyperparameters prompt ({len(optimized_prompt)} chars)")
-
-        log_critique_result(self.logger, "hyperparameters_graph", critique, is_frozen)
-
-    async def _generate_community_summarizer_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for community summarizer prompt (with skip logic)."""
-        self.logger.info("Generating community summarizer critique")
-
-        all_evaluation_responses = current_state.get("response_evaluations", [])
-
-        if not all_evaluation_responses:
-            self.logger.warning("No evaluation data available - skipping community summarizer critique")
-            current_state["community_summarizer_critique"] = "No critique provided"
-            return
-
-        # Get the current community summarizer prompt
-        current_summarizer_prompt = current_state.get("learned_prompt_community_summarizer", "")
-        if not current_summarizer_prompt:
-            from parameters import base_prompt_community_summarizer
-            current_summarizer_prompt = base_prompt_community_summarizer
-
-        # Get previous critique (from retrieved content)
-        previous_critique = current_state.get("retrieved_content_critique", "")
-
-        # Get response evaluator output (all iterations)
-        response_evaluator_output = self._format_all_evaluation_responses(all_evaluation_responses)
-
-        # Format prompt with new structure
-        prompt_content = self.community_summarizer_gradient_prompt.format(
-            current_prompt=current_summarizer_prompt,
-            previous_critique=previous_critique,
-            response_evaluator_output=response_evaluator_output
-        )
-
-        # Call LLM with structured output
-        from parameters import PromptCritiqueResponse
-        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
-
-        # Implement skip logic
-        if not critique_response.problem_in_this_component:
-            current_state["community_summarizer_critique"] = "No critique provided"
-            self.logger.info("Community summarizer prompt: No problem detected, skipping optimization")
-            return
-
-        # Problem detected - store critique and optimize
-        critique = critique_response.critique
-        current_state["community_summarizer_critique"] = critique
-
-        # Generate optimized prompt using the critique
-        optimizer_prompt = self.community_summarizer_prompt_optimizer.format(critique)
-        optimized_prompt = await self._call_llm(optimizer_prompt, ctx, interaction_type="optimization", user_prompt="Generate the optimized system prompt.")
-
-        # Limit prompt length to prevent truncation
-        MAX_PROMPT_LENGTH = 4000
-        if len(optimized_prompt) > MAX_PROMPT_LENGTH:
-            self.logger.warning(f"Optimized community summarizer prompt too long ({len(optimized_prompt)} chars), truncating to {MAX_PROMPT_LENGTH}")
-            optimized_prompt = optimized_prompt[:MAX_PROMPT_LENGTH] + "\n\n[Prompt truncated to prevent errors]"
-
-        # Only update if not frozen
-        is_frozen = self._is_prompt_frozen("community_summarizer", current_state)
-        if not is_frozen:
-            current_state["learned_prompt_community_summarizer"] = optimized_prompt
-            self.logger.info(f"Stored optimized community summarizer prompt ({len(optimized_prompt)} chars)")
-
-        log_critique_result(self.logger, "community_summarizer", critique, is_frozen)
 
     def _is_prompt_frozen(self, prompt_type: str, current_state: Dict[str, Any]) -> bool:
         """Check if a prompt type is frozen."""
         frozen_prompts = current_state.get("frozen_prompts", [])
         return prompt_type in frozen_prompts
 
-    async def _call_llm(self, prompt_content: str, ctx: MessageContext, interaction_type: str = "critique", batch_id: int = None, user_prompt: str = "Please provide your critique and feedback.") -> str:
+    async def _call_llm(self, prompt_content: str, ctx: MessageContext, interaction_type: str = "critique", batch_id: int = None, repetition: int = None, user_prompt: str = "Please provide your critique and feedback.") -> str:
         """Helper method to call LLM with given prompt and token limit."""
         try:
-            # Add token limit instruction to the prompt based on interaction type
-            if interaction_type == "optimization":
-                enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your response to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the optimized prompt and be concise."
-            else:
-                enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your critique to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the most critical points and be concise."
+            # Use the prompt content directly without token limit constraints
+            enhanced_prompt = prompt_content
 
             system_message = SystemMessage(content=enhanced_prompt)
             user_message = UserMessage(content=user_prompt, source="system")
@@ -4592,6 +5256,8 @@ class BackwardPassAgent(RoutedAgent):
             response_content = response.content if isinstance(response.content, str) else str(response.content)
 
             # Log LLM interaction
+            # BackwardPassAgent operates at batch level, so qa_pair_id is None
+            # Use repetition parameter for iteration
             logger = get_global_prompt_logger()
             logger.log_interaction(
                 agent_name="BackwardPassAgent",
@@ -4600,6 +5266,8 @@ class BackwardPassAgent(RoutedAgent):
                 user_prompt=user_prompt,
                 llm_response=response_content,
                 batch_id=batch_id,
+                qa_pair_id=None,  # Batch-level processing
+                iteration=repetition,
                 additional_metadata={
                     "critique_token_limit": self.critique_token_limit,
                     "prompt_length": len(prompt_content),
@@ -4614,7 +5282,7 @@ class BackwardPassAgent(RoutedAgent):
             self.logger.error(f"Error calling LLM: {e}")
             return f"Error generating critique: {e}"
 
-    async def _call_llm_structured(self, prompt_content: str, ctx: MessageContext, response_format, interaction_type: str = "critique", batch_id: int = None, user_prompt: str = "Please provide your critique."):
+    async def _call_llm_structured(self, prompt_content: str, ctx: MessageContext, response_format, interaction_type: str = "critique", batch_id: int = None, repetition: int = None, user_prompt: str = "Please provide your critique."):
         """Helper method to call LLM with structured output (Pydantic response format)."""
         try:
             # Create a temporary client with the response format
@@ -4646,6 +5314,8 @@ class BackwardPassAgent(RoutedAgent):
             parsed_response = response_format.model_validate_json(response.content)
 
             # Log LLM interaction
+            # BackwardPassAgent operates at batch level, so qa_pair_id is None
+            # Use repetition parameter for iteration
             logger = get_global_prompt_logger()
             logger.log_interaction(
                 agent_name="BackwardPassAgent",
@@ -4654,6 +5324,8 @@ class BackwardPassAgent(RoutedAgent):
                 user_prompt=user_prompt,
                 llm_response=response.content,
                 batch_id=batch_id,
+                qa_pair_id=None,  # Batch-level processing
+                iteration=repetition,
                 additional_metadata={
                     "response_format": response_format.__name__,
                     "prompt_length": len(prompt_content)
@@ -4740,6 +5412,11 @@ Provide a concise summary that captures all essential information while being si
                 summary = response.content if isinstance(response.content, str) else str(response.content)
 
                 # Log LLM interaction
+                # Get current QA pair and iteration from shared state for logging
+                current_state_for_logging = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+                current_qa_pair_id = current_state_for_logging.get("current_qa_pair_id", None)
+                current_iteration = current_state_for_logging.get("current_iteration", None)
+
                 logger = get_global_prompt_logger()
                 logger.log_interaction(
                     agent_name="SummarizerAgent",
@@ -4748,6 +5425,8 @@ Provide a concise summary that captures all essential information while being si
                     user_prompt=prompt_content,
                     llm_response=summary,
                     batch_id=message.batch_id,
+                    qa_pair_id=current_qa_pair_id,
+                    iteration=current_iteration,
                     additional_metadata={
                         "context_index": i + 1,
                         "total_contexts": len(message.retrieved_contexts),

@@ -293,9 +293,14 @@ class SharedState:
         # Preserve all response evaluations from previous iterations
         new_state["response_evaluations"] = current_state.get("response_evaluations", [])
 
-        # Preserve continue_optimization flags for all QA pairs
+        # Preserve graph and community data for style-issue reuse
+        new_state["last_graph_response"] = current_state.get("last_graph_response", {})
+        new_state["last_useful_community_answers"] = current_state.get("last_useful_community_answers", [])
+        new_state["community_summaries"] = current_state.get("community_summaries", {})
+
+        # Preserve continue_optimization and issue_type flags for all QA pairs
         for key, value in current_state.items():
-            if key.startswith("continue_optimization_"):
+            if key.startswith("continue_optimization_") or key.startswith("issue_type_"):
                 new_state[key] = value
 
         # Preserve system prompts from previous iteration if they exist

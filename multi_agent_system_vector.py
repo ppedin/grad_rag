@@ -2502,11 +2502,18 @@ class ResponseEvaluatorAgent(RoutedAgent):
         # Don't include previous evaluations in the prompt (to match Self-Refine behavior)
         # Each iteration is evaluated independently
 
+        # Format unfound keywords history for display
+        if hasattr(message, 'unfound_keywords_history') and message.unfound_keywords_history:
+            unfound_keywords_text = "\n\n**KEYWORDS ALREADY TRIED (DO NOT REPEAT):**\nThe following keywords were suggested in previous iterations but were NOT found in the document:\n" + ", ".join(message.unfound_keywords_history)
+        else:
+            unfound_keywords_text = ""
+
         # Prepare prompt with query, generated response, and satisfactory criteria
         prompt_content = self.response_evaluator_prompt.format(
             original_query=message.original_query,
             generated_answer=message.generated_answer,
-            satisfactory_criteria=self.satisfactory_criteria
+            satisfactory_criteria=self.satisfactory_criteria,
+            unfound_keywords_history=unfound_keywords_text
         )
 
         print(f"   Prompt prepared ({len(prompt_content)} chars)")

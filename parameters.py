@@ -1,18 +1,11 @@
 from pydantic import BaseModel, Field
 from typing import List, Union, Literal, Dict, Any, Optional
+from enum import Enum
 
 
-base_prompt_hyperparameters_graph = """
-Your goal is to define the hyperparameters for a Graph RAG architecture.
-You have to define a good chunk size. The chunk size must be in tokens. The chunk size must be only one (no variable chunk sizes).
-The system will split the input text based on the chunk size. For each split, an LLM will be used to extract a graph (the graphs will then be merged). So, the chunk size determines the length of the text that must be processed by an LLM.
+# Tuple delimiter for graph refinement output format
+TUPLE_DELIMITER = "<|>"
 
-Text to analyze: {text}
-
-Question: {question}
-
-Please, suggest an appropriate chunk size and provide the reasoning that led to your response.
-"""
 
 base_prompt_hyperparameters_vector = """
 Your goal is to define the hyperparameters for a Vector RAG architecture.
@@ -27,71 +20,163 @@ Please, suggest an appropriate chunk size and provide the reasoning that led to 
 """
 
 
-class HyperparametersGraphResponse(BaseModel):
-    reasoning: str
-    chunk_size: int
-
-class HyperparametersGraphResponse(BaseModel):
-    reasoning: str
-    chunk_size: int
-
 base_prompt_graph_builder = """
-You will be given a text. Your goal is to identify entities in the text and all the relationships among the identified entities.
-For each entity, you will include:
-- name: the entity name
-- type: the entity type (e.g., Person, Organization, Location, Event, Concept)
-- properties: a list of key-value pairs describing characteristics of the entity extracted from the text (e.g., for a person: age, role, description; for a location: description, significance). Each property should have a "key" and "value" field.
+# Goal
+You are an expert knowledge graph builder. Your task is to extract entities and relationships from the provided text and structure them into a knowledge graph.
 
-For each relationship, you will include its type, a description (why you think the two entities are related to each other), and the evidence from the text that supports this.
-The relationships must be among the extracted entities.
-Provide a list of triplets in your answer.
+# Steps
 
-Return no more than 20 entities and 30 relationships. 
+1. **Identify Entities**: Read through the text and identify all significant entities.
 
-Text:
+2. **Classify Entity Types**: Assign each entity to an appropriate type category.
+
+3. **Write Entity Descriptions**: For each entity, write a concise description that captures its key characteristics based on the text.
+
+4. **Extract Relationships**: Identify meaningful relationships between the entities you've extracted.
+
+5. **Document Evidence**: For each relationship, provide the exact text from the document that supports it.
+
+6. **Create Triplets**: Express each relationship as a (subject, predicate, object) triplet.
+
+# Example
+
+This is an abstract example showing the expected output format:
+
+**Entities**:
+- Name: "[entity name as it appears in text]", Type: "[entity type]", Description: "[description based on text]"
+- Name: "[another entity]", Type: "[entity type]", Description: "[description based on text]"
+
+**Relationships**:
+- Source: "[source entity name]", Target: "[target entity name]", Type: "[RELATIONSHIP_TYPE]", Description: "[nature of relationship]", Evidence: "[exact quote from text]"
+- Source: "[entity A]", Target: "[entity B]", Type: "[RELATIONSHIP_TYPE]", Description: "[nature of relationship]", Evidence: "[exact quote from text]"
+
+# Constraints
+- Extract NO MORE than 20 entities and 30 relationships
+- Entity names should match how they appear in the text
+- Descriptions should be factual and based only on information in the text
+- Evidence must be exact quotes from the text
+- All entity names in relationships and triplets must exactly match entity names in the entities list
+
+# Text to Analyze
+
 {}
 
-Provide the reasoning that led to your response.
+# Output Format
+
+You MUST return your response as valid JSON in the following format. Wrap your JSON in ```json code blocks.
+
+```json
+{{
+  "entities": [
+    {{
+      "name": "entity name",
+      "type": "entity type",
+      "description": "concise description of the entity based on the text"
+    }}
+  ],
+  "relationships": [
+    {{
+      "source_entity": "source entity name",
+      "target_entity": "target entity name",
+      "relationship_type": "type of relationship",
+      "description": "why these entities are related",
+      "evidence": "exact text from document supporting this relationship"
+    }}
+  ],
+  "triplets": [
+    {{
+      "subject": "entity name",
+      "predicate": "relationship type",
+      "object": "entity name"
+    }}
+  ],
+  "reasoning": "your reasoning for the extraction"
+}}
+```
+
+IMPORTANT:
+- All entity names in relationships and triplets must exactly match entity names in the entities list
+- Evidence must be direct quotes from the text
+- Return ONLY the JSON, no additional text outside the code block
 """
 
 
 base_prompt_graph_refinement = """
-You will be given a text. Your goal is to extract entities and relationships from the text to enhance the knowledge graph by:
-1. Identifying new entities mentioned in the text
-2. Extracting properties for entities based on information in the text
-3. Identifying relationships between entities
-4. Providing evidence from the text for each relationship
+# Goal
+You are an expert knowledge graph enhancer. Your task is to extract additional entities and relationships from the provided text to enrich an existing knowledge graph.
 
-For each entity, you will include:
-- name: the entity name
-- type: the entity type (e.g., Person, Organization, Location, Event, Concept)
-- properties: a list of key-value pairs describing characteristics of the entity extracted from the text. Each property should have a "key" and "value" field.
+# Steps
 
-For each relationship, you will include its type, a description, and the evidence from the text that supports this.
-The relationships must be among the extracted entities.
-Provide a list of triplets for relationships in your answer.
+1. **Identify New Entities**: Read through the text and identify entities that should be added to the knowledge graph.
 
-Text to analyze:
+2. **Classify Entity Types**: Assign each entity to an appropriate type category.
+
+3. **Write Entity Descriptions**: For each entity, write a concise description that captures its key characteristics based on the text.
+
+4. **Extract New Relationships**: Identify meaningful relationships between entities mentioned in this text.
+
+5. **Document Evidence**: For each relationship, provide the exact text from the document that supports it.
+
+6. **Create Triplets**: Express each relationship as a (subject, predicate, object) triplet.
+
+# Example
+
+This is an abstract example showing the expected output format:
+
+**New Entities**:
+- Name: "[entity name as it appears in text]", Type: "[entity type]", Description: "[description based on text]"
+- Name: "[another entity]", Type: "[entity type]", Description: "[description based on text]"
+
+**New Relationships**:
+- Source: "[source entity name]", Target: "[target entity name]", Type: "[RELATIONSHIP_TYPE]", Description: "[nature of relationship]", Evidence: "[exact quote from text]"
+- Source: "[entity A]", Target: "[entity B]", Type: "[RELATIONSHIP_TYPE]", Description: "[nature of relationship]", Evidence: "[exact quote from text]"
+
+# Constraints
+- Extract NO MORE than 20 entities and 30 relationships
+- Focus on NEW information that adds value to the knowledge graph
+- Entity names should match how they appear in the text
+- Descriptions should be factual and based only on information in the text
+- Evidence must be exact quotes from the text
+- All entity names in relationships and triplets must exactly match entity names
+
+# Text to Analyze
+
 {}
 
-Extract all relevant entities and relationships from the text.
+# Output Format
 
-Return no more than 20 entities and 30 relationships.
+Return your response as a list of tuples, one per line.
 
-Provide the reasoning that led to your response.
+**Entity Format:**
+("entity"<|>entity_name<|>entity_type<|>entity_description)
+
+**Relationship Format:**
+("relationship"<|>relationship_type<|>source_entity<|>target_entity<|>relationship_description)
+
+Where <|> is the tuple delimiter.
+
+**Example Output:**
+("entity"<|>entity_name<|>entity_type<|>description of the entity based on the text)
+("entity"<|>another_entity<|>entity_type<|>description of this entity based on the text)
+("relationship"<|>RELATIONSHIP_TYPE<|>source_entity<|>target_entity<|>description of why these entities are related)
+("relationship"<|>ANOTHER_RELATIONSHIP_TYPE<|>entity_A<|>entity_B<|>description of their relationship)
+
+IMPORTANT:
+- Each tuple must be on a separate line
+- Entity names in relationships must exactly match entity names defined in entity tuples
+- Use specific, meaningful relationship types (e.g., KILLED, OWNS, CAUSED, MOTIVATED_BY)
+- Descriptions should be concise but informative
+- Extract NO MORE than 20 entities and 30 relationships
+- Focus on NEW information that adds value to the knowledge graph
+- Return ONLY the tuples, no additional text or explanations
 """
 
-
-class EntityProperty(BaseModel):
-    model_config = {"extra": "forbid"}
-    key: str
-    value: str
 
 class Entity(BaseModel):
     model_config = {"extra": "forbid"}
     name: str
     type: str
-    properties: List[EntityProperty] = Field(default_factory=list)
+    description: str
 
 
 class Relationship(BaseModel):
@@ -100,7 +185,7 @@ class Relationship(BaseModel):
     target_entity: str
     relationship_type: str
     description: str
-    evidence: str
+    evidence: str = ""  # Optional, defaults to empty string for tuple format
 
 
 class Triplet(BaseModel):
@@ -118,18 +203,11 @@ class GraphBuilderResponse(BaseModel):
     reasoning: str
 
 
-class EntityUpdate(BaseModel):
-    model_config = {"extra": "forbid"}
-    entity_name: str
-    property_key: str
-    property_value: str
-
 class GraphRefinementResponse(BaseModel):
     model_config = {"extra": "forbid"}
     new_entities: List[Entity]
     new_relationships: List[Relationship]
     new_triplets: List[Triplet]
-    entity_property_updates: List[EntityUpdate] = Field(default_factory=list)
     reasoning: str
 
 
@@ -294,6 +372,7 @@ QUESTION:
 
 GENERATED ANSWER:
 {generated_answer}
+{unfound_keywords_history}
 
 Your task:
 1. Evaluate if the generated answer follows the learned gold patterns in terms of:
@@ -323,9 +402,86 @@ DECISION: [SATISFACTORY or NEEDS_REFINEMENT]
 CRITIQUE: [Your detailed critique if refinement is needed, or "None" if satisfactory]"""
 
 
+# GraphRAG-specific response evaluator prompt with knowledge graph refinement context
+response_evaluator_prompt_graph = """You are evaluating answers for a GraphRAG system based on learned patterns.
+
+LEARNED PATTERNS:
+{satisfactory_criteria}
+
+QUESTION: {original_query}
+
+
+ANSWER: {generated_answer}
+{unfound_keywords_history}
+
+EVALUATION PRIORITY:
+1. Retrieval sufficiency (specificity, concrete details)
+2. Content completeness
+3. Presentation quality
+
+Default: If keywords could improve the answer → CONTENT_ISSUE
+
+RETRIEVAL QUALITY CHECK:
+Insufficient retrieval indicators: vague quantifiers ("significant", "several"), generic descriptions, missing entities/numbers/dates, causal gaps, abstract summaries.
+
+ISSUE CLASSIFICATION:
+
+**SATISFACTORY**: Fully satisfies requirements
+- Set: continue=false, issue_type="satisfactory"
+
+**CONTENT_ISSUE**: Missing information OR insufficient retrieval
+- Set: continue=true, issue_type="content_issue"
+- Provide exactly 4 missing_keywords (named entities preferred)
+- Examples: missing facts/dates/names, vague language
+
+**STYLE_ISSUE**: All information present, only presentation issues
+- Set: continue=true, issue_type="style_issue"
+- DO NOT provide keywords (empty list)
+- Examples: wrong tone, poor structure, formatting issues
+
+WHEN IN DOUBT → Choose CONTENT_ISSUE
+
+LENGTH REQUIREMENT:
+- Descriptive/significance questions: 150-450 words minimum
+- Too short with all info → STYLE_ISSUE
+- Too short due to missing info → CONTENT_ISSUE
+
+═══════════════════════════════════════════════════════════════════
+CRITICAL: KEYWORD SELECTION GUIDELINES (CONTENT_ISSUE only)
+═══════════════════════════════════════════════════════════════════
+
+**PURPOSE**: Keywords are entities that we can focus on to fill the gaps in the current response. Keywords must be one word (2 for proper nouns).
+
+Do not hallucinate keywords: keywords must be entities that are likely to be found in text. 
+Keywords must be proper nouns of characters/places/organizations mentioned in the answer. If they are not found, use other nouns in the answer. Don't hallucinate. 
+Avoid complex phrases. Preferably use proper nouns (like person, organization, etc.).
+
+6. **NO MORE THAN 6 KEYWORDS**: Provide no more than 6 for CONTENT_ISSUE
+
+
+OUTPUT JSON:
+{{
+  "reasoning": "1) Retrieval assessment: [vague language Y/N, check if entities from context are used]. 2) Completeness: [elements present in context but missing in answer]. 3) Decision: [CONTENT_ISSUE if context has info not used OR insufficient retrieval, STYLE_ISSUE if context fully used but poor presentation, SATISFACTORY if both sufficient]",
+  "continue": true/false,
+  "issue_type": "satisfactory"/"content_issue"/"style_issue",
+  "critique": "specific critique if needs refinement, else empty",
+  "missing_keywords": ["keyword1", "keyword2", "keyword3", "keyword4"] or []
+}}
+
+Return ONLY valid JSON."""
+
+
+class IssueType(str, Enum):
+    """Classification of issues found in generated answers."""
+    SATISFACTORY = "satisfactory"
+    CONTENT_ISSUE = "content_issue"  # Missing info, wrong facts → needs graph rebuild
+    STYLE_ISSUE = "style_issue"       # Poor formatting, tone → only answer gen
+
+
 class ResponseEvaluationResponse(BaseModel):
     reasoning: str
     continue_optimization: bool = Field(alias="continue")
+    issue_type: IssueType = IssueType.SATISFACTORY  # Classification of the issue
     critique: str
     missing_keywords: List[str] = Field(default_factory=list)
 
@@ -376,7 +532,7 @@ Based on this information, determine if there is a problem with the answer gener
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.
-If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If true, provide a critique focusing on the specific issue.
 If false, leave the critique empty.
 """
 
@@ -413,7 +569,7 @@ Critique from the previous component:
 Response evaluator output:
 {response_evaluator_output}
 
-Based on this information, provide a SHORT and CONCISE critique (2-3 sentences max) of how the retrieved content can be improved.
+Based on this information, provide a critique of how the retrieved content can be improved.
 """
 
 retrieved_content_gradient_prompt_vector = """
@@ -459,7 +615,7 @@ Critique from the previous component:
 Response evaluator output:
 {response_evaluator_output}
 
-Based on this information, provide a SHORT and CONCISE critique (2-3 sentences max) of how the community selection can be improved.
+Based on this information, provide a critique of how the community selection can be improved.
 """
 
 
@@ -513,7 +669,7 @@ Based on this information, determine if there is a problem with the retrieval pl
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.
-If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If true, provide a critique focusing on the specific issue.
 If false, leave the critique empty.
 """
 
@@ -571,7 +727,7 @@ Critique from the previous component:
 Response evaluator output:
 {response_evaluator_output}
 
-Based on this information, provide a SHORT and CONCISE critique (2-3 sentences max) of how the graph can be improved.
+Based on this information, provide a critique of how the graph can be improved.
 """
 
 
@@ -591,28 +747,7 @@ Based on this information, determine if there is a problem with the graph extrac
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.
-If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
-If false, leave the critique empty.
-"""
-
-
-rag_hyperparameters_agent_gradient_prompt = """
-You are evaluating the prompt used for hyperparameter (chunk size) selection in a GraphRAG system.
-
-Current hyperparameters selection prompt:
-{current_prompt}
-
-Critique from the previous component:
-{previous_critique}
-
-Response evaluator output:
-{response_evaluator_output}
-
-Based on this information, determine if there is a problem with the hyperparameters selection prompt that needs to be fixed.
-
-First, provide your reasoning explaining why there is or isn't a problem.
-Then, set problem_in_this_component=true or false accordingly.
-If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If true, provide a critique focusing on the specific issue.
 If false, leave the critique empty.
 """
 
@@ -635,7 +770,7 @@ Based on this information, determine if there is a problem with the chunk size s
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.
-If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue with the chunk size.
+If true, provide a critique focusing on the specific issue with the chunk size.
 If false, leave the critique empty.
 """
 
@@ -662,23 +797,195 @@ Provide only the optimized system prompt without additional commentary.
 """
 
 graph_builder_prompt_optimizer = """
-You are optimizing a system prompt for graph construction in a GraphRAG system.
+You are optimizing a SYSTEM PROMPT for graph construction and refinement in a GraphRAG system.
+
+CRITICAL ARCHITECTURE CONTEXT:
+Your optimized prompt will be used as a SYSTEM MESSAGE sent to the LLM.
+A separate USER MESSAGE will contain the base prompt with:
+- Abstract format example (showing output structure only, no concrete content)
+- The actual text chunk to analyze
+- Complete tuple output format specification (using <|> delimiter with format: ("entity"<|>name<|>type<|>description) and ("relationship"<|>type<|>source<|>target<|>description))
+- All constraints (max 20 entities, 30 relationships)
 
 The current critique of the graph building process is:
 {}
 
-Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better extract entities and relationships from text. The system prompt should incorporate the feedback to improve entity recognition, relationship extraction, and graph structure.
 
-Provide only the optimized system prompt without additional commentary.
-"""
+**CRITICAL EXTRACTION RULE**: Your optimized prompt MUST make it absolutely clear that the LLM should extract ONLY and EXCLUSIVELY entities and relationships of the specified types. Do NOT allow extraction of any other types, even if they seem important.
 
-hyperparameters_graph_agent_prompt_optimizer = """
-You are optimizing a system prompt for hyperparameter selection in a GraphRAG system.
+MANDATORY STRUCTURE:
+Your prompt MUST follow this exact chain of thought structure:
 
-The current critique of the hyperparameter selection process is:
-{}
+═══════════════════════════════════════════════════════════════════
+SECTION 1: STRATEGIC GUIDANCE (Brief)
+═══════════════════════════════════════════════════════════════════
+Provide 2-3 sentences on:
+- Overall quality expectations (completeness, accuracy, evidence-based)
+- The primary goal of the extraction
+- **CRITICAL**: MUST explicitly state that extraction is STRICTLY LIMITED to ONLY the specified entity and relationship types - NO other types should be extracted under any circumstances
+- Emphasize that extracting types outside the specified list will degrade system performance
+- How to approach the task with disciplined focus on specified types only
 
-Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better determine optimal chunk sizes for graph construction. The system prompt should incorporate the feedback to improve hyperparameter reasoning and selection.
+═══════════════════════════════════════════════════════════════════
+SECTION 2: ENTITY IDENTIFICATION (Detailed and Structured)
+═══════════════════════════════════════════════════════════════════
+Structure this section as:
+
+**Step 1: Identify Entity Types**
+
+Based on the critique, list the SPECIFIC entity types to extract. For EACH type, provide:
+- Type name (e.g., Person, Organization, Location, Event, Concept)
+- Brief description of what qualifies as this type
+- 2-3 concrete examples
+
+Format:
+- **[Entity Type]**: [Description]
+  - Example: "[Concrete example 1]"
+  - Example: "[Concrete example 2]"
+  - Example: "[Concrete example 3]"
+
+**Step 2: Prioritize Most Important Types**
+
+Explicitly state which entity types are MOST CRITICAL for this task based on the critique.
+Format: "Focus primarily on: [Type1], [Type2], [Type3]"
+
+**Step 3: Entity Extraction Principle**
+
+State the core principle for entity extraction (e.g., "Extract ALL mentioned entities of the prioritized types", "Be exhaustive in identifying entities that drive the narrative")
+
+**MUST INCLUDE**: Explicitly remind the model to extract ONLY entities that match the specified types and to ignore all other entity types.
+
+**CRITICAL CLARIFICATION FOR EVENT ENTITIES:**
+
+If "Event" is one of the specified entity types, you MUST explicitly clarify in your prompt that:
+- Events are ENTITIES, not relationships
+- Events must be extracted as entity tuples: ("entity"<|>event_name<|>Event<|>description)
+- Do NOT confuse events with relationships between entities
+- Events should be extracted as standalone entities that can then participate in relationships with other entities
+
+Example clarification to include:
+"IMPORTANT: Event entities (such as 'The Great War', 'The Exile', 'The Rescue Mission') are ENTITIES and must be extracted using the entity tuple format. Events are not relationships - they are things that happened and should be treated as entities in the graph. However, Events CAN participate in relationships with other entities (e.g., a Person PARTICIPATED_IN an Event, an Event CAUSED another Event, an Event OCCURRED_AT a Location)."
+
+═══════════════════════════════════════════════════════════════════
+SECTION 3: RELATIONSHIP IDENTIFICATION (Detailed and Structured)
+═══════════════════════════════════════════════════════════════════
+Structure this section as:
+
+**Step 1: Identify Relationship Types**
+
+Based on the critique, list the SPECIFIC relationship types to extract. For EACH type, provide:
+- Relationship name (e.g., MOTIVATES, CAUSES, CONFLICTS_WITH)
+- Description of what this relationship means
+- 2-3 concrete examples showing entity pairs connected by this relationship
+
+Format:
+- **[RELATIONSHIP_TYPE]**: [Description]
+  - Example: "[Entity A] [RELATIONSHIP] [Entity B]" - [Brief explanation]
+  - Example: "[Entity C] [RELATIONSHIP] [Entity D]" - [Brief explanation]
+  - Example: "[Entity E] [RELATIONSHIP] [Entity F]" - [Brief explanation]
+
+**Step 2: Prioritize Most Important Relationships**
+
+Explicitly state which relationship types are MOST CRITICAL for this task based on the critique.
+Format: "Focus primarily on: [REL1], [REL2], [REL3]"
+
+**Step 3: Relationship Extraction Principle**
+
+State the core principle for relationship extraction (e.g., "Focus on causal chains", "Prioritize relationships that explain narrative progression")
+
+**MUST INCLUDE**: Explicitly remind the model to extract ONLY relationships that match the specified types and to ignore all other relationship types.
+
+═══════════════════════════════════════════════════════════════════
+SECTION 4: EXTRACTION DIRECTIVE (Clear and Direct)
+═══════════════════════════════════════════════════════════════════
+Provide a clear, direct, unambiguous instruction that tells the model:
+
+"When analyzing the text, extract ONLY and EXCLUSIVELY:
+1. Entities of types: [list ALL the specified types from SECTION 2]
+2. Relationships of types: [list ALL the specified types from SECTION 3]
+
+**ABSOLUTE RESTRICTION - NO EXCEPTIONS:**
+- Extract ONLY entities that match the specified entity types listed above
+- Extract ONLY relationships that match the specified relationship types listed above
+- DO NOT extract ANY entities or relationships that fall outside these specified categories
+- Ignore all other entity types and relationship types, even if they appear highly important or central to the text
+- The system is designed to work with these specific types ONLY - extracting other types will severely degrade performance
+- DO NOT infer or create new entity/relationship types beyond those specified
+- When in doubt, if an entity or relationship doesn't clearly fit the specified types, DO NOT extract it"
+
+═══════════════════════════════════════════════════════════════════
+SECTION 5: FEW-SHOT EXAMPLES (2-3 Examples)
+═══════════════════════════════════════════════════════════════════
+Provide 2-3 concrete examples that demonstrate proper extraction.
+
+**CRITICAL**: All examples MUST use the exact tuple format with <|> delimiter. This is NOT optional.
+**This applies to BOTH graph construction AND graph refinement** - the tuple format is mandatory in all cases.
+
+For EACH example:
+1. Provide a short text snippet (2-4 sentences)
+2. Show extracted entities and relationships in TUPLE FORMAT using the <|> delimiter
+3. EVERY entity and relationship in the example MUST be in tuple format - no other format is acceptable
+4. Use the exact tuple schemas: ("entity"<|>name<|>type<|>description) and ("relationship"<|>type<|>source<|>target<|>description)
+
+**CRITICAL RULES FOR EXAMPLES:**
+- **MANDATORY FORMAT**: EVERY extracted entity and relationship in examples MUST use the exact tuple format with <|> delimiter
+- Entity tuple format: ("entity"<|>name<|>type<|>description)
+- Relationship tuple format: ("relationship"<|>type<|>source<|>target<|>description)
+- DO show what entities and relationships to extract
+- DO show how to describe entities and relationships
+- DO use concrete, specific examples from realistic scenarios
+- DO NOT use abstract placeholders like "[entity_name]" - use actual names
+- DO NOT use any other format (no JSON, no bullet lists, no prose descriptions)
+- Focus on demonstrating WHAT to extract and WHY those elements matter
+- **IF Event is an entity type: At least ONE example MUST show an Event entity participating in a relationship with another entity** (e.g., Person PARTICIPATED_IN Event, Event CAUSED Event, Event OCCURRED_AT Location)
+
+**MANDATORY Example Format - NO EXCEPTIONS:**
+**Example [N]:**
+Text: "[Your example text here - 2-4 sentences of realistic content]"
+
+Extracted Output:
+("entity"<|>EntityName1<|>EntityType<|>Description of this entity based on the text)
+("entity"<|>EntityName2<|>EntityType<|>Description of this entity based on the text)
+("relationship"<|>RELATIONSHIP_TYPE<|>EntityName1<|>EntityName2<|>Description of why these entities are related)
+
+IMPORTANT: Every single entity and relationship in your examples MUST be shown in this exact tuple format. Do not deviate from this format.
+
+**Special Note for Event Examples:**
+If Event is an entity type, include at least one example like:
+("entity"<|>The Battle of Midway<|>Event<|>A decisive naval battle in 1942)
+("entity"<|>Admiral Yamamoto<|>Person<|>Japanese naval commander)
+("relationship"<|>COMMANDED<|>Admiral Yamamoto<|>The Battle of Midway<|>Admiral Yamamoto commanded Japanese forces during the Battle of Midway)
+
+═══════════════════════════════════════════════════════════════════
+
+CRITICAL REQUIREMENTS:
+1. Follow the 5-section structure EXACTLY
+2. Provide concrete examples for EACH entity type you specify (at least 2-3 examples per type)
+3. Provide concrete examples for EACH relationship type you specify (at least 2-3 examples per type)
+4. **Make it ABSOLUTELY CLEAR that extraction is LIMITED to ONLY the specified types**:
+   - Your prompt MUST explicitly forbid extraction of any entity or relationship types not in the specified list
+   - Use strong, unambiguous language: "ONLY", "EXCLUSIVELY", "DO NOT extract other types"
+   - State the consequence: extracting unspecified types degrades system performance
+5. **SECTION 5 examples MUST use tuple format with <|> delimiter - MANDATORY, NO EXCEPTIONS**
+   - **This applies to BOTH graph construction AND graph refinement - tuple format is ALWAYS required**
+   - Every single entity MUST be: ("entity"<|>name<|>type<|>description)
+   - Every single relationship MUST be: ("relationship"<|>type<|>source<|>target<|>description)
+   - Do NOT use any other format (no JSON, no bullet lists, no prose)
+6. Examples should use concrete entity names (not abstract placeholders) to demonstrate realistic extraction
+7. Base all priorities on the critique provided
+8. Be specific about which types to prioritize (don't say "all" or "any")
+9. **If Event is an entity type, MUST include:**
+   a) Explicit clarification that Events are entities (not relationships) and must be extracted as entity tuples
+   b) At least ONE concrete example in SECTION 5 showing an Event entity participating in a relationship with another entity (in tuple format)
+
+**FINAL CRITICAL REMINDER**:
+Your optimized prompt must make it CRYSTAL CLEAR that the LLM should extract ONLY and EXCLUSIVELY entities and relationships of the specified types. This restriction must be stated explicitly in:
+- SECTION 1 (Strategic Guidance)
+- SECTION 2 Step 3 (Entity Extraction Principle)
+- SECTION 3 Step 3 (Relationship Extraction Principle)
+- SECTION 4 (Extraction Directive)
+
+Use strong, unambiguous language throughout. The LLM must understand that extracting ANY entity or relationship types outside the specified list is strictly forbidden and will degrade system performance.
 
 Provide only the optimized system prompt without additional commentary.
 """
@@ -699,7 +1006,7 @@ Based on this information, determine if there is a problem with the community su
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.
-If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If true, provide a critique focusing on the specific issue.
 If false, leave the critique empty.
 """
 
@@ -781,7 +1088,7 @@ The summarizer prompt should guide the model to:
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.
-If true, provide a SHORT and CONCISE critique (2-3 sentences max) focusing on the specific issue.
+If true, provide a critique focusing on the specific issue.
 If false, leave the critique empty.
 """
 
@@ -815,4 +1122,18 @@ Below are the criticisms on the prompt:
 
 Incorporate the criticism, and produce a new prompt.
 """
+
+
+# Community Level Selection for GraphRAG
+# Controls which hierarchical levels of communities to use for summarization and answer generation
+# Options:
+#   "all"   - Use all communities at all levels
+#   "top"   - Use only top-level communities (L0_*)
+#   "leaf"  - Use only leaf communities (most specific, no children)
+#   "0"     - Use only depth 0 communities (broadest)
+#   "1"     - Use only depth 1 communities (second level - DEFAULT)
+#   "2"     - Use only depth 2 communities (third level - most specific)
+#   "0,1"   - Use depths 0 and 1
+#   "1,2"   - Use depths 1 and 2
+default_community_levels = "top"  # Default: second level (depth 1) provides good balance
 

@@ -27,8 +27,9 @@ output/
 *_wins*.txt
 temp_*.txt
 
-# Test files
+# Test files (excluding test_time_training.py which is core)
 test_*.py
+!test_time_training.py
 verify_graph.py
 llm_keys.py
 demo_*
