@@ -386,11 +386,6 @@ Your task:
    - SATISFACTORY: The answer adequately follows the patterns and answers the question well
    - NEEDS_REFINEMENT: The answer has issues and should be improved
 
-Pay special attention to the LENGTH GUIDELINES in the learned patterns:
-- Answers must meet the minimum word count for their question type
-- Descriptive/significance questions require 150-450 words
-- Brief answers that lack comprehensiveness should be marked NEEDS_REFINEMENT
-- If an answer seems too short or lacks detail, it likely needs refinement
 
 3. If NEEDS_REFINEMENT, provide a specific, actionable critique explaining:
    - What is missing or incorrect

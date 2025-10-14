@@ -498,12 +498,36 @@ class DatasetAgent(RoutedAgent):
             # Determine if we should continue
             continue_processing = False
 
+            # Check if evaluator determined answer is satisfactory (from BatchOrchestratorAgent)
+            # The evaluator sets continue_optimization_<qa_pair_id> = False when answer is SATISFACTORY
+            qa_pair_id = current_state.get("batch_information", {}).get("qa_pairs", [{}])[0].get("question_id", "")
+            should_continue_optimization = current_state.get(f"continue_optimization_{qa_pair_id}", True)
+
             # Check if we need more iterations for current QA pair
             if message.repetition < self.repetitions - 1:
-                self.current_repetition = message.repetition + 1
-                continue_processing = True
-                self.logger.info(f"Starting iteration {self.current_repetition + 1}/{self.repetitions} for QA pair {self.current_qa_index}")
-                self._log_to_file(f"Starting iteration {self.current_repetition + 1}/{self.repetitions} for QA pair {self.current_qa_index}")
+                if should_continue_optimization:
+                    # Answer needs refinement - continue iterations
+                    self.current_repetition = message.repetition + 1
+                    continue_processing = True
+                    self.logger.info(f"Starting iteration {self.current_repetition + 1}/{self.repetitions} for QA pair {self.current_qa_index}")
+                    self._log_to_file(f"Starting iteration {self.current_repetition + 1}/{self.repetitions} for QA pair {self.current_qa_index}")
+                else:
+                    # Answer is satisfactory - skip remaining iterations and move to next QA pair
+                    self.logger.info(f"✅ Answer is satisfactory - skipping remaining iterations for QA pair {self.current_qa_index}")
+                    self._log_to_file(f"Answer is satisfactory - skipping remaining iterations for QA pair {self.current_qa_index}")
+                    # Move to next QA pair
+                    self.current_repetition = 0
+                    self.current_qa_index = message.batch_id + 1
+                    next_example = self.generate_single_qa_pair(self.current_qa_index)
+                    if next_example is not None:
+                        continue_processing = True
+                        self.logger.info(f"Moving to QA pair {self.current_qa_index}, resetting learned prompts")
+                        self._log_to_file(f"Moving to QA pair {self.current_qa_index}, resetting learned prompts")
+                        await self._reset_state_for_new_example(self.dataset_name, self.setting)
+                    else:
+                        self.logger.info("All QA pairs completed")
+                        self._log_to_file("All QA pairs completed")
+                        finalize_execution_logging()
             else:
                 # Move to next QA pair (reset state between examples)
                 self.current_repetition = 0

@@ -13,15 +13,20 @@ from pathlib import Path
 class SharedState:
     """Manages shared state between AutoGen agents."""
 
-    def __init__(self, state_dir: str = "agent_states"):
+    def __init__(self, state_dir: str = "agent_states", enable_archiving: bool = False):
         """
         Initialize shared state manager.
 
         Args:
             state_dir (str): Directory to store state files
+            enable_archiving (bool): Enable archiving of QA pair and iteration data (default: False for performance)
         """
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(exist_ok=True)
+
+        # Performance optimization: In-memory state cache
+        self._state_cache: Dict[str, Dict[str, Any]] = {}
+        self.enable_archiving = enable_archiving
 
         # Default shared state structure
         self.default_state = {
@@ -59,6 +64,33 @@ class SharedState:
             "iteration_start_time": None
         }
 
+        # Global in-memory map for early-stop flags (shared across all instances)
+        # Keyed by (dataset, setting, qa_pair_id) -> bool
+        # Using class-level storage so multiple SharedState instances share the same map in-process
+        if not hasattr(SharedState, "_continue_flags"):
+            SharedState._continue_flags: Dict[str, bool] = {}
+
+    @staticmethod
+    def _flag_key(dataset: str, setting: str, qa_pair_id: str) -> str:
+        return f"{dataset}::{setting}::{qa_pair_id}"
+
+    @classmethod
+    def set_continue_flag(cls, dataset: str, setting: str, qa_pair_id: str, value: bool) -> None:
+        try:
+            key = cls._flag_key(dataset, setting, qa_pair_id)
+            cls._continue_flags[key] = bool(value)
+        except Exception:
+            # Best-effort; avoid raising from logging utilities
+            pass
+
+    @classmethod
+    def get_continue_flag(cls, dataset: str, setting: str, qa_pair_id: str) -> Optional[bool]:
+        try:
+            key = cls._flag_key(dataset, setting, qa_pair_id)
+            return cls._continue_flags.get(key, None)
+        except Exception:
+            return None
+
     def get_state_file_path(self, dataset: str, setting: str, batch_id: int = None) -> Path:
         """
         Get the path for a specific state file.
@@ -79,7 +111,7 @@ class SharedState:
 
     def load_state(self, dataset: str, setting: str, batch_id: int = None) -> Dict[str, Any]:
         """
-        Load shared state from file.
+        Load shared state from file with in-memory caching.
 
         Args:
             dataset (str): Dataset name
@@ -89,6 +121,11 @@ class SharedState:
         Returns:
             Dict[str, Any]: Shared state dictionary
         """
+        # Check cache first (performance optimization)
+        cache_key = f"{dataset}_{setting}_{batch_id}"
+        if cache_key in self._state_cache:
+            return self._state_cache[cache_key].copy()
+
         state_file = self.get_state_file_path(dataset, setting, batch_id)
 
         if state_file.exists():
@@ -99,16 +136,23 @@ class SharedState:
                 for key, default_value in self.default_state.items():
                     if key not in state:
                         state[key] = default_value
+
+                # Cache the loaded state
+                self._state_cache[cache_key] = state.copy()
                 return state
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Error loading state file {state_file}: {e}")
-                return self.default_state.copy()
+                default = self.default_state.copy()
+                self._state_cache[cache_key] = default.copy()
+                return default
         else:
-            return self.default_state.copy()
+            default = self.default_state.copy()
+            self._state_cache[cache_key] = default.copy()
+            return default
 
     def save_state(self, state: Dict[str, Any], dataset: str, setting: str, batch_id: int = None) -> bool:
         """
-        Save shared state to file.
+        Save shared state to file with in-memory caching.
 
         Args:
             state (Dict[str, Any]): State to save
@@ -119,6 +163,10 @@ class SharedState:
         Returns:
             bool: True if successful, False otherwise
         """
+        # Update cache first (performance optimization)
+        cache_key = f"{dataset}_{setting}_{batch_id}"
+        self._state_cache[cache_key] = state.copy()
+
         state_file = self.get_state_file_path(dataset, setting, batch_id)
 
         try:
@@ -134,16 +182,27 @@ class SharedState:
             with open(state_file, 'w', encoding='utf-8') as f:
                 json.dump(state_with_meta, f, indent=2, ensure_ascii=False)
 
-            # Also save as latest
-            if batch_id is not None:
-                latest_file = self.get_state_file_path(dataset, setting, None)
-                with open(latest_file, 'w', encoding='utf-8') as f:
-                    json.dump(state_with_meta, f, indent=2, ensure_ascii=False)
+            # OPTIMIZATION: Disabled duplicate "latest" file writing for performance
+            # if batch_id is not None:
+            #     latest_file = self.get_state_file_path(dataset, setting, None)
+            #     with open(latest_file, 'w', encoding='utf-8') as f:
+            #         json.dump(state_with_meta, f, indent=2, ensure_ascii=False)
 
             return True
         except (IOError, json.JSONEncodeError) as e:
             print(f"Error saving state file {state_file}: {e}")
             return False
+
+    def invalidate_cache(self, dataset: str, setting: str, batch_id: int = None) -> None:
+        """Invalidate the in-memory cache entry for a given state file."""
+        cache_key = f"{dataset}_{setting}_{batch_id}"
+        if cache_key in self._state_cache:
+            del self._state_cache[cache_key]
+
+    def load_state_fresh(self, dataset: str, setting: str, batch_id: int = None) -> Dict[str, Any]:
+        """Force reload state from disk, bypassing the in-memory cache."""
+        self.invalidate_cache(dataset, setting, batch_id)
+        return self.load_state(dataset, setting, batch_id)
 
     def get_all_states(self, dataset: str, setting: str) -> List[Dict[str, Any]]:
         """
@@ -188,7 +247,8 @@ class SharedState:
             Dict[str, Any]: Fresh state for new QA pair
         """
         # Load current state to preserve document text and example information
-        current_state = self.load_state(dataset, setting, batch_id)
+        # Force fresh load to ensure we see latest flags/prompts
+        current_state = self.load_state_fresh(dataset, setting, batch_id)
 
         # Archive previous QA pair data if exists
         if self.current_qa_pair_id and self.current_qa_pair_id != qa_pair_id:
@@ -270,7 +330,8 @@ class SharedState:
             Dict[str, Any]: State with preserved system prompts
         """
         # Load current state to preserve system prompts
-        current_state = self.load_state(dataset, setting, batch_id)
+        # Force fresh load to ensure we preserve latest flags/prompts from previous iteration
+        current_state = self.load_state_fresh(dataset, setting, batch_id)
 
         # Archive previous iteration data
         self._archive_iteration_data(qa_pair_id, self.current_iteration, current_state, dataset, setting, batch_id)
@@ -292,6 +353,12 @@ class SharedState:
 
         # Preserve all response evaluations from previous iterations
         new_state["response_evaluations"] = current_state.get("response_evaluations", [])
+
+        # Preserve retrieved context from iteration 0 for baseline static retrieval reuse
+        # This allows the baseline to skip re-retrieval on subsequent iterations
+        new_state["baseline_retrieved_context_iter0"] = current_state.get("baseline_retrieved_context_iter0", "")
+        new_state["faiss_index_path"] = current_state.get("faiss_index_path", "")
+        new_state["chunk_metadata_path"] = current_state.get("chunk_metadata_path", "")
 
         # Preserve graph and community data for style-issue reuse
         new_state["last_graph_response"] = current_state.get("last_graph_response", {})
@@ -378,7 +445,11 @@ class SharedState:
     def _archive_qa_pair_data(self, qa_pair_id: str, dataset: str, setting: str, batch_id: int = None):
         """
         Archive data for completed QA pair.
+        OPTIMIZATION: Disabled by default for performance (enable with enable_archiving=True).
         """
+        if not self.enable_archiving:
+            return  # Skip archiving for performance
+
         archive_dir = self.state_dir / "archives" / "qa_pairs" / qa_pair_id
         archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -396,7 +467,11 @@ class SharedState:
     def _archive_iteration_data(self, qa_pair_id: str, iteration: int, state: Dict[str, Any], dataset: str, setting: str, batch_id: int = None):
         """
         Archive data for completed iteration.
+        OPTIMIZATION: Disabled by default for performance (enable with enable_archiving=True).
         """
+        if not self.enable_archiving:
+            return  # Skip archiving for performance
+
         archive_dir = self.state_dir / "archives" / "iterations" / qa_pair_id / f"iteration_{iteration}"
         archive_dir.mkdir(parents=True, exist_ok=True)
 

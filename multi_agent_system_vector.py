@@ -27,6 +27,10 @@ from autogen_core import (
 from autogen_core.models import SystemMessage, UserMessage
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 
+# Gemini API imports
+from google import genai
+from google.genai import types
+
 from shared_state import SharedState
 from datasets_schema import Document, Question
 from eval_functions import evaluate_rouge_score
@@ -280,6 +284,38 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             self.logger.info(f"Initialized tracking for {len(self.current_batch_qa_pairs)} QA pairs")
 
+            # Carry over continue_optimization flags from previous repetitions (cross-batch)
+            # so early-stop works on repetition > 0 for already-satisfactory QA pairs
+            try:
+                if message.repetition > 0:
+                    prev_states = self.shared_state.get_all_states(message.dataset, message.setting)
+                    # Sort is already by batch_id ascending; iterate from latest to oldest
+                    copied = 0
+                    for qa in qa_pairs:
+                        qa_pair_id = qa.get("question_id", "")
+                        if not qa_pair_id:
+                            continue
+                        flag_key = f"continue_optimization_{qa_pair_id}"
+                        # Only set if not present in current state
+                        current_state = self.shared_state.load_state_fresh(message.dataset, message.setting, message.batch_id)
+                        if flag_key in current_state:
+                            continue
+                        # Find most recent prior value
+                        for ps in reversed(prev_states):
+                            if ps.get("_metadata", {}).get("batch_id", 0) == message.batch_id:
+                                continue
+                            if flag_key in ps:
+                                val = ps.get(flag_key)
+                                if isinstance(val, bool):
+                                    current_state[flag_key] = val
+                                    copied += 1
+                                    break
+                    if copied:
+                        self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+                        print(f"[Orchestrator] Carried over {copied} early-stop flags from previous repetitions")
+            except Exception as e:
+                print(f"[Orchestrator] Early-stop flag carry-over error: {e}")
+
             # FIXED: Use message.repetition as current iteration instead of processing multiple iterations
             # The DatasetAgent calls us once per repetition, so we should process exactly one iteration
             current_iteration = message.repetition
@@ -344,8 +380,58 @@ class BatchOrchestratorAgent(RoutedAgent):
 
                 # Check if we should skip this iteration because evaluation determined response is satisfactory
                 if current_iteration > 0:  # Only check after first iteration
-                    current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-                    should_continue = current_state.get(f"continue_optimization_{qa_pair_id}", True)
+                    # Force fresh state load to observe evaluator's latest signals
+                    current_state = self.shared_state.load_state_fresh(message.dataset, message.setting, message.batch_id)
+
+                    # Try 0: in-memory map (updated by evaluator immediately)
+                    mem_flag = None
+                    try:
+                        from shared_state import SharedState as _SS
+                        mem_flag = _SS.get_continue_flag(message.dataset, message.setting, qa_pair_id)
+                    except Exception:
+                        mem_flag = None
+
+                    # Try 1: most recent eval in current batch
+                    should_continue = True
+                    evals = current_state.get("response_evaluations", [])
+                    used_source = "current_batch_evals"
+                    if mem_flag is not None:
+                        should_continue = bool(mem_flag)
+                        used_source = "memory_map"
+                    if evals:
+                        qa_evals = [e for e in evals if e.get('qa_pair_id') == qa_pair_id]
+                        if qa_evals:
+                            last_eval = qa_evals[-1]
+                            cont = last_eval.get('continue_optimization')
+                            if isinstance(cont, bool):
+                                should_continue = cont
+                    # Try 2: scan all previous states for last eval for this qa_pair_id
+                    if not evals or (should_continue and len([e for e in evals if e.get('qa_pair_id') == qa_pair_id]) == 0):
+                        all_states = self.shared_state.get_all_states(message.dataset, message.setting)
+                        for st in reversed(all_states):
+                            evs = st.get("response_evaluations", [])
+                            qa_evs = [e for e in evs if e.get('qa_pair_id') == qa_pair_id]
+                            if qa_evs:
+                                last = qa_evs[-1]
+                                cont = last.get('continue_optimization')
+                                if isinstance(cont, bool):
+                                    should_continue = cont
+                                    used_source = "prior_batches_evals"
+                                    break
+                    # Try 3: dedicated flag in current batch or prior states
+                    if should_continue:
+                        flag_key = f"continue_optimization_{qa_pair_id}"
+                        if flag_key in current_state:
+                            should_continue = current_state.get(flag_key, True)
+                            used_source = "current_batch_flag"
+                        else:
+                            for st in reversed(self.shared_state.get_all_states(message.dataset, message.setting)):
+                                if flag_key in st:
+                                    should_continue = st.get(flag_key, True)
+                                    used_source = "prior_batches_flag"
+                                    break
+
+                    print(f"[Orchestrator] Early-stop check qa_pair_id={qa_pair_id} flag={should_continue} (source={used_source}, current_batch_evals={len(evals)})")
                     if not should_continue:
                         self.logger.info(f"⏭️  Skipping iteration {current_iteration} for {qa_pair_id} - evaluation indicated response was satisfactory in previous iteration")
                         print(f"⏭️  Early stopping: Skipping {qa_pair_id} iteration {current_iteration} (response satisfactory)")
@@ -358,33 +444,34 @@ class BatchOrchestratorAgent(RoutedAgent):
                             self.qa_pair_rouge_progression[qa_pair_id].append(last_rouge)
                             self.logger.info(f"✓ Reusing result from previous iteration for {qa_pair_id} | ROUGE: {last_rouge:.4f}")
 
-                        # Log iteration completion for the final iteration
-                        if current_iteration == total_iterations - 1:
-                            current_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
-                            eval_logger = get_global_evaluation_logger()
-                            # Log to old evaluation logger for backward compatibility
-                            eval_logger.complete_qa_pair_evaluation(
-                                qa_pair_id=qa_pair_id,
-                                final_rouge_score=current_rouge,
-                                rouge_progression=self.qa_pair_rouge_progression[qa_pair_id],
-                                best_iteration=current_iteration,
-                                total_iterations_completed=current_iteration + 1,
-                                improvement_gained=0.0,
-                                final_metrics={}
-                            )
+                            # Log iteration completion for the final iteration
+                            if current_iteration == total_iterations - 1:
+                                current_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
+                                eval_logger = get_global_evaluation_logger()
+                                # Log to old evaluation logger for backward compatibility
+                                eval_logger.complete_qa_pair_evaluation(
+                                    qa_pair_id=qa_pair_id,
+                                    final_rouge_score=current_rouge,
+                                    rouge_progression=self.qa_pair_rouge_progression[qa_pair_id],
+                                    best_iteration=current_iteration,
+                                    total_iterations_completed=current_iteration + 1,
+                                    improvement_gained=0.0,
+                                    final_metrics={}
+                                )
 
-                            # Log to standardized evaluation logger
-                            best_answer = last_result.get("generated_answer", "") if 'last_result' in locals() else ""
-                            self.standardized_logger.complete_qa_pair_evaluation(
-                                qa_pair_id=qa_pair_id,
-                                final_rouge_score=current_rouge,
-                                rouge_progression=self.qa_pair_rouge_progression[qa_pair_id],
-                                best_iteration=current_iteration,
-                                total_iterations_completed=current_iteration + 1,
-                                best_answer=best_answer
-                            )
+                                # Log to standardized evaluation logger
+                                best_answer = last_result.get("generated_answer", "")
+                                self.standardized_logger.complete_qa_pair_evaluation(
+                                    qa_pair_id=qa_pair_id,
+                                    final_rouge_score=current_rouge,
+                                    rouge_progression=self.qa_pair_rouge_progression[qa_pair_id],
+                                    best_iteration=current_iteration,
+                                    total_iterations_completed=current_iteration + 1,
+                                    best_answer=best_answer
+                                )
 
-                        continue  # Skip to next QA pair
+                        # IMPORTANT: Skip to next iteration - don't process this one
+                        continue
 
                 # Process the current iteration only
                 self.logger.info(f"📊 Processing QA pair {qa_pair_id}, iteration {current_iteration}")
@@ -728,6 +815,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Perform backward pass ONLY if evaluator determined answer needs refinement
             # The ResponseEvaluatorAgent sets continue_optimization=True when decision is NEEDS_REFINEMENT
             if eval_response.continue_optimization:
+                print(f"[Orchestrator] Immediate backward pass trigger (continue_optimization=True) iteration={iteration}")
                 self.logger.info(f"🔄 Starting backward pass for iteration {iteration} (evaluator determined answer needs refinement)")
 
                 # Gather QA results for backward pass
@@ -754,6 +842,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                 try:
                     backward_agent_id = AgentId("backward_pass_agent", "default")
                     backward_response = await self.send_message(backward_pass_msg, backward_agent_id)
+                    print(f"[Orchestrator] Immediate BackwardPassReady received for iteration={iteration}")
                     self.logger.info(f"✓ Backward pass completed for iteration {iteration}")
 
                     # Process backward pass response to update QA pair prompts (like GraphRAG does)
@@ -1015,6 +1104,7 @@ class BatchOrchestratorAgent(RoutedAgent):
     async def _process_answer_response(self, answer_response: AnswerGenerationReadyMessage, ctx: MessageContext) -> None:
         """Process answer generation response and continue with evaluation."""
         self.logger.info(f"Processing answer response for QA pair {answer_response.qa_pair_id}")
+        print(f"[Orchestrator] _process_answer_response START qa_pair_id={answer_response.qa_pair_id}")
 
         qa_pair = self.current_batch_qa_pairs.get(answer_response.qa_pair_id)
         if not qa_pair:
@@ -1023,6 +1113,7 @@ class BatchOrchestratorAgent(RoutedAgent):
 
         # Compute ROUGE score using real implementation
         rouge_score = self._compute_rouge_score(qa_pair, answer_response.generated_answer)
+        print(f"[Orchestrator] Computed ROUGE-L={rouge_score:.4f} for qa_pair_id={answer_response.qa_pair_id}")
 
         self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {answer_response.qa_pair_id}")
 
@@ -1031,7 +1122,8 @@ class BatchOrchestratorAgent(RoutedAgent):
         rouge_scores_list = current_state.get("rouge_scores", [])
         rouge_scores_list.append(rouge_score)
         current_state["rouge_scores"] = rouge_scores_list
-        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, answer_response.batch_id)
+        saved = self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, answer_response.batch_id)
+        print(f"[Orchestrator] Saved ROUGE to state. saved={saved}")
 
         # Log to evaluation logger
         eval_logger = get_global_evaluation_logger()
@@ -1115,11 +1207,13 @@ class BatchOrchestratorAgent(RoutedAgent):
         )
 
         self.logger.info(f"Sending ResponseEvaluationStart for QA pair {answer_response.qa_pair_id}")
+        print(f"[Orchestrator] Sending ResponseEvaluationStart qa_pair_id={answer_response.qa_pair_id}")
 
         # Send to ResponseEvaluatorAgent
         try:
             response_eval_agent_id = AgentId("response_evaluator_agent", "default")
             eval_response = await self.send_message(eval_start_msg, response_eval_agent_id)
+            print(f"[Orchestrator] Received ResponseEvaluationReady qa_pair_id={answer_response.qa_pair_id} continue={getattr(eval_response,'continue_optimization',None)}")
             self.logger.info(f"Received ResponseEvaluationReady response")
 
             # Continue with final processing
@@ -1128,11 +1222,13 @@ class BatchOrchestratorAgent(RoutedAgent):
         except Exception as e:
             self.logger.warning(f"ResponseEvaluatorAgent not available, falling back to simulation: {e}")
             # Fallback to simulation if agent is not available
+            print(f"[Orchestrator] ResponseEvaluatorAgent unavailable, simulating evaluation")
             await self._simulate_response_evaluation_ready(eval_start_msg, ctx)
 
     async def _process_evaluation_response(self, eval_response: ResponseEvaluationReadyMessage, ctx: MessageContext) -> None:
         """Process evaluation response and track completion."""
         self.logger.info(f"Processing evaluation response for QA pair {eval_response.qa_pair_id}")
+        print(f"[Orchestrator] _process_evaluation_response qa_pair_id={eval_response.qa_pair_id} continue={getattr(eval_response,'continue_optimization',None)}")
 
         # Note: ResponseEvaluatorAgent already stores evaluation results in response_evaluations
         # with the proper structured format needed for backward pass. No need to duplicate here.
@@ -1144,6 +1240,7 @@ class BatchOrchestratorAgent(RoutedAgent):
         # Check if all QA pairs are completed
         if len(self.completed_qa_pairs) == len(self.current_batch_qa_pairs):
             self.logger.info(f"All {len(self.completed_qa_pairs)} QA pairs completed for batch {eval_response.batch_id}")
+            print(f"[Orchestrator] All QA pairs completed. Starting context summary then backward pass")
 
             # Generate context summary before backward pass
             await self._generate_context_summary(eval_response.batch_id, eval_response.repetition, ctx)
@@ -1154,6 +1251,7 @@ class BatchOrchestratorAgent(RoutedAgent):
     async def _generate_context_summary(self, batch_id: int, repetition: int, ctx: MessageContext) -> None:
         """Generate summary of all retrieved contexts before backward pass."""
         self.logger.info(f"Generating context summary for batch {batch_id}")
+        print(f"[Orchestrator] _generate_context_summary START batch_id={batch_id}")
 
         # Load current shared state
         current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, batch_id)
@@ -1161,6 +1259,7 @@ class BatchOrchestratorAgent(RoutedAgent):
 
         if not retrieved_contexts:
             self.logger.warning("No retrieved contexts to summarize")
+            print("[Orchestrator] No retrieved contexts to summarize — skipping")
             return
 
         # Log context details
@@ -1178,29 +1277,34 @@ class BatchOrchestratorAgent(RoutedAgent):
         try:
             summarizer_agent_id = AgentId("summarizer_agent", "default")
             self.logger.info("Sending summarization request to SummarizerAgent")
+            print("[Orchestrator] Sending SummarizationStart to summarizer_agent")
             summary_response = await self.send_message(summarization_msg, summarizer_agent_id)
 
             # Store the summary in shared state
             current_state["context_summary"] = summary_response.summary
             self.logger.info(f"Context summary generated successfully, length: {len(summary_response.summary)} chars")
+            print(f"[Orchestrator] Summary generated. length={len(summary_response.summary)}")
 
             # Log the summary for debugging
             self.logger.debug(f"Generated summary preview: {summary_response.summary[:200]}...")
 
         except Exception as e:
             self.logger.warning(f"SummarizerAgent not available, using concatenated contexts as fallback: {e}")
+            print("[Orchestrator] SummarizerAgent unavailable — using concatenated contexts")
             # Fallback to using concatenated contexts
             concatenated_contexts = "\n\n--- Context Separator ---\n\n".join(retrieved_contexts)
             current_state["context_summary"] = concatenated_contexts
 
         # Save state with summary
-        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, batch_id)
+        saved = self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, batch_id)
         self.logger.info(f"Context summary saved to shared state for batch {batch_id}")
+        print(f"[Orchestrator] Saved context summary to state. saved={saved}")
 
     # Continue with other methods...
     async def _start_backward_pass(self, batch_id: int, repetition: int, ctx: MessageContext) -> None:
         """Start the backward pass."""
         all_qa_results = list(self.completed_qa_pairs.values())
+        print(f"[Orchestrator] _start_backward_pass START batch_id={batch_id} qa_results={len(all_qa_results)}")
 
         backward_pass_msg = BackwardPassStartMessage(
             batch_id=batch_id,
@@ -1211,12 +1315,14 @@ class BatchOrchestratorAgent(RoutedAgent):
         )
 
         self.logger.info(f"Starting backward pass for batch {batch_id}")
+        print(f"[Orchestrator] Sending BackwardPassStart to backward_pass_agent")
 
         # Send to BackwardPassAgent and get response
         try:
             backward_pass_agent_id = AgentId("backward_pass_agent", "default")
             backward_response = await self.send_message(backward_pass_msg, backward_pass_agent_id)
             self.logger.info(f"Received BackwardPassReady response")
+            print(f"[Orchestrator] Received BackwardPassReady")
 
             # Process the backward pass response and send final result to DatasetAgent
             await self._process_backward_pass_response(backward_response, ctx)
@@ -1224,12 +1330,14 @@ class BatchOrchestratorAgent(RoutedAgent):
         except Exception as e:
             self.logger.error(f"BackwardPassAgent failed: {e}", exc_info=True)
             self.logger.warning(f"Falling back to backward pass simulation due to error")
+            print(f"[Orchestrator] BackwardPassAgent unavailable — simulating backward pass")
             # Fallback to simulation if agent is not available
             await self._simulate_backward_pass_ready(backward_pass_msg, ctx)
 
     async def _process_backward_pass_response(self, backward_response: BackwardPassReadyMessage, ctx: MessageContext) -> None:
         """Process backward pass response and send BatchReady to DatasetAgent."""
         self.logger.info(f"Processing backward pass response for batch {backward_response.batch_id}")
+        print(f"[Orchestrator] _process_backward_pass_response START batch_id={backward_response.batch_id}")
 
         # Update QA pair prompts with optimized versions (like GraphRAG does)
         if hasattr(backward_response, 'backward_pass_results'):
@@ -1237,17 +1345,21 @@ class BatchOrchestratorAgent(RoutedAgent):
             current_qa_pair_id = self.shared_state.current_qa_pair_id
             if current_qa_pair_id and optimized_prompts:
                 self.shared_state.update_qa_pair_prompts(current_qa_pair_id, optimized_prompts)
+                print(f"[Orchestrator] Updating prompts for qa_pair_id={current_qa_pair_id} keys={list(optimized_prompts.keys())}")
 
                 # CRITICAL FIX: Save optimized prompts to persistent state for next DatasetAgent call
                 current_state = self.shared_state.load_state(backward_response.dataset, backward_response.setting, backward_response.batch_id)
                 for prompt_key, prompt_value in optimized_prompts.items():
                     current_state[prompt_key] = prompt_value
-                self.shared_state.save_state(current_state, backward_response.dataset, backward_response.setting, backward_response.batch_id)
+                saved = self.shared_state.save_state(current_state, backward_response.dataset, backward_response.setting, backward_response.batch_id)
+                print(f"[Orchestrator] Persisted optimized prompts. saved={saved}")
 
                 self.logger.info(f"Updated QA pair prompts for {current_qa_pair_id} - preserving learned prompts for next iteration")
                 self.logger.info(f"DEBUG: BatchOrchestrator - optimized_prompts saved to persistent state: {[(k, len(v)) for k, v in optimized_prompts.items()]}")
             else:
+                print(f"[Orchestrator] Skipping immediate backward pass (continue_optimization=False)")
                 self.logger.warning(f"Cannot update QA pair prompts - current_qa_pair_id: {current_qa_pair_id}, optimized_prompts: {bool(optimized_prompts)}")
+                print(f"[Orchestrator] No optimized prompts to apply or missing current_qa_pair_id")
 
         # The BatchOrchestratorAgent's handle_batch_start method already returns the BatchReady message
         # This is the final step of the pipeline
@@ -2203,19 +2315,9 @@ class AnswerGeneratorAgent(RoutedAgent):
         # Import prompts
         from parameters import answer_generator_initial_prompt, answer_generator_refinement_prompt
 
-        # Initialize Gemini model client with structured output
-        self.model_client = OpenAIChatCompletionClient(
-            model="gemini-2.5-flash",
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            api_key=llm_keys.GEMINI_KEY,
-            model_info={
-                "vision": False,
-                "function_calling": True,
-                "json_output": True,
-                "family": "unknown",
-                "structured_output": True,
-            }
-        )
+        # Initialize Gemini API client using native SDK
+        self.gemini_client = genai.Client(api_key=llm_keys.GEMINI_KEY)
+        self.model_name = "gemini-2.5-flash"
 
         self.initial_prompt = answer_generator_initial_prompt
         self.refinement_prompt = answer_generator_refinement_prompt
@@ -2230,6 +2332,7 @@ class AnswerGeneratorAgent(RoutedAgent):
 
         # Check if learned prompt exists from previous iteration's backward pass
         learned_system_prompt = current_state.get("learned_prompt_answer_generator_vector", "")
+
         if not learned_system_prompt:
             self.logger.info(f"First iteration for QA pair {message.qa_pair_id} - using empty answer generator system prompt")
         else:
@@ -2304,17 +2407,27 @@ class AnswerGeneratorAgent(RoutedAgent):
             self.logger.info(f"Including {len(qa_pair_evals)} previous attempt(s) as additional context")
 
         try:
-            # Create messages with dual-prompt structure
-            system_message = SystemMessage(content=learned_system_prompt)
-            user_message = UserMessage(content=user_prompt_content, source="user")
+            # Use Gemini API directly with system instruction and thinking disabled
+            # Build config - only include system_instruction if it's not empty
+            config_dict = {
+                "thinking_config": types.ThinkingConfig(thinking_budget=0)
+            }
+            if learned_system_prompt:
+                config_dict["system_instruction"] = learned_system_prompt
 
-            response = await self.model_client.create(
-                [system_message, user_message],
-                cancellation_token=ctx.cancellation_token
+            # Run synchronous Gemini call in executor to not block event loop
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.gemini_client.models.generate_content(
+                    model=self.model_name,
+                    contents=user_prompt_content,
+                    config=types.GenerateContentConfig(**config_dict)
+                )
             )
 
             # Get generated answer
-            generated_answer = response.content if isinstance(response.content, str) else str(response.content)
+            generated_answer = response.text
 
             # Log LLM interaction
             logger = get_global_prompt_logger()
@@ -2377,7 +2490,8 @@ class AnswerGeneratorAgent(RoutedAgent):
 
     async def close(self) -> None:
         """Close the model client."""
-        await self.model_client.close()
+        # Gemini client doesn't require explicit closing
+        pass
 
 
 # ===== RESPONSE EVALUATOR AGENT =====
@@ -2399,19 +2513,9 @@ class ResponseEvaluatorAgent(RoutedAgent):
         # Load learned gold answer patterns if available
         self.satisfactory_criteria = self._load_gold_patterns()
 
-        # Initialize Gemini model client (without structured output - will parse text)
-        self.model_client = OpenAIChatCompletionClient(
-            model="gemini-2.5-flash",
-            max_tokens=8192,
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            api_key=llm_keys.GEMINI_KEY,
-            model_info={
-                "vision": False,
-                "function_calling": False,
-                "json_output": False,
-                "family": "unknown",
-            }
-        )
+        # Initialize Gemini API client using native SDK
+        self.gemini_client = genai.Client(api_key=llm_keys.GEMINI_KEY)
+        self.model_name = "gemini-2.5-flash"
 
         self.response_evaluator_prompt = response_evaluator_prompt
 
@@ -2488,16 +2592,19 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 qa_pair_for_rouge = {"answers": valid_gold_answers}
                 rouge_score = self._compute_rouge_score(qa_pair_for_rouge, message.generated_answer)
                 self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {message.qa_pair_id}")
+        print(f"[ResponseEvaluator] ROUGE-L={rouge_score:.4f}")
 
         # Load previous evaluations from shared state
         current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
         all_evaluation_responses = current_state.get("response_evaluations", [])
+        print(f"[ResponseEvaluator] Loaded state. prev_evals_total={len(all_evaluation_responses)}")
 
         # Filter previous evaluations for this specific QA pair only
         qa_pair_evals = [
             eval_resp for eval_resp in all_evaluation_responses
             if eval_resp.get('qa_pair_id') == message.qa_pair_id
         ]
+        print(f"[ResponseEvaluator] prev_evals_for_qa={len(qa_pair_evals)}")
 
         # Don't include previous evaluations in the prompt (to match Self-Refine behavior)
         # Each iteration is evaluated independently
@@ -2520,37 +2627,29 @@ class ResponseEvaluatorAgent(RoutedAgent):
         print(f"   ℹ️  Evaluating answer independently (not showing previous iterations to match Self-Refine)")
 
         try:
-            # Call LLM for response evaluation
-            system_message = SystemMessage(content=prompt_content)
-            user_message = UserMessage(content="Please evaluate the response.", source="system")
-
-            print("=" * 80)
-            print("RESPONSE EVALUATOR AGENT - LLM CALL")
-            print("=" * 80)
-            print(f"System Prompt ({len(prompt_content)} chars):")
-            print(f"\n[First 500 chars of full prompt:]")
-            print(prompt_content[:500])
-            print("-" * 80)
-            print(f"User Prompt: Please evaluate the response.")
-            print("-" * 80)
-            print("Calling LLM...")
 
             # Use retry logic to handle API overload errors
+            # Use Gemini API directly with system instruction and thinking disabled
             async def api_call():
-                return await self.model_client.create(
-                    [system_message, user_message],
-                    cancellation_token=ctx.cancellation_token
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    None,
+                    lambda: self.gemini_client.models.generate_content(
+                        model=self.model_name,
+                        contents="Please evaluate the response.",
+                        config=types.GenerateContentConfig(
+                            system_instruction=prompt_content,
+                            thinking_config=types.ThinkingConfig(thinking_budget=0)  # Disable thinking
+                        )
+                    )
                 )
 
+            print("[ResponseEvaluator] Calling Gemini API for evaluation...")
             response = await retry_api_call_with_backoff(api_call)
-
-            print(f"LLM Response received ({len(response.content)} chars):")
-            print(response.content)
-            print("=" * 80)
+            print("[ResponseEvaluator] LLM response received. length={}".format(len(response.text or "")))
 
             # Parse text response (like Self-Refine)
-            assert isinstance(response.content, str)
-            response_text = response.content.strip()
+            response_text = response.text.strip()
 
             # Parse DECISION and CRITIQUE from text
             decision = "NEEDS_REFINEMENT"  # Default
@@ -2571,6 +2670,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
                         critique += "\n" + "\n".join(lines[i+1:])
                     break
 
+            print(f"[ResponseEvaluator] Parsed decision={decision}")
             # Map to internal format
             # SATISFACTORY -> continue_optimization=False
             # NEEDS_REFINEMENT -> continue_optimization=True
@@ -2594,7 +2694,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 interaction_type="response_evaluation",
                 system_prompt=prompt_content,
                 user_prompt="Please evaluate the response. Remember: if the answer states that the context doesn't contain the information, then it is not satisfactory.",
-                llm_response=response.content,
+                llm_response=response.text,
                 batch_id=message.batch_id,
                 qa_pair_id=message.qa_pair_id,
                 iteration=message.repetition,
@@ -2610,6 +2710,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
             log_qa_processing(self.logger, message.qa_pair_id,
                             f"Evaluation completed - continue: {eval_response.continue_optimization}",
                             f"Reasoning: {eval_response.reasoning}\nCritique: {eval_response.critique}\nMissing Keywords: {eval_response.missing_keywords}")
+            print(f"[ResponseEvaluator] continue_optimization={eval_response.continue_optimization}")
 
             # Create evaluation result dictionary (excluding gold answers to prevent data leakage)
             evaluation_data = {
@@ -2634,7 +2735,15 @@ class ResponseEvaluatorAgent(RoutedAgent):
             # Store continue_optimization flag for early stopping
             current_state[f"continue_optimization_{message.qa_pair_id}"] = eval_response.continue_optimization
 
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            saved = self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            # Update in-memory early-stop map to avoid cross-batch timing issues
+            try:
+                from shared_state import SharedState as _SS
+                _SS.set_continue_flag(message.dataset, message.setting, message.qa_pair_id, eval_response.continue_optimization)
+                print(f"[ResponseEvaluator] Updated in-memory continue flag for {message.qa_pair_id} -> {eval_response.continue_optimization}")
+            except Exception as _:
+                pass
+            print(f"[ResponseEvaluator] Saved evaluation to state. saved={saved} flag_key=continue_optimization_{message.qa_pair_id}")
 
             # Send ResponseEvaluationReady message
             eval_ready_msg = ResponseEvaluationReadyMessage(
@@ -2647,13 +2756,14 @@ class ResponseEvaluatorAgent(RoutedAgent):
             )
 
             self.logger.info(f"Returning ResponseEvaluationReady for QA pair {message.qa_pair_id}")
+            print(f"[ResponseEvaluator] RETURN qa_pair_id={message.qa_pair_id}")
 
             # Return the evaluation ready message
             return eval_ready_msg
 
         except Exception as e:
             print("=" * 80)
-            print("RESPONSE EVALUATOR AGENT - ERROR AFTER ALL RETRIES")
+            print("[ResponseEvaluator] ERROR after retries")
             print("=" * 80)
             print(f"Error Type: {type(e).__name__}")
             print(f"Error Message: {e}")
@@ -2676,7 +2786,8 @@ class ResponseEvaluatorAgent(RoutedAgent):
 
     async def close(self) -> None:
         """Close the model client."""
-        await self.model_client.close()
+        # Gemini client doesn't require explicit closing
+        pass
 
 
 # ===== BACKWARD PASS AGENT =====
@@ -2741,33 +2852,141 @@ class BackwardPassAgent(RoutedAgent):
     async def handle_backward_pass_start(self, message: BackwardPassStartMessage, ctx: MessageContext) -> BackwardPassReadyMessage:
         """Handle BackwardPassStart message and perform complete backward pass critique generation."""
         self.logger.info(f"BackwardPassAgent processing backward pass for batch {message.batch_id}")
+        print(f"[BackwardPass] START batch_id={message.batch_id} dataset={message.dataset} setting={message.setting} qa_results={len(message.all_qa_results)}")
 
-        # Load shared state with correct dataset and setting parameters
-        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+        # Load shared state with correct dataset and setting parameters (force fresh to avoid stale cache)
+        current_state = self.shared_state.load_state_fresh(message.dataset, message.setting, message.batch_id)
+
+        # HYDRATE STATE FROM MESSAGE if critical fields are missing (handles immediate backward pass timing)
+        try:
+            hydrated = False
+            if message.all_qa_results:
+                # Seed response_evaluations if empty
+                if not current_state.get("response_evaluations"):
+                    evals = []
+                    for r in message.all_qa_results:
+                        ev = r.get("evaluation", {}) or {}
+                        evals.append({
+                            "qa_pair_id": r.get("qa_pair_id", ""),
+                            "original_query": r.get("question", ""),
+                            "generated_answer": r.get("generated_answer", ""),
+                            "evaluation_reasoning": ev.get("evaluation_reasoning", ev.get("reasoning", "")),
+                            "evaluation_feedback": ev.get("evaluation_feedback", ev.get("critique", "")),
+                            "missing_keywords": ev.get("missing_keywords", []),
+                            "continue_optimization": ev.get("continue_optimization", True),
+                            "repetition": message.repetition,
+                            "timestamp": datetime.now().isoformat(),
+                            "rouge_score": r.get("rouge_score", 0.0)
+                        })
+                    current_state["response_evaluations"] = evals
+                    print(f"[BackwardPass] Hydrated response_evaluations from message: {len(evals)}")
+                    hydrated = True
+
+                # Seed conversations_answer_generation if empty
+                if not current_state.get("conversations_answer_generation"):
+                    convs = []
+                    for r in message.all_qa_results:
+                        convs.append({
+                            "qa_pair_id": r.get("qa_pair_id", ""),
+                            "question": r.get("question", ""),
+                            "retrieved_context": r.get("retrieved_context", ""),
+                            "system_prompt": "",
+                            "user_prompt": "",
+                            "generated_answer": r.get("generated_answer", ""),
+                            "repetition": message.repetition
+                        })
+                    current_state["conversations_answer_generation"] = convs
+                    print(f"[BackwardPass] Hydrated conversations_answer_generation: {len(convs)}")
+                    hydrated = True
+
+                # Seed retrieved_contexts if empty
+                if not current_state.get("retrieved_contexts"):
+                    ctxs = []
+                    for r in message.all_qa_results:
+                        rc = r.get("retrieved_context", "")
+                        if rc:
+                            ctxs.append(rc)
+                    if ctxs:
+                        current_state["retrieved_contexts"] = ctxs
+                        print(f"[BackwardPass] Hydrated retrieved_contexts: {len(ctxs)}")
+                        hydrated = True
+
+                # Synthesize context_summary if missing but we have contexts
+                if not current_state.get("context_summary"):
+                    rc_list = current_state.get("retrieved_contexts", [])
+                    if rc_list:
+                        current_state["context_summary"] = "\n\n--- Context Separator ---\n\n".join(rc_list)
+                        print("[BackwardPass] Synthesized context_summary from retrieved_contexts")
+                        hydrated = True
+
+                # Seed retrieval_plans if empty (fallback to QA questions)
+                if not current_state.get("retrieval_plans"):
+                    plans = []
+                    for r in message.all_qa_results:
+                        q = r.get("question", "")
+                        if q:
+                            plans.append(f"query='{q}'")
+                    if plans:
+                        current_state["retrieval_plans"] = plans
+                        print(f"[BackwardPass] Hydrated retrieval_plans from questions: {len(plans)}")
+                        hydrated = True
+
+                # Seed retrieval_prompt if empty (fallback to base prompt)
+                if not current_state.get("retrieval_prompt"):
+                    try:
+                        from parameters import base_prompt_vector_retrieval_planner
+                        # Store a generic template since true prompt may be template-based
+                        current_state["retrieval_prompt"] = base_prompt_vector_retrieval_planner
+                        print("[BackwardPass] Hydrated retrieval_prompt with base template")
+                        hydrated = True
+                    except Exception as _:
+                        pass
+
+            if hydrated:
+                self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+                print("[BackwardPass] State hydrated and saved prior to critiques")
+        except Exception as e:
+            print(f"[BackwardPass] Hydration error: {e}")
 
         try:
             # Step 1: Generate answer generation critique
+            print("[BackwardPass] Step1: answer generation critique -> BEGIN")
             await self._generate_answer_generation_critique(current_state, ctx)
+            print("[BackwardPass] Step1: answer generation critique -> DONE")
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            print("[BackwardPass] State saved after Step1")
 
             # Step 2: Generate retrieved content critique
+            print("[BackwardPass] Step2: retrieved content critique -> BEGIN")
             await self._generate_retrieved_content_critique(current_state, ctx)
+            print("[BackwardPass] Step2: retrieved content critique -> DONE")
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            print("[BackwardPass] State saved after Step2")
 
             # Step 2.5: Generate retrieval summarizer prompt critique (with skip logic)
+            print("[BackwardPass] Step2.5: retrieval summarizer prompt critique -> BEGIN")
             await self._generate_retrieval_summarizer_prompt_critique(current_state, ctx)
+            print("[BackwardPass] Step2.5: retrieval summarizer prompt critique -> DONE")
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            print("[BackwardPass] State saved after Step2.5")
 
             # Step 3: Generate retrieval plan critique
+            print("[BackwardPass] Step3: retrieval plan critique -> BEGIN")
             await self._generate_retrieval_plan_critique(current_state, ctx)
+            print("[BackwardPass] Step3: retrieval plan critique -> DONE")
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            print("[BackwardPass] State saved after Step3")
 
             # Step 4: Generate retrieval planning prompt critique
+            print("[BackwardPass] Step4: retrieval planning prompt critique -> BEGIN")
             await self._generate_retrieval_planning_prompt_critique(current_state, ctx)
+            print("[BackwardPass] Step4: retrieval planning prompt critique -> DONE")
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            print("[BackwardPass] State saved after Step4")
 
             # Final save to ensure everything is persisted
             self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+            print("[BackwardPass] Final state save complete")
 
             # Prepare optimized prompts to return to BatchOrchestrator (no hyperparameters - fixed chunk size)
             optimized_prompts = {
@@ -2800,12 +3019,14 @@ class BackwardPassAgent(RoutedAgent):
             )
 
             self.logger.info(f"Returning BackwardPassReady for batch {message.batch_id}")
+            print("[BackwardPass] RETURN BackwardPassReady")
 
             # Return the backward pass ready message
             return backward_ready_msg
 
         except Exception as e:
             self.logger.error(f"Error in backward pass: {e}")
+            print(f"[BackwardPass] ERROR: {e}")
             # Return error response
             return BackwardPassReadyMessage(
                 batch_id=message.batch_id,
@@ -2922,12 +3143,14 @@ Continue Optimization: {data.get('continue_optimization', False)}
     async def _generate_answer_generation_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for answer generation prompt (with skip logic)."""
         self.logger.info("Generating answer generation critique")
+        print("[BackwardPass] _generate_answer_generation_critique START")
 
         all_evaluation_responses = current_state.get("response_evaluations", [])
 
         if not all_evaluation_responses:
             self.logger.warning("No evaluation data available - skipping answer generation critique")
             current_state["answer_generation_critique"] = "No critique provided"
+            print("[BackwardPass] No eval data  skipping answer generation critique")
             return
 
         # Get the current answer generation prompt
@@ -2952,6 +3175,7 @@ Continue Optimization: {data.get('continue_optimization', False)}
         # Call LLM with structured output
         from parameters import PromptCritiqueResponse
         critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+        print(f"[BackwardPass] AnswerGen critique structured: problem={getattr(critique_response,'problem_in_this_component',None)}")
 
         # Implement skip logic
         if not critique_response.problem_in_this_component:
@@ -2967,6 +3191,7 @@ Continue Optimization: {data.get('continue_optimization', False)}
         # Generate optimized prompt using the critique
         optimizer_prompt = self.answer_generation_prompt_optimizer_vector.format(critique)
         optimized_prompt = await self._call_llm(optimizer_prompt, ctx, "Please provide the new prompt", add_token_limit=False)
+        print(f"[BackwardPass] AnswerGen optimized prompt length={len(optimized_prompt)}")
 
         # Limit prompt length to prevent truncation
         MAX_PROMPT_LENGTH = 4000
@@ -2979,12 +3204,14 @@ Continue Optimization: {data.get('continue_optimization', False)}
         if not is_frozen:
             current_state["learned_prompt_answer_generator_vector"] = optimized_prompt
             self.logger.info(f"Stored optimized answer generator prompt ({len(optimized_prompt)} chars)")
+            print("[BackwardPass] Stored optimized answer generator prompt")
 
         log_critique_result(self.logger, "answer_generator_vector", critique, is_frozen)
 
     async def _generate_retrieved_content_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for retrieved content based on conversations, contexts, and evaluations."""
         self.logger.info("Generating retrieved content critique")
+        print("[BackwardPass] _generate_retrieved_content_critique START")
 
         conversations = current_state.get("conversations_answer_generation", [])
         evaluation_responses = current_state.get("response_evaluations", [])
@@ -2999,6 +3226,7 @@ Continue Optimization: {data.get('continue_optimization', False)}
         if not conversations or not evaluation_responses:
             self.logger.warning("Missing data for retrieved content critique")
             current_state["retrieved_content_critique"] = "No critique provided"
+            print("[BackwardPass] Missing data — skipping retrieved content critique")
             return
 
         # Extract query from first conversation
@@ -3063,6 +3291,7 @@ Evaluation Feedback:
     async def _generate_retrieval_plan_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for retrieval plans based on plans and contexts."""
         self.logger.info("Generating retrieval plan critique")
+        print("[BackwardPass] _generate_retrieval_plan_critique START")
 
         retrieval_plans = current_state.get("retrieval_plans", [])
         evaluation_responses = current_state.get("response_evaluations", [])
@@ -3081,6 +3310,7 @@ Evaluation Feedback:
         if not retrieval_plans:
             self.logger.warning("Missing retrieval plans for critique")
             current_state["retrieval_plan_critique"] = "No critique provided"
+            print("[BackwardPass] SKIP retrieval plan critique — no retrieval_plans found")
             return
 
         # Create comprehensive retrieval plan information with all plans (WITHOUT retrieved content)
@@ -3103,6 +3333,7 @@ Evaluation Feedback:
             response_critique_history=response_critique_history
         )
 
+        print("[BackwardPass] Calling LLM for retrieval plan critique")
         critique = await self._call_llm(prompt_content, ctx)
         current_state["retrieval_plan_critique"] = critique
 
@@ -3111,6 +3342,7 @@ Evaluation Feedback:
     async def _generate_retrieval_planning_prompt_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for retrieval planning prompt (with skip logic)."""
         self.logger.info("Generating retrieval planning prompt critique")
+        print("[BackwardPass] _generate_retrieval_planning_prompt_critique START")
 
         retrieval_prompt = current_state.get("retrieval_prompt", "")
         all_evaluation_responses = current_state.get("response_evaluations", [])
@@ -3119,6 +3351,7 @@ Evaluation Feedback:
         if not retrieval_prompt or not all_evaluation_responses:
             self.logger.warning("Missing retrieval prompt or evaluation for critique")
             current_state["retrieval_planner_agent_critique"] = "No critique provided"
+            print(f"[BackwardPass] SKIP retrieval planning prompt critique — missing retrieval_prompt={not bool(retrieval_prompt)} or evals={len(all_evaluation_responses)}")
             return
 
         # Get the current retrieval planning prompt
@@ -3143,11 +3376,13 @@ Evaluation Feedback:
         # Call LLM with structured output
         from parameters import PromptCritiqueResponse
         critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+        print(f"[BackwardPass] RetrievalPlanner prompt critique structured: problem={getattr(critique_response,'problem_in_this_component',None)}")
 
         # Implement skip logic
         if not critique_response.problem_in_this_component:
             current_state["retrieval_planner_agent_critique"] = "No critique provided"
             self.logger.info("Retrieval planning prompt: No problem detected, skipping optimization")
+            print("[BackwardPass] Retrieval planner prompt: no problem — skipping")
             return
 
         # Problem detected - store critique and optimize
@@ -3157,21 +3392,25 @@ Evaluation Feedback:
         # Generate optimized prompt using the critique
         optimizer_prompt = self.retrieval_planner_prompt_optimizer_vector.format(critique)
         optimized_prompt = await self._call_llm(optimizer_prompt, ctx, "Please provide the new prompt", add_token_limit=False)
+        print(f"[BackwardPass] RetrievalPlanner optimized prompt length={len(optimized_prompt)}")
 
         # Only update if not frozen
         is_frozen = self._is_prompt_frozen("vector_retrieval_planner", current_state)
         if not is_frozen:
             current_state["learned_prompt_vector_retrieval_planner"] = optimized_prompt
+            print("[BackwardPass] Stored optimized retrieval planner prompt")
 
         log_critique_result(self.logger, "vector_retrieval_planner", critique, is_frozen)
 
     async def _generate_hyperparameters_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for hyperparameters agent (with skip logic)."""
+        print("[BackwardPass] _generate_hyperparameters_critique START")
         all_evaluation_responses = current_state.get("response_evaluations", [])
         conversations = current_state.get("conversations_answer_generation", [])
 
         if not all_evaluation_responses:
             current_state["hyperparameters_vector_agent_critique"] = "No critique provided"
+            print("[BackwardPass] No evals — skipping hyperparameters critique")
             return
 
         # Get current hyperparameters
@@ -3218,11 +3457,13 @@ Evaluation Feedback:
         # Call LLM with structured output
         from parameters import PromptCritiqueResponse
         critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
+        print(f"[BackwardPass] Hyperparameters critique structured: problem={getattr(critique_response,'problem_in_this_component',None)}")
 
         # Implement skip logic
         if not critique_response.problem_in_this_component:
             current_state["hyperparameters_vector_agent_critique"] = "No critique provided"
             self.logger.info("Hyperparameters: No problem detected, skipping optimization")
+            print("[BackwardPass] Hyperparameters: no problem — skipping")
             return
 
         # Problem detected - store critique and optimize
@@ -3230,6 +3471,7 @@ Evaluation Feedback:
         current_state["hyperparameters_vector_agent_critique"] = critique
         optimizer_prompt = self.hyperparameters_vector_agent_prompt_optimizer.format(critique)
         optimized_prompt = await self._call_llm(optimizer_prompt, ctx, "Please provide the new prompt", add_token_limit=False)
+        print(f"[BackwardPass] Hyperparameters optimized prompt length={len(optimized_prompt)}")
 
         # Limit prompt length
         MAX_PROMPT_LENGTH = 4000
@@ -3239,6 +3481,7 @@ Evaluation Feedback:
         is_frozen = self._is_prompt_frozen("hyperparameters_vector", current_state)
         if not is_frozen:
             current_state["learned_prompt_hyperparameters_vector"] = optimized_prompt
+            print("[BackwardPass] Stored optimized hyperparameters prompt")
 
         log_critique_result(self.logger, "hyperparameters_vector", critique, is_frozen)
 
@@ -3250,6 +3493,7 @@ Evaluation Feedback:
     async def _call_llm(self, prompt_content: str, ctx: MessageContext, user_message_content: str = "Please provide your critique and feedback.", add_token_limit: bool = True) -> str:
         """Helper method to call LLM with given prompt and optional token limit."""
         try:
+            print(f"[BackwardPass] _call_llm START add_token_limit={add_token_limit} prompt_len={len(prompt_content)}")
             # Add token limit instruction only for critiques, not for prompt optimization
             if add_token_limit:
                 enhanced_prompt = f"{prompt_content}\n\nIMPORTANT: Please limit your critique to approximately {self.critique_token_limit} tokens to ensure efficient inference processing. Focus on the most critical points and be concise."
@@ -3265,6 +3509,7 @@ Evaluation Feedback:
             )
 
             result = response.content if isinstance(response.content, str) else str(response.content)
+            print(f"[BackwardPass] _call_llm DONE response_len={len(result)}")
 
             # Log LLM interaction
             logger = get_global_prompt_logger()
@@ -3285,11 +3530,13 @@ Evaluation Feedback:
 
         except Exception as e:
             self.logger.error(f"Error calling LLM: {e}")
+            print(f"[BackwardPass] _call_llm ERROR: {e}")
             return f"Error generating critique: {e}"
 
     async def _call_llm_structured(self, prompt_content: str, ctx: MessageContext, response_format, interaction_type: str = "critique", batch_id: int = None, user_prompt: str = "Please provide your critique."):
         """Helper method to call LLM with structured output (Pydantic response format)."""
         try:
+            print(f"[BackwardPass] _call_llm_structured START prompt_len={len(prompt_content)} format={getattr(response_format,'__name__',str(response_format))}")
             # Create a temporary client with the response format
             structured_client = OpenAIChatCompletionClient(
                 model="gemini-2.5-flash-lite",
@@ -3485,3 +3732,4 @@ def create_backward_pass_agent(critique_token_limit: int = 512) -> BackwardPassA
 def create_summarizer_agent() -> SummarizerAgent:
     """Factory function to create SummarizerAgent instances."""
     return SummarizerAgent("summarizer_agent")
+
