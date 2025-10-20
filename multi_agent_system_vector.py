@@ -1,4 +1,4 @@
-"""
+﻿"""
 Multi-Agent VectorRAG System with AutoGen Core API.
 Includes BatchOrchestratorAgent and HyperparametersVectorAgent.
 """
@@ -9,10 +9,12 @@ import statistics
 import numpy as np
 import faiss
 import asyncio
+import pickle
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 from pydantic import BaseModel
 from datetime import datetime
+from rank_bm25 import BM25Okapi
 
 from logging_utils import LoggingUtils, log_agent_action, log_batch_progress, log_qa_processing, log_critique_result
 from prompt_response_logger import get_global_prompt_logger, initialize_prompt_logging
@@ -26,6 +28,9 @@ from autogen_core import (
 )
 from autogen_core.models import SystemMessage, UserMessage
 from autogen_ext.models.openai import OpenAIChatCompletionClient
+
+# OpenAI imports for G-Eval
+from openai import OpenAI
 
 # Gemini API imports
 from google import genai
@@ -130,6 +135,7 @@ class VectorRetrievalReadyMessage(BaseModel):
     retrieved_context: str
     dataset: str
     setting: str
+    shared_state: Dict[str, Any]  # Message-passing state architecture
 
 class HyperparametersVectorReadyMessage(BaseModel):
     qa_pair_id: str
@@ -145,12 +151,14 @@ class AnswerGenerationStartMessage(BaseModel):
     repetition: int
     dataset: str
     setting: str
+    shared_state: Dict[str, Any]  # Message-passing state architecture
 
 class AnswerGenerationReadyMessage(BaseModel):
     qa_pair_id: str
     generated_answer: str
     batch_id: int
     repetition: int
+    shared_state: Dict[str, Any]  # Message-passing state architecture
 
 class ResponseEvaluationStartMessage(BaseModel):
     qa_pair_id: str
@@ -162,6 +170,9 @@ class ResponseEvaluationStartMessage(BaseModel):
     repetition: int
     dataset: str
     setting: str
+    document_text: str = ""  # Added for G-Eval computation
+    retrieved_context: str = ""  # Retrieved context used to generate the answer
+    shared_state: Dict[str, Any]  # Message-passing state architecture
 
 class ResponseEvaluationReadyMessage(BaseModel):
     qa_pair_id: str
@@ -170,6 +181,7 @@ class ResponseEvaluationReadyMessage(BaseModel):
     continue_optimization: bool
     batch_id: int
     repetition: int
+    shared_state: Dict[str, Any]  # Message-passing state architecture
 
 class BackwardPassStartMessage(BaseModel):
     batch_id: int
@@ -331,7 +343,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Process each QA pair for the current iteration only (DatasetAgent handles repetitions)
             for qa_pair in qa_pairs:
                 qa_pair_id = qa_pair.get("question_id", f"qa_{qa_pairs.index(qa_pair)}")
-                self.logger.info(f"🔄 Processing QA pair {qa_pair_id} for iteration {current_iteration}")
+                self.logger.info(f"ðŸ”„ Processing QA pair {qa_pair_id} for iteration {current_iteration}")
 
                 # Log QA pair start for evaluation (matching GraphRAG pattern)
                 if current_iteration == 0:  # Only log start on first iteration
@@ -359,6 +371,12 @@ class BatchOrchestratorAgent(RoutedAgent):
                 # Initialize shared state for this QA pair
                 current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
 
+                # Display document chunk count at the beginning of QA pair
+                total_chunks = current_state.get("total_chunks", "unknown")
+                print(f"\n{'='*80}")
+                print(f"QA PAIR: {qa_pair_id} | Iteration: {current_iteration} | Document Chunks: {total_chunks}")
+                print(f"{'='*80}\n")
+
                 # Determine if this is a new QA pair or new iteration
                 transition_type = self.shared_state.detect_transition_type(qa_pair_id, current_iteration)
 
@@ -383,7 +401,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                     # Force fresh state load to observe evaluator's latest signals
                     current_state = self.shared_state.load_state_fresh(message.dataset, message.setting, message.batch_id)
 
-                    # Try 0: in-memory map (updated by evaluator immediately)
+                    # Try 0: in-memory map (updated by evaluator immediately) â€” authoritative
                     mem_flag = None
                     try:
                         from shared_state import SharedState as _SS
@@ -391,50 +409,54 @@ class BatchOrchestratorAgent(RoutedAgent):
                     except Exception:
                         mem_flag = None
 
-                    # Try 1: most recent eval in current batch
-                    should_continue = True
-                    evals = current_state.get("response_evaluations", [])
                     used_source = "current_batch_evals"
+                    evals = current_state.get("response_evaluations", [])
                     if mem_flag is not None:
                         should_continue = bool(mem_flag)
                         used_source = "memory_map"
-                    if evals:
-                        qa_evals = [e for e in evals if e.get('qa_pair_id') == qa_pair_id]
-                        if qa_evals:
-                            last_eval = qa_evals[-1]
-                            cont = last_eval.get('continue_optimization')
-                            if isinstance(cont, bool):
-                                should_continue = cont
-                    # Try 2: scan all previous states for last eval for this qa_pair_id
-                    if not evals or (should_continue and len([e for e in evals if e.get('qa_pair_id') == qa_pair_id]) == 0):
-                        all_states = self.shared_state.get_all_states(message.dataset, message.setting)
-                        for st in reversed(all_states):
-                            evs = st.get("response_evaluations", [])
-                            qa_evs = [e for e in evs if e.get('qa_pair_id') == qa_pair_id]
-                            if qa_evs:
-                                last = qa_evs[-1]
-                                cont = last.get('continue_optimization')
+                    else:
+                        # Try 1: most recent eval in current batch for this QA
+                        should_continue = True
+                        if evals:
+                            qa_evals = [e for e in evals if e.get('qa_pair_id') == qa_pair_id]
+                            if qa_evals:
+                                last_eval = qa_evals[-1]
+                                cont = last_eval.get('continue_optimization')
                                 if isinstance(cont, bool):
                                     should_continue = cont
-                                    used_source = "prior_batches_evals"
-                                    break
-                    # Try 3: dedicated flag in current batch or prior states
-                    if should_continue:
-                        flag_key = f"continue_optimization_{qa_pair_id}"
-                        if flag_key in current_state:
-                            should_continue = current_state.get(flag_key, True)
-                            used_source = "current_batch_flag"
+                                    used_source = "current_batch_evals"
+                        # Try 2: scan all previous states for last eval for this qa_pair_id
+                        if used_source == "current_batch_evals" and evals and 'should_continue' in locals():
+                            pass  # already resolved from current batch evals
                         else:
-                            for st in reversed(self.shared_state.get_all_states(message.dataset, message.setting)):
-                                if flag_key in st:
-                                    should_continue = st.get(flag_key, True)
-                                    used_source = "prior_batches_flag"
-                                    break
+                            all_states = self.shared_state.get_all_states(message.dataset, message.setting)
+                            for st in reversed(all_states):
+                                evs = st.get("response_evaluations", [])
+                                qa_evs = [e for e in evs if e.get('qa_pair_id') == qa_pair_id]
+                                if qa_evs:
+                                    last = qa_evs[-1]
+                                    cont = last.get('continue_optimization')
+                                    if isinstance(cont, bool):
+                                        should_continue = cont
+                                        used_source = "prior_batches_evals"
+                                        break
+                        # Try 3: dedicated flag in current batch or prior states
+                        if used_source not in ("memory_map", "current_batch_evals", "prior_batches_evals"):
+                            flag_key = f"continue_optimization_{qa_pair_id}"
+                            if flag_key in current_state:
+                                should_continue = current_state.get(flag_key, True)
+                                used_source = "current_batch_flag"
+                            else:
+                                for st in reversed(self.shared_state.get_all_states(message.dataset, message.setting)):
+                                    if flag_key in st:
+                                        should_continue = st.get(flag_key, True)
+                                        used_source = "prior_batches_flag"
+                                        break
 
                     print(f"[Orchestrator] Early-stop check qa_pair_id={qa_pair_id} flag={should_continue} (source={used_source}, current_batch_evals={len(evals)})")
                     if not should_continue:
-                        self.logger.info(f"⏭️  Skipping iteration {current_iteration} for {qa_pair_id} - evaluation indicated response was satisfactory in previous iteration")
-                        print(f"⏭️  Early stopping: Skipping {qa_pair_id} iteration {current_iteration} (response satisfactory)")
+                        self.logger.info(f"â­ï¸  Skipping iteration {current_iteration} for {qa_pair_id} - evaluation indicated response was satisfactory in previous iteration")
+                        print(f"â­ï¸  Early stopping: Skipping {qa_pair_id} iteration {current_iteration} (response satisfactory)")
 
                         # Use the last successful result
                         if qa_pair_id in self.qa_pair_results and self.qa_pair_results[qa_pair_id]:
@@ -442,7 +464,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                             self.qa_pair_results[qa_pair_id].append(last_result)
                             last_rouge = last_result.get("rouge_score", 0.0)
                             self.qa_pair_rouge_progression[qa_pair_id].append(last_rouge)
-                            self.logger.info(f"✓ Reusing result from previous iteration for {qa_pair_id} | ROUGE: {last_rouge:.4f}")
+                            self.logger.info(f"âœ“ Reusing result from previous iteration for {qa_pair_id} | ROUGE: {last_rouge:.4f}")
 
                             # Log iteration completion for the final iteration
                             if current_iteration == total_iterations - 1:
@@ -474,7 +496,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                         continue
 
                 # Process the current iteration only
-                self.logger.info(f"📊 Processing QA pair {qa_pair_id}, iteration {current_iteration}")
+                self.logger.info(f"ðŸ“Š Processing QA pair {qa_pair_id}, iteration {current_iteration}")
 
                 try:
                     # Start batch for this iteration
@@ -493,7 +515,7 @@ class BatchOrchestratorAgent(RoutedAgent):
                     rouge_score = iteration_results.get("rouge_score", 0.0)
                     self.qa_pair_rouge_progression[qa_pair_id].append(rouge_score)
 
-                    self.logger.info(f"✓ Iteration {current_iteration} completed for {qa_pair_id} | ROUGE: {rouge_score:.4f}")
+                    self.logger.info(f"âœ“ Iteration {current_iteration} completed for {qa_pair_id} | ROUGE: {rouge_score:.4f}")
 
                     # Complete batch for this iteration
                     step_logger.complete_batch(success=True, final_rouge_score=rouge_score)
@@ -518,7 +540,7 @@ class BatchOrchestratorAgent(RoutedAgent):
 
                 # Log iteration completion (DatasetAgent handles overall QA pair completion tracking)
                 current_rouge = self.qa_pair_rouge_progression[qa_pair_id][-1] if self.qa_pair_rouge_progression[qa_pair_id] else 0.0
-                self.logger.info(f"🎯 QA pair {qa_pair_id} iteration {current_iteration} completed - ROUGE: {current_rouge:.4f}")
+                self.logger.info(f"ðŸŽ¯ QA pair {qa_pair_id} iteration {current_iteration} completed - ROUGE: {current_rouge:.4f}")
 
                 # Add QA pair completion logging for the final iteration (matching GraphRAG)
                 if current_iteration == total_iterations - 1:
@@ -586,22 +608,23 @@ class BatchOrchestratorAgent(RoutedAgent):
         Returns:
             Dict[str, Any]: Results from this iteration including ROUGE score
         """
-        self.logger.info(f"🔄 Processing iteration {iteration} for QA pair {qa_pair_id}")
+        self.logger.info(f"ðŸ”„ Processing iteration {iteration} for QA pair {qa_pair_id}")
 
         # Track intermediate outputs for comprehensive evaluation logging (matching GraphRAG)
         intermediate_outputs = {}
         step_start_time = datetime.now()
 
         try:
-            # Fixed chunk size (300 words)
-            FIXED_CHUNK_SIZE = 300
+            # Fixed chunk size (150 words with 20-30% overlap)
+            FIXED_CHUNK_SIZE = 200
 
             # Step 1: Vector Building (only on first iteration)
             self.logger.info(f"Step 1/4: Vector building for {qa_pair_id}")
 
             step_agent_start = datetime.now()
             try:
-                current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
+                # Force fresh load to pick up indices saved by previous iteration (bypass cache)
+                current_state = self.shared_state.load_state_fresh(original_message.dataset, original_message.setting, original_message.batch_id)
 
                 vector_start_msg = VectorStartMessage(
                     batch_id=original_message.batch_id,
@@ -639,9 +662,11 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Step 2: Vector Retrieval
             self.logger.info(f"Step 2/4: Vector retrieval for {qa_pair_id}")
             # Update shared state with FAISS index paths for retrieval
-            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
+            # CRITICAL: Use load_state_fresh to pick up indices saved by previous iteration (bypass stale cache)
+            current_state = self.shared_state.load_state_fresh(original_message.dataset, original_message.setting, original_message.batch_id)
             current_state["faiss_index_path"] = vector_response.faiss_index_path
             current_state["chunk_metadata_path"] = vector_response.chunk_metadata_path
+            current_state["total_chunks"] = vector_response.total_chunks
             self.shared_state.save_state(current_state, original_message.dataset, original_message.setting, original_message.batch_id)
 
             retrieval_start_msg = VectorRetrievalStartMessage(
@@ -665,8 +690,8 @@ class BatchOrchestratorAgent(RoutedAgent):
                 "retrieved_context_length": len(retrieval_response.retrieved_context)
             }
 
-            # Update shared state with retrieved context
-            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
+            # Use state from retrieval message (message-passing architecture)
+            current_state = retrieval_response.shared_state.copy()
             retrieved_contexts = current_state.get("retrieved_contexts", [])
             retrieved_contexts.append(retrieval_response.retrieved_context)
             current_state["retrieved_contexts"] = retrieved_contexts
@@ -674,8 +699,6 @@ class BatchOrchestratorAgent(RoutedAgent):
             retrieval_queries = current_state.get("retrieval_queries", [])
             retrieval_queries.append(qa_pair.get("question", ""))
             current_state["retrieval_queries"] = retrieval_queries
-
-            self.shared_state.save_state(current_state, original_message.dataset, original_message.setting, original_message.batch_id)
 
             # Step 3: Answer Generation
             self.logger.info(f"Step 3/4: Answer generation for {qa_pair_id}")
@@ -686,7 +709,8 @@ class BatchOrchestratorAgent(RoutedAgent):
                 batch_id=retrieval_response.batch_id,
                 repetition=retrieval_response.repetition,
                 dataset=original_message.dataset,
-                setting=original_message.setting
+                setting=original_message.setting,
+                shared_state=current_state  # Pass state through message
             )
 
             answer_gen_agent_id = AgentId("answer_generator_agent", "default")
@@ -702,10 +726,21 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Step 4: Evaluation
             self.logger.info(f"Step 4/4: Evaluation for {qa_pair_id}")
 
+            # Use state from answer message (message-passing architecture)
+            current_state = answer_response.shared_state.copy()
+
             # Create evaluation message (ROUGE score will be computed by ResponseEvaluatorAgent)
             # Debug: check qa_pair structure
+            print(f"\n[DEBUG] QA Pair available keys: {list(qa_pair.keys())}")
             self.logger.info(f"QA Pair keys: {list(qa_pair.keys())}")
             self.logger.info(f"QA Pair answer field: {qa_pair.get('answer', 'NOT_FOUND')}")
+
+            # Get document text from shared state (where DatasetAgent stores it)
+            document_text = current_state.get("full_document_text", "")
+            if document_text:
+                print(f"[DEBUG] Document text retrieved from shared state, length: {len(document_text)} chars")
+            else:
+                print(f"[DEBUG] âš ï¸ No document text in shared state!")
 
             # Try multiple possible answer field names
             gold_answer = qa_pair.get("answer") or qa_pair.get("answers") or qa_pair.get("expected_answer") or ""
@@ -716,6 +751,10 @@ class BatchOrchestratorAgent(RoutedAgent):
 
             self.logger.info(f"Gold answers for ROUGE: {gold_answers}")
 
+            # Get the latest retrieved context from state
+            retrieved_contexts = current_state.get("retrieved_contexts", [])
+            latest_retrieved_context = retrieved_contexts[-1] if retrieved_contexts else ""
+
             eval_start_msg = ResponseEvaluationStartMessage(
                 qa_pair_id=qa_pair_id,
                 original_query=qa_pair.get("question", ""),
@@ -725,7 +764,10 @@ class BatchOrchestratorAgent(RoutedAgent):
                 batch_id=answer_response.batch_id,
                 repetition=answer_response.repetition,
                 dataset=original_message.dataset,
-                setting=original_message.setting
+                setting=original_message.setting,
+                document_text=document_text,  # For G-Eval computation
+                retrieved_context=latest_retrieved_context,  # Pass retrieved context for evaluation
+                shared_state=current_state  # Pass state through message
             )
 
             eval_agent_id = AgentId("response_evaluator_agent", "default")
@@ -757,8 +799,8 @@ class BatchOrchestratorAgent(RoutedAgent):
             # Note: ResponseEvaluatorAgent already stores evaluation results in response_evaluations
             # with the proper format needed for backward pass. No need to duplicate here.
 
-            # Store ROUGE scores for tracking
-            current_state = self.shared_state.load_state(original_message.dataset, original_message.setting, original_message.batch_id)
+            # Use state from evaluation message and save once (message-passing architecture)
+            current_state = eval_response.shared_state.copy()
             rouge_scores = current_state.get("rouge_scores", [])
             rouge_scores.append(rouge_score)
             current_state["rouge_scores"] = rouge_scores
@@ -773,6 +815,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             })
             current_state["vector_statistics"] = vector_statistics
 
+            # Save state ONCE at end of iteration (message-passing architecture)
             self.shared_state.save_state(current_state, original_message.dataset, original_message.setting, original_message.batch_id)
 
             # Log to evaluation logger with comprehensive statistics (matching GraphRAG pattern)
@@ -816,7 +859,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             # The ResponseEvaluatorAgent sets continue_optimization=True when decision is NEEDS_REFINEMENT
             if eval_response.continue_optimization:
                 print(f"[Orchestrator] Immediate backward pass trigger (continue_optimization=True) iteration={iteration}")
-                self.logger.info(f"🔄 Starting backward pass for iteration {iteration} (evaluator determined answer needs refinement)")
+                self.logger.info(f"ðŸ”„ Starting backward pass for iteration {iteration} (evaluator determined answer needs refinement)")
 
                 # Gather QA results for backward pass
                 qa_result = {
@@ -843,16 +886,16 @@ class BatchOrchestratorAgent(RoutedAgent):
                     backward_agent_id = AgentId("backward_pass_agent", "default")
                     backward_response = await self.send_message(backward_pass_msg, backward_agent_id)
                     print(f"[Orchestrator] Immediate BackwardPassReady received for iteration={iteration}")
-                    self.logger.info(f"✓ Backward pass completed for iteration {iteration}")
+                    self.logger.info(f"âœ“ Backward pass completed for iteration {iteration}")
 
                     # Process backward pass response to update QA pair prompts (like GraphRAG does)
                     await self._process_backward_pass_response(backward_response, ctx)
                 except Exception as e:
-                    self.logger.error(f"❌ Backward pass failed: {e}")
+                    self.logger.error(f"âŒ Backward pass failed: {e}")
                     self.logger.error(f"Make sure 'backward_pass_agent' is registered in your runtime!")
                     self.logger.warning(f"Continuing without backward pass optimization...")
             else:
-                self.logger.info(f"⏭️  Skipping backward pass for iteration {iteration} (evaluator determined answer is satisfactory)")
+                self.logger.info(f"â­ï¸  Skipping backward pass for iteration {iteration} (evaluator determined answer is satisfactory)")
 
             # Return iteration results
             return {
@@ -1060,8 +1103,8 @@ class BatchOrchestratorAgent(RoutedAgent):
         """Process retrieval, answer generation, and evaluation for a single QA pair."""
         self.logger.info(f"Processing single QA pair {qa_pair_id} for batch {retrieval_response.batch_id}")
 
-        # Load and update shared state
-        current_state = self.shared_state.load_state(retrieval_response.dataset, retrieval_response.setting, retrieval_response.batch_id)
+        # Use state from message (message-passing architecture - no I/O)
+        current_state = retrieval_response.shared_state.copy()
 
         # Store retrieved context for this QA pair
         retrieved_contexts = current_state.get("retrieved_contexts", [])
@@ -1073,9 +1116,7 @@ class BatchOrchestratorAgent(RoutedAgent):
         retrieval_queries.append(qa_pair.get("question", ""))
         current_state["retrieval_queries"] = retrieval_queries
 
-        self.shared_state.save_state(current_state, retrieval_response.dataset, retrieval_response.setting, retrieval_response.batch_id)
-
-        # Send AnswerGenerationStart message for THIS QA pair
+        # Pass updated state to AnswerGenerationStart message
         answer_gen_msg = AnswerGenerationStartMessage(
             qa_pair_id=qa_pair_id,
             question=qa_pair.get("question", ""),
@@ -1083,7 +1124,8 @@ class BatchOrchestratorAgent(RoutedAgent):
             batch_id=retrieval_response.batch_id,
             repetition=retrieval_response.repetition,
             dataset=retrieval_response.dataset,
-            setting=retrieval_response.setting
+            setting=retrieval_response.setting,
+            shared_state=current_state  # Pass state through message
         )
 
         self.logger.info(f"Sending AnswerGenerationStart for QA pair {qa_pair_id}")
@@ -1117,13 +1159,11 @@ class BatchOrchestratorAgent(RoutedAgent):
 
         self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {answer_response.qa_pair_id}")
 
-        # Save ROUGE score to shared state
-        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, answer_response.batch_id)
+        # Use state from message (message-passing architecture - no I/O)
+        current_state = answer_response.shared_state.copy()
         rouge_scores_list = current_state.get("rouge_scores", [])
         rouge_scores_list.append(rouge_score)
         current_state["rouge_scores"] = rouge_scores_list
-        saved = self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, answer_response.batch_id)
-        print(f"[Orchestrator] Saved ROUGE to state. saved={saved}")
 
         # Log to evaluation logger
         eval_logger = get_global_evaluation_logger()
@@ -1136,12 +1176,12 @@ class BatchOrchestratorAgent(RoutedAgent):
         # Create comprehensive intermediate outputs for evaluation logging (matching GraphRAG format)
         intermediate_outputs = {
             "hyperparameters": {
-                "chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512),
+                "chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 150),
                 "processing_time_ms": 0,  # Not available in this context
                 "learned_prompt_used": False  # Not available in this context
             },
             "vector_building": {
-                "chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512),
+                "chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 150),
                 "faiss_index_path": "vector_indexes/cached",  # Cached from previous processing
                 "vectors_created": True,
                 "embedding_method": "openai",
@@ -1174,7 +1214,7 @@ class BatchOrchestratorAgent(RoutedAgent):
             intermediate_outputs=intermediate_outputs,
             generated_answer=answer_response.generated_answer,
             rouge_scores=rouge_scores,
-            hyperparameters={"chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512)},
+            hyperparameters={"chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 150)},
             graph_metrics={"vector_count": len(current_state.get("retrieved_contexts", [])), "retrieval_method": "vector_similarity"},
             retrieval_context=current_state.get("retrieved_contexts", [""])[-1] if current_state.get("retrieved_contexts") else "",
             additional_metrics={"qa_pair_question": qa_pair.get("question", "N/A")}
@@ -1188,12 +1228,33 @@ class BatchOrchestratorAgent(RoutedAgent):
                 generated_answer=answer_response.generated_answer,
                 rouge_scores=rouge_scores,
                 intermediate_outputs=intermediate_outputs,
-                hyperparameters={"chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 512)},
+                hyperparameters={"chunk_size": current_state.get("rag_hyperparameters", {}).get("chunk_size", 150)},
                 execution_time_seconds=None,  # Not available in this context
                 system_specific_metrics={"vector_count": len(current_state.get("retrieved_contexts", [])), "retrieval_method": "vector_similarity"}
             )
 
         # Send ResponseEvaluationStart message
+        # Debug: check qa_pair structure
+        print(f"\n[DEBUG] QA Pair available keys: {list(qa_pair.keys())}")
+
+        # Get document text from shared state (where DatasetAgent stores it)
+        document_text = current_state.get("full_document_text", "")
+        if document_text:
+            print(f"[DEBUG] Document text retrieved from shared state, length: {len(document_text)} chars")
+        else:
+            print(f"[DEBUG] âš ï¸ No document text in shared state!")
+
+        # Extract gold answers
+        gold_answer = qa_pair.get("answer") or qa_pair.get("answers") or qa_pair.get("expected_answer") or ""
+        if isinstance(gold_answer, list):
+            gold_answers = gold_answer
+        else:
+            gold_answers = [gold_answer] if gold_answer else []
+
+        # Get the latest retrieved context from state
+        retrieved_contexts = current_state.get("retrieved_contexts", [])
+        latest_retrieved_context = retrieved_contexts[-1] if retrieved_contexts else ""
+
         eval_start_msg = ResponseEvaluationStartMessage(
             qa_pair_id=answer_response.qa_pair_id,
             original_query=qa_pair.get("question", ""),
@@ -1203,7 +1264,10 @@ class BatchOrchestratorAgent(RoutedAgent):
             batch_id=answer_response.batch_id,
             repetition=answer_response.repetition,
             dataset=self.current_dataset,
-            setting=self.current_setting
+            setting=self.current_setting,
+            document_text=document_text,  # For G-Eval computation
+            retrieved_context=latest_retrieved_context,  # Pass retrieved context for evaluation
+            shared_state=current_state  # Pass state through message
         )
 
         self.logger.info(f"Sending ResponseEvaluationStart for QA pair {answer_response.qa_pair_id}")
@@ -1233,8 +1297,12 @@ class BatchOrchestratorAgent(RoutedAgent):
         # Note: ResponseEvaluatorAgent already stores evaluation results in response_evaluations
         # with the proper structured format needed for backward pass. No need to duplicate here.
 
+        # Save state ONCE at the end of QA processing (message-passing architecture)
+        current_state = eval_response.shared_state
+        self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, eval_response.batch_id)
+        self.logger.info(f"Saved final state for QA pair {eval_response.qa_pair_id}")
+
         # Mark QA pair as completed
-        current_state = self.shared_state.load_state(self.current_dataset, self.current_setting, eval_response.batch_id)
         self.completed_qa_pairs[eval_response.qa_pair_id] = eval_response.evaluation_result
 
         # Check if all QA pairs are completed
@@ -1249,8 +1317,8 @@ class BatchOrchestratorAgent(RoutedAgent):
             await self._start_backward_pass(eval_response.batch_id, eval_response.repetition, ctx)
 
     async def _generate_context_summary(self, batch_id: int, repetition: int, ctx: MessageContext) -> None:
-        """Generate summary of all retrieved contexts before backward pass."""
-        self.logger.info(f"Generating context summary for batch {batch_id}")
+        """Concatenate all retrieved contexts (NO SUMMARIZATION)."""
+        self.logger.info(f"Concatenating contexts for batch {batch_id}")
         print(f"[Orchestrator] _generate_context_summary START batch_id={batch_id}")
 
         # Load current shared state
@@ -1258,47 +1326,19 @@ class BatchOrchestratorAgent(RoutedAgent):
         retrieved_contexts = current_state.get("retrieved_contexts", [])
 
         if not retrieved_contexts:
-            self.logger.warning("No retrieved contexts to summarize")
-            print("[Orchestrator] No retrieved contexts to summarize — skipping")
+            self.logger.warning("No retrieved contexts to concatenate")
+            print("[Orchestrator] No retrieved contexts to concatenate â€” skipping")
             return
 
-        # Log context details
-        self.logger.info(f"Preparing to summarize {len(retrieved_contexts)} contexts")
+        # Concatenate contexts directly without summarization
+        self.logger.info(f"Concatenating {len(retrieved_contexts)} contexts")
+        concatenated_contexts = "\n\n--- Context Separator ---\n\n".join(retrieved_contexts)
+        current_state["context_summary"] = concatenated_contexts
 
-        # Send SummarizationStart message with list of contexts
-        summarization_msg = SummarizationStartMessage(
-            batch_id=batch_id,
-            repetition=repetition,
-            retrieved_contexts=retrieved_contexts,  # Pass list directly
-            dataset=self.current_dataset,
-            setting=self.current_setting
-        )
-
-        try:
-            summarizer_agent_id = AgentId("summarizer_agent", "default")
-            self.logger.info("Sending summarization request to SummarizerAgent")
-            print("[Orchestrator] Sending SummarizationStart to summarizer_agent")
-            summary_response = await self.send_message(summarization_msg, summarizer_agent_id)
-
-            # Store the summary in shared state
-            current_state["context_summary"] = summary_response.summary
-            self.logger.info(f"Context summary generated successfully, length: {len(summary_response.summary)} chars")
-            print(f"[Orchestrator] Summary generated. length={len(summary_response.summary)}")
-
-            # Log the summary for debugging
-            self.logger.debug(f"Generated summary preview: {summary_response.summary[:200]}...")
-
-        except Exception as e:
-            self.logger.warning(f"SummarizerAgent not available, using concatenated contexts as fallback: {e}")
-            print("[Orchestrator] SummarizerAgent unavailable — using concatenated contexts")
-            # Fallback to using concatenated contexts
-            concatenated_contexts = "\n\n--- Context Separator ---\n\n".join(retrieved_contexts)
-            current_state["context_summary"] = concatenated_contexts
-
-        # Save state with summary
+        # Save state with concatenated contexts
         saved = self.shared_state.save_state(current_state, self.current_dataset, self.current_setting, batch_id)
-        self.logger.info(f"Context summary saved to shared state for batch {batch_id}")
-        print(f"[Orchestrator] Saved context summary to state. saved={saved}")
+        self.logger.info(f"Concatenated contexts saved to shared state for batch {batch_id}, length: {len(concatenated_contexts)} chars")
+        print(f"[Orchestrator] Saved concatenated contexts to state. saved={saved}")
 
     # Continue with other methods...
     async def _start_backward_pass(self, batch_id: int, repetition: int, ctx: MessageContext) -> None:
@@ -1330,7 +1370,7 @@ class BatchOrchestratorAgent(RoutedAgent):
         except Exception as e:
             self.logger.error(f"BackwardPassAgent failed: {e}", exc_info=True)
             self.logger.warning(f"Falling back to backward pass simulation due to error")
-            print(f"[Orchestrator] BackwardPassAgent unavailable — simulating backward pass")
+            print(f"[Orchestrator] BackwardPassAgent unavailable â€” simulating backward pass")
             # Fallback to simulation if agent is not available
             await self._simulate_backward_pass_ready(backward_pass_msg, ctx)
 
@@ -1403,7 +1443,8 @@ class BatchOrchestratorAgent(RoutedAgent):
             qa_pair_id=answer_gen.qa_pair_id,
             generated_answer="Mock generated answer based on retrieved context",
             batch_id=answer_gen.batch_id,
-            repetition=answer_gen.repetition
+            repetition=answer_gen.repetition,
+            shared_state=answer_gen.shared_state  # Pass state through simulation
         )
         await self._process_answer_response(answer_ready_msg, ctx)
 
@@ -1415,8 +1456,11 @@ class BatchOrchestratorAgent(RoutedAgent):
                 "generated_answer": eval_start.generated_answer,
                 "evaluation_metrics": {"coherence": 0.8, "relevance": 0.9}
             },
+            rouge_score=eval_start.rouge_score,
+            continue_optimization=True,
             batch_id=eval_start.batch_id,
-            repetition=eval_start.repetition
+            repetition=eval_start.repetition,
+            shared_state=eval_start.shared_state  # Pass state through simulation
         )
         await self._process_evaluation_response(eval_ready_msg, ctx)
 
@@ -1624,7 +1668,7 @@ class HyperparametersVectorAgent(RoutedAgent):
             # Return default response on error
             return HyperparametersVectorReadyMessage(
                 qa_pair_id=message.qa_pair_id,
-                chunk_size=512,  # Default chunk size
+                chunk_size=150,  # Default chunk size (with 25% overlap)
                 batch_id=message.batch_id,
                 repetition=message.repetition
             )
@@ -1802,19 +1846,32 @@ class VectorBuilderAgent(RoutedAgent):
 
                 self.logger.info(f"Created FAISS index with {self.faiss_index.ntotal} vectors, dimension {dimension}")
 
-                # Save index to file for reuse (using document_index for consistent naming)
+                # Create BM25 index for hybrid retrieval
+                self.logger.info(f"Creating BM25 index for hybrid retrieval...")
+                tokenized_chunks = [chunk.lower().split() for chunk in chunks]
+                bm25_index = BM25Okapi(tokenized_chunks)
+                self.logger.info(f"Created BM25 index with {len(tokenized_chunks)} documents")
+
+                # Save indexes to file for reuse (using document_index for consistent naming)
                 import os
                 index_dir = "vector_indexes"
                 os.makedirs(index_dir, exist_ok=True)
+
+                # Save FAISS index
                 index_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{document_index}.index")
                 faiss.write_index(self.faiss_index, index_filename)
+
+                # Save BM25 index
+                bm25_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{document_index}_bm25.pkl")
+                with open(bm25_filename, 'wb') as f:
+                    pickle.dump(bm25_index, f)
 
                 # Save metadata
                 metadata_filename = os.path.join(index_dir, f"{message.dataset}_{message.setting}_batch_{document_index}_metadata.json")
                 with open(metadata_filename, 'w', encoding='utf-8') as f:
                     json.dump(self.chunk_metadata, f, indent=2, ensure_ascii=False)
 
-                self.logger.info(f"Saved FAISS index and metadata to {index_filename}")
+                self.logger.info(f"Saved FAISS index, BM25 index, and metadata to {index_filename}")
 
             except Exception as e:
                 self.logger.error(f"Error creating FAISS index: {e}")
@@ -1842,23 +1899,84 @@ class VectorBuilderAgent(RoutedAgent):
         return vector_ready_msg
 
     def _split_text_into_chunks(self, text: str, chunk_size: int) -> List[str]:
-        """Split text into chunks of approximately chunk_size tokens."""
+        """
+        Split text into chunks of approximately chunk_size words with 20-30% overlap.
+        Respects sentence boundaries - chunks always start at the beginning of a sentence.
+
+        Args:
+            text: Input text to chunk
+            chunk_size: Target chunk size in words (default: 150)
+
+        Returns:
+            List of text chunks with overlap
+        """
+        import re
+
         chunks = []
-        words = text.split()
-        current_chunk = []
-        current_token_count = 0
+        overlap_ratio = 0.25  # 25% overlap (20-30% range)
+        overlap_words = int(chunk_size * overlap_ratio)  # ~37-38 words for chunk_size=150
 
-        for word in words:
-            if current_token_count + 1 > chunk_size and current_chunk:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = [word]
-                current_token_count = 1
-            else:
-                current_chunk.append(word)
-                current_token_count += 1
+        # Split into paragraphs first (respect paragraph boundaries)
+        paragraphs = re.split(r'\n\s*\n', text)
 
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
+        all_sentences = []
+
+        # Collect all sentences with their word counts
+        for para in paragraphs:
+            # Split paragraph into sentences (respect sentence boundaries)
+            sentences = re.split(r'(?<=[.!?])\s+', para.strip())
+
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if sentence:
+                    all_sentences.append(sentence)
+
+        # Build chunks from complete sentences
+        i = 0
+        while i < len(all_sentences):
+            current_chunk_sentences = []
+            current_word_count = 0
+
+            # Add sentences until we reach the target chunk size
+            while i < len(all_sentences):
+                sentence = all_sentences[i]
+                sentence_word_count = len(sentence.split())
+
+                # If this is the first sentence in the chunk, always add it (even if it exceeds chunk_size)
+                if not current_chunk_sentences:
+                    current_chunk_sentences.append(sentence)
+                    current_word_count += sentence_word_count
+                    i += 1
+                # If adding this sentence would exceed chunk_size, stop here
+                elif current_word_count + sentence_word_count > chunk_size:
+                    break
+                # Otherwise add the sentence
+                else:
+                    current_chunk_sentences.append(sentence)
+                    current_word_count += sentence_word_count
+                    i += 1
+
+            # Create chunk from collected sentences
+            if current_chunk_sentences:
+                chunks.append(" ".join(current_chunk_sentences))
+
+            # Calculate overlap: go back to include sentences for overlap
+            # Find how many sentences to go back to achieve ~overlap_words
+            if i < len(all_sentences):  # If not at the end
+                overlap_word_count = 0
+                sentences_to_overlap = 0
+
+                # Count backwards from current position to find overlap sentences
+                for j in range(i - 1, -1, -1):
+                    sentence_word_count = len(all_sentences[j].split())
+                    if overlap_word_count + sentence_word_count <= overlap_words:
+                        overlap_word_count += sentence_word_count
+                        sentences_to_overlap += 1
+                    else:
+                        break
+
+                # Move index back by the number of overlap sentences
+                i = i - sentences_to_overlap
 
         return chunks
 
@@ -1908,17 +2026,23 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         )
 
         self.base_prompt_vector_retrieval_planner = base_prompt_vector_retrieval_planner
+        # In-memory cache of last iteration's retrieved FAISS indices per QA
+        # Keyed by dataset::setting::qa_pair_id -> List[int]
+        self._last_indices_cache = {}
 
     @message_handler
     async def handle_vector_retrieval_start(self, message: VectorRetrievalStartMessage, ctx: MessageContext) -> VectorRetrievalReadyMessage:
         """Handle VectorRetrievalStart message and execute iterative retrieval."""
         self.logger.info(f"VectorRetrievalPlannerAgent processing batch {message.batch_id} for query: {message.query}")
 
-        # Get document_index from shared_state for fault-tolerant index naming
-        document_index = message.shared_state.get("document_index", message.batch_id)
+        # Use state from message (message-passing architecture - no I/O)
+        current_state = message.shared_state.copy()
 
-        # Load the correct FAISS index using document_index (not batch_id)
-        faiss_index, chunk_metadata = self._load_faiss_index(message.dataset, message.setting, document_index)
+        # Get document_index from shared_state for fault-tolerant index naming
+        document_index = current_state.get("document_index", message.batch_id)
+
+        # Load the correct FAISS and BM25 indexes using document_index (not batch_id)
+        faiss_index, chunk_metadata, bm25_index = self._load_faiss_index(message.dataset, message.setting, document_index)
 
         if faiss_index is None:
             self.logger.error(f"Could not load FAISS index for batch {message.batch_id}")
@@ -1930,15 +2054,15 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                 setting=message.setting
             )
 
-        # Load shared state
-        current_state = message.shared_state
-
-        # Check if learned prompt exists from previous iteration's backward pass
-        learned_system_prompt = current_state.get("learned_prompt_vector_retrieval_planner", "")
-        if not learned_system_prompt:
-            self.logger.info(f"First iteration for batch {message.batch_id} - using empty retrieval planner system prompt")
+        # Use learned prompt as USER prefix; system prompt must remain empty
+        learned_user_prompt = current_state.get("learned_prompt_vector_retrieval_planner", "")
+        if not learned_user_prompt:
+            # Fallback to a very basic base user prompt
+            from parameters import base_prompt_vector_retrieval_planner
+            learned_user_prompt = base_prompt_vector_retrieval_planner
+            self.logger.info("Retrieval planner: using basic base user prompt")
         else:
-            self.logger.info(f"Using learned retrieval planner system prompt for batch {message.batch_id}")
+            self.logger.info("Retrieval planner: using learned user prompt (system prompt kept empty)")
 
         # Create base user prompt template and save to shared state
         prompt_template = self.base_prompt_vector_retrieval_planner.format(
@@ -1946,20 +2070,120 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         )
         current_state["retrieval_prompt"] = prompt_template
 
-        # Initialize retrieval summarizer agent
-        retrieval_summarizer = RetrievalSummarizerAgent(self.shared_state)
-
         # Initialize retrieval context and plan responses
         retrieved_context = ""
         retrieval_plan_responses = []
         query_history = []  # Track history of queries made
         all_selected_documents = []  # Track all selected documents across iterations
         used_document_indices = set()  # Track FAISS indices of already-retrieved documents to avoid duplicates
+        query_content_pairs = []  # Track query -> retrieved content pairs for backward pass
+
+        # Pre-populate with first two chunks as starting point
+        print(f"\n{'='*80}")
+        print(f"PRE-POPULATING CONTEXT WITH FIRST TWO CHUNKS - QA {message.qa_pair_id}")
+        print(f"{'='*80}")
+
+        if chunk_metadata and len(chunk_metadata) >= 2:
+            initial_chunks = []
+            for i in range(2):
+                chunk_doc = {
+                    'index': i,
+                    'faiss_index': i,
+                    'score': 1.0,  # Initial chunks have max score
+                    'text': chunk_metadata[i]["text"],
+                    'initial_chunk': True
+                }
+                initial_chunks.append(chunk_doc)
+                used_document_indices.add(i)
+                all_selected_documents.append(chunk_doc)
+
+                # Print initial chunks
+                chunk_text = chunk_metadata[i]["text"]
+                display_text = chunk_text[:500] + "..." if len(chunk_text) > 500 else chunk_text
+                print(f"Initial Chunk {i+1} (FAISS index: {i}):")
+                print(f"{display_text}")
+                print(f"{'-'*80}")
+
+            # Format initial chunks for context
+            chunk_parts = []
+            for i, doc in enumerate(initial_chunks, 1):
+                chunk_text = doc.get('text', '')
+                chunk_parts.append(f"Document {i}:\n{chunk_text}")
+            retrieved_context = "Initial context:\n" + "\n\n".join(chunk_parts)
+
+            self.logger.info(f"Pre-populated context with first 2 chunks (indices 0, 1)")
+            print(f"{'='*80}\n")
+        else:
+            self.logger.warning(f"Not enough chunks available for pre-population (found {len(chunk_metadata) if chunk_metadata else 0})")
+
+        # Load previous system iteration's retrieved indices for overlap tracking
+        previous_system_iteration_indices = None
+        # Use in-memory cache first to obtain previous iteration indices
+        cache_key = message.dataset + '::' + message.setting + '::' + message.qa_pair_id
+        if message.repetition > 0:
+            try:
+                cached_prev = self._last_indices_cache.get(cache_key)
+                if cached_prev is not None:
+                    previous_system_iteration_indices = list(cached_prev)
+                    print('[OVERLAP DEBUG - QA ' + message.qa_pair_id + '] Using in-memory cached indices from previous iteration: ' + str(len(cached_prev)))
+            except Exception:
+                pass
+
+        print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Current repetition: {message.repetition}")
+
+        if message.repetition > 0:
+            # Load from persistent storage to get previous iteration's data
+            prev_indices_key = f"retrieved_indices_qa_{message.qa_pair_id}_rep_{message.repetition - 1}"
+
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Looking for key: {prev_indices_key}")
+
+            # Only query current state if cache didn't have it (don't overwrite cache result!)
+            if previous_system_iteration_indices is None:
+                previous_system_iteration_indices = current_state.get(prev_indices_key, None)
+                print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Current state lookup result: {previous_system_iteration_indices is not None}")
+            else:
+                print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Skipping current state lookup (already found in cache)")
+
+            if previous_system_iteration_indices:
+                print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Found previous indices: {len(previous_system_iteration_indices)} indices")
+
+            # If not found, try loading from all previous states
+            if previous_system_iteration_indices is None:
+                print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Not found in current state, searching persistent storage...")
+                try:
+                    all_states = self.shared_state.get_all_states(message.dataset, message.setting)
+                    print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Found {len(all_states)} states in persistent storage")
+
+                    # Search through all previous batches for this QA pair's indices
+                    for i, batch_state in enumerate(all_states):
+                        print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Checking state {i}, keys: {list(batch_state.keys())[:10]}...")  # Show first 10 keys
+                        if prev_indices_key in batch_state:
+                            previous_system_iteration_indices = batch_state[prev_indices_key]
+                            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] FOUND in state {i}! Indices: {previous_system_iteration_indices}")
+                            self.logger.info(f"Loaded {len(previous_system_iteration_indices)} indices from persistent storage for previous iteration {message.repetition - 1}")
+                            break
+
+                    if previous_system_iteration_indices is None:
+                        print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Key '{prev_indices_key}' not found in any of the {len(all_states)} states")
+
+                except Exception as e:
+                    print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] ERROR loading from persistent storage: {e}")
+                    self.logger.warning(f"Could not load previous iteration indices: {e}")
+
+            if previous_system_iteration_indices:
+                print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] FINAL: Found previous iteration data: {len(previous_system_iteration_indices)} indices from iteration {message.repetition - 1}")
+                self.logger.info(f"Found previous iteration data: {len(previous_system_iteration_indices)} indices from iteration {message.repetition - 1}")
+            else:
+                print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] FINAL: No previous iteration data found")
+                self.logger.warning(f"No previous iteration data found for QA {message.qa_pair_id}, iteration {message.repetition - 1}")
+        else:
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Repetition 0 - skipping overlap check")
 
         # Execute retrieval iterations (fixed number)
         # TODO: Make this a hyperparameter
-        MAX_ITERATIONS = 5
-        CHUNKS_PER_ITERATION = 3
+        MAX_ITERATIONS = 9
+        CHUNKS_PER_ITERATION = 1
+
         for iteration in range(MAX_ITERATIONS):
             self.logger.info(f"Retrieval iteration {iteration + 1}/{MAX_ITERATIONS}")
 
@@ -1979,17 +2203,35 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                 else:
                     context_text = retrieved_context
 
-                # Prepare base user prompt with query, summaries, and query history
-                user_prompt_content = self.base_prompt_vector_retrieval_planner.format(
-                    message.query, context_text, history_text
+                # Build user prompt: learned prompt + required sections with same variables
+                # Add explicit instruction about hypothetical documents
+                hyde_instruction = """
+IMPORTANT: You must generate BOTH a retrieval query AND a hypothetical document.
+
+For the hypothetical document (~150 words):
+- Write it as if it were an actual excerpt from a document
+- REPRODUCE THE NARRATIVE STYLE of the story/text you are retrieving from
+- Match the tone, voice, and writing style of the original text
+- Take inspiration from the text already retrieved (if any)
+- Make it concrete and specific (not abstract or generic)
+- Focus on information that would help answer the question
+- Generate approximately 150 words
+- This hypothetical document will be embedded for semantic search
+"""
+
+                user_prompt_content = (
+                    f"{learned_user_prompt}\n\n"
+                    f"{hyde_instruction}\n\n"
+                    f"Query to answer:\n{message.query}\n\n"
+                    f"Retrieved summaries so far:\n{context_text}\n\n"
+                    f"Previous queries you made:\n{history_text}"
                 )
 
-                # Create messages with dual-prompt structure
-                system_message = SystemMessage(content=learned_system_prompt)
+                # Create messages (no system prompt)
                 user_message = UserMessage(content=user_prompt_content, source="user")
 
                 response = await self.model_client.create(
-                    [system_message, user_message],
+                    [user_message],
                     cancellation_token=ctx.cancellation_token
                 )
 
@@ -2003,7 +2245,7 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                 logger.log_interaction(
                     agent_name="VectorRetrievalPlannerAgent",
                     interaction_type="retrieval_planning",
-                    system_prompt=learned_system_prompt,
+                    system_prompt="",
                     user_prompt=user_prompt_content,
                     llm_response=response.content,
                     qa_pair_id=message.qa_pair_id,
@@ -2011,6 +2253,7 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                     additional_metadata={
                         "iteration": iteration + 1,
                         "query": retrieval_response.query,
+                        "hypothetical_document": retrieval_response.hypothetical_document,
                         "query_history_length": len(query_history)
                     }
                 )
@@ -2020,53 +2263,56 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                 retrieval_plan_responses.append(query_summary)
                 query_history.append(retrieval_response.query)
 
-                # Execute vector search with the query (returns exactly CHUNKS_PER_ITERATION documents)
+                # Print HyDE information
+                print(f"\n{'='*80}")
+                print(f"ITERATION {iteration + 1}/{MAX_ITERATIONS} - QA {message.qa_pair_id}")
+                print(f"{'='*80}")
+                print(f"Query: {retrieval_response.query}")
+                print(f"\nHypothetical Document:")
+                print(f"{retrieval_response.hypothetical_document}")
+                print(f"{'='*80}\n")
+
+                # Execute hybrid search with the hypothetical document (HyDE method)
                 # Pass used_document_indices to get only new documents
                 retrieved_documents = await self._execute_vector_search(
                     retrieval_response.query,
                     faiss_index,
                     chunk_metadata,
                     k=CHUNKS_PER_ITERATION,
-                    used_document_indices=used_document_indices
+                    used_document_indices=used_document_indices,
+                    bm25_index=bm25_index,
+                    hypothetical_document=retrieval_response.hypothetical_document
                 )
 
-                # Summarize each document asynchronously in parallel
-                summarization_tasks = []
-                for doc in retrieved_documents:
-                    task = retrieval_summarizer.summarize_document(
-                        query=message.query,
-                        document=doc,
-                        current_state=current_state,
-                        ctx=ctx,
-                        qa_pair_id=message.qa_pair_id,
-                        iteration=message.repetition
-                    )
-                    summarization_tasks.append(task)
-
-                # Wait for all summarizations to complete
-                summaries = await asyncio.gather(*summarization_tasks)
-
-                # Format summaries to add to context
-                # Both planner and answer generator see the same summaries
-                if summaries:
-                    summary_parts = []
-                    for i, summary in enumerate(summaries, 1):
-                        # Parse JSON to extract only the summary field (not reasoning)
-                        try:
-                            import json
-                            summary_obj = json.loads(summary)
-                            summary_text = summary_obj.get('summary', summary)
-                        except (json.JSONDecodeError, AttributeError):
-                            # If parsing fails, use the raw summary
-                            summary_text = summary
-                        summary_parts.append(f"Document {i}:\n{summary_text}")
-                    formatted_summaries = "\n\n".join(summary_parts)
+                # Format raw document chunks to add to context (NO SUMMARIZATION)
+                # Both planner and answer generator see the raw chunks
+                if retrieved_documents:
+                    chunk_parts = []
+                    for i, doc in enumerate(retrieved_documents, 1):
+                        # Use raw chunk text directly
+                        chunk_text = doc.get('text', '')
+                        chunk_parts.append(f"Document {i}:\n{chunk_text}")
+                    formatted_chunks = "\n\n".join(chunk_parts)
                 else:
-                    formatted_summaries = "No documents retrieved"
+                    formatted_chunks = "No documents retrieved"
 
-                # Track documents with their summaries
-                for doc, summary in zip(retrieved_documents, summaries):
-                    doc['summary'] = summary
+                # Print retrieved documents
+                print(f"Retrieved Documents ({len(retrieved_documents)} total):")
+                print(f"{'-'*80}")
+                if retrieved_documents:
+                    for i, doc in enumerate(retrieved_documents, 1):
+                        chunk_text = doc.get('text', '')
+                        # Truncate if too long for display
+                        display_text = chunk_text[:500] + "..." if len(chunk_text) > 500 else chunk_text
+                        print(f"Document {i} (FAISS index: {doc['faiss_index']}, score: {doc['score']:.4f}):")
+                        print(f"{display_text}")
+                        print(f"{'-'*80}")
+                else:
+                    print("No documents retrieved")
+                    print(f"{'-'*80}")
+                print()
+
+                # Track documents (no summaries stored)
                 all_selected_documents.extend(retrieved_documents)
 
                 # Add document indices to used set to prevent re-retrieval
@@ -2075,11 +2321,17 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                     used_document_indices.add(doc['faiss_index'])
                     faiss_indices_this_iteration.append(doc['faiss_index'])
 
-                # Add formatted summaries to retrieved context
-                if formatted_summaries:
-                    retrieved_context += f"\n\nIteration {iteration + 1} results:\n{formatted_summaries}"
+                # Add formatted chunks to retrieved context
+                if formatted_chunks:
+                    retrieved_context += f"\n\nIteration {iteration + 1} results:\n{formatted_chunks}"
 
-                self.logger.info(f"Completed iteration {iteration + 1}, retrieved and summarized {len(retrieved_documents)} docs, "
+                # Store query â†’ content pair for backward pass critique
+                query_content_pairs.append({
+                    "query": retrieval_response.query,
+                    "content": formatted_chunks
+                })
+
+                self.logger.info(f"Completed iteration {iteration + 1}, retrieved {len(retrieved_documents)} raw chunks, "
                                f"FAISS indices: {faiss_indices_this_iteration}, total unique so far: {len(used_document_indices)}, "
                                f"context length: {len(retrieved_context)}")
 
@@ -2087,20 +2339,97 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
                 self.logger.error(f"Error in retrieval iteration {iteration + 1}: {e}")
                 continue
 
-        # Save retrieval plans to shared state
+        # Update state with retrieval plans and query-content pairs (in-memory only)
         current_state["retrieval_plans"] = retrieval_plan_responses
-        self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
+        current_state["query_content_pairs"] = query_content_pairs
 
-        # Cleanup agents
-        await retrieval_summarizer.close()
+        self.logger.info(f"Updated state with {len(query_content_pairs)} query-content pairs")
 
-        # Send VectorRetrievalReady message
+        # Store current system iteration's retrieved indices and calculate overlap with previous iteration
+        current_iteration_indices = list(used_document_indices)
+        current_indices_key = f"retrieved_indices_qa_{message.qa_pair_id}_rep_{message.repetition}"
+        current_state[current_indices_key] = current_iteration_indices
+
+        print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Storing current iteration indices: key='{current_indices_key}', count={len(current_iteration_indices)}")
+        print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Current iteration indices: {current_iteration_indices}")
+        # Update in-memory cache so the next iteration can compute overlap without relying on disk
+        try:
+            self._last_indices_cache[cache_key] = list(current_iteration_indices)
+            print('[OVERLAP DEBUG - QA ' + message.qa_pair_id + '] Updated in-memory cache for next iteration (' + str(len(current_iteration_indices)) + ' indices)')
+        except Exception:
+            pass
+
+        # Explicitly save to persistent storage to ensure it's available for next iteration
+        # IMPORTANT: Load existing state first, then merge, then save
+        try:
+            # Load the current persistent state for this batch
+            existing_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Loaded existing state, has {len(existing_state)} keys")
+
+            # Merge our new key into the existing state
+            existing_state[current_indices_key] = current_iteration_indices
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Merged new key into existing state")
+
+            # Save the merged state back
+            saved = self.shared_state.save_state(existing_state, message.dataset, message.setting, message.batch_id)
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Save to persistent storage result: {saved}")
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Verification - can we load it back?")
+
+            # Verify it was saved
+            verify_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+            if current_indices_key in verify_state:
+                print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] VERIFIED: Key found in reloaded state with {len(verify_state[current_indices_key])} indices")
+            else:
+                print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] WARNING: Key NOT found in reloaded state!")
+
+            self.logger.info(f"Saved {len(current_iteration_indices)} indices to persistent storage for iteration {message.repetition}")
+        except Exception as e:
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] ERROR saving to persistent storage: {e}")
+            import traceback
+            traceback.print_exc()
+            self.logger.error(f"Failed to save indices to persistent storage: {e}")
+
+        # Calculate and display overlap with previous system iteration
+        print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] About to calculate overlap, previous_system_iteration_indices is: {previous_system_iteration_indices is not None}")
+
+        if previous_system_iteration_indices is not None:
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Calculating overlap...")
+            current_set = set(current_iteration_indices)
+            previous_set = set(previous_system_iteration_indices)
+
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Current set: {current_set}")
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] Previous set: {previous_set}")
+
+            intersection = current_set.intersection(previous_set)
+            union = current_set.union(previous_set)
+
+            overlap_count = len(intersection)
+            current_count = len(current_set)
+            jaccard = len(intersection) / len(union) if len(union) > 0 else 0.0
+            percent_overlap = (overlap_count / current_count * 100) if current_count > 0 else 0.0
+
+            overlap_msg = (f"System Iteration {message.repetition}: Retrieval overlap with iteration {message.repetition - 1}: "
+                          f"{overlap_count}/{current_count} documents ({percent_overlap:.1f}%, Jaccard: {jaccard:.3f})")
+
+            # Print to console
+            print(f"[VectorRAG - QA {message.qa_pair_id}] {overlap_msg}")
+
+            self.logger.info(overlap_msg)
+        else:
+            # First system iteration - no overlap to calculate
+            print(f"[OVERLAP DEBUG - QA {message.qa_pair_id}] No previous iteration data available")
+            overlap_msg = f"System Iteration {message.repetition}: Retrieval overlap: N/A (first iteration or no previous data)"
+            print(f"[VectorRAG - QA {message.qa_pair_id}] {overlap_msg}")
+            self.logger.info(overlap_msg)
+
+        # Return VectorRetrievalReady message with modified state
         retrieval_ready_msg = VectorRetrievalReadyMessage(
             batch_id=message.batch_id,
             repetition=message.repetition,
             retrieved_context=retrieved_context,
             dataset=message.dataset,
-            setting=message.setting
+            setting=message.setting,
+            shared_state=current_state  # Pass modified state back
         )
 
         self.logger.info(f"Returning VectorRetrievalReady for batch {message.batch_id}")
@@ -2109,42 +2438,57 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         return retrieval_ready_msg
 
     def _load_faiss_index(self, dataset: str, setting: str, batch_id: int):
-        """Load FAISS index and metadata from disk."""
+        """Load FAISS index, BM25 index, and metadata from disk."""
         try:
             import os
 
             index_dir = "vector_indexes"
             index_filename = os.path.join(index_dir, f"{dataset}_{setting}_batch_{batch_id}.index")
+            bm25_filename = os.path.join(index_dir, f"{dataset}_{setting}_batch_{batch_id}_bm25.pkl")
             metadata_filename = os.path.join(index_dir, f"{dataset}_{setting}_batch_{batch_id}_metadata.json")
 
             if not os.path.exists(index_filename) or not os.path.exists(metadata_filename):
                 self.logger.error(f"Index files not found: {index_filename}")
-                return None, None
+                return None, None, None
 
             # Load FAISS index
             faiss_index = faiss.read_index(index_filename)
+
+            # Load BM25 index (if it exists)
+            bm25_index = None
+            if os.path.exists(bm25_filename):
+                with open(bm25_filename, 'rb') as f:
+                    bm25_index = pickle.load(f)
+                self.logger.info(f"Loaded BM25 index for hybrid retrieval")
+            else:
+                self.logger.warning(f"BM25 index not found, using FAISS only: {bm25_filename}")
 
             # Load metadata
             with open(metadata_filename, 'r', encoding='utf-8') as f:
                 chunk_metadata = json.load(f)
 
             self.logger.info(f"Loaded FAISS index with {faiss_index.ntotal} vectors")
-            return faiss_index, chunk_metadata
+            return faiss_index, chunk_metadata, bm25_index
 
         except Exception as e:
-            self.logger.error(f"Error loading FAISS index: {e}")
-            return None, None
+            self.logger.error(f"Error loading indexes: {e}")
+            return None, None, None
 
-    async def _execute_vector_search(self, query: str, faiss_index, chunk_metadata, k: int = 5, used_document_indices: set = None) -> List[Dict[str, Any]]:
+    async def _execute_vector_search(self, query: str, faiss_index, chunk_metadata, k: int = 5, used_document_indices: set = None, bm25_index=None, hypothetical_document: str = None) -> List[Dict[str, Any]]:
         """
-        Execute vector search using FAISS index and return structured documents.
+        Execute hybrid retrieval with MMR re-ranking using HyDE method:
+        1. Retrieve 50 candidates using BM25 + FAISS hybrid search
+        2. Apply MMR (Maximal Marginal Relevance) to diversify results
+        3. Return top k documents
 
         Args:
-            query: Query string
+            query: Query string (used for BM25 keyword search)
             faiss_index: FAISS index
             chunk_metadata: Metadata for chunks
-            k: Number of unique documents to retrieve
+            k: Number of final documents to retrieve (default: 5)
             used_document_indices: Set of FAISS indices already in context
+            bm25_index: BM25 index for keyword search (optional)
+            hypothetical_document: Hypothetical document for HyDE embedding (if None, uses query)
 
         Returns:
             List of k unique documents (or fewer if not enough exist)
@@ -2153,48 +2497,216 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
             used_document_indices = set()
 
         try:
-            # Get query embedding using async function
-            from llm import get_embeddings_async
-            query_embeddings = await get_embeddings_async([query])
-            query_vector = np.array(query_embeddings[0]).astype('float32').reshape(1, -1)
+            # If no BM25 index, fall back to FAISS-only retrieval
+            if bm25_index is None:
+                self.logger.info("BM25 index not available, using FAISS-only retrieval")
+                return await self._faiss_only_search(query, faiss_index, chunk_metadata, k, used_document_indices, hypothetical_document)
 
-            # Normalize for cosine similarity
+            # Stage 1: Hybrid retrieval to get initial candidate set (50 chunks)
+            initial_k = 50  # Retrieve more candidates for re-ranking
+            self.logger.info(f"Stage 1: Hybrid retrieval (BM25 + FAISS) retrieving {initial_k} candidates for query: {query[:50]}...")
+
+            # 1. Get FAISS scores for all documents using HyDE method
+            # If hypothetical_document is provided, embed it instead of the query
+            from llm import get_embeddings_async
+            text_to_embed = hypothetical_document if hypothetical_document else query
+            self.logger.info(f"HyDE: Embedding {'hypothetical document' if hypothetical_document else 'query'} for retrieval")
+            query_embeddings = await get_embeddings_async([text_to_embed])
+            query_vector = np.array(query_embeddings[0]).astype('float32').reshape(1, -1)
             faiss.normalize_L2(query_vector)
 
-            # Retrieve more documents than needed to account for filtering
-            # Start with k*10 to ensure we get k unique documents even in later iterations
-            # Cap at total index size
-            max_retrieve = min(k * 10, faiss_index.ntotal)  # Retrieve 30 candidates for k=3
+            # Search all documents
+            num_docs = faiss_index.ntotal
+            faiss_scores, faiss_indices = faiss_index.search(query_vector, num_docs)
+            faiss_scores = faiss_scores[0]  # Flatten
 
-            # Search for top max_retrieve similar vectors
-            scores, indices = faiss_index.search(query_vector, max_retrieve)
+            # 2. Get BM25 scores for all documents
+            tokenized_query = query.lower().split()
+            bm25_scores = bm25_index.get_scores(tokenized_query)
 
-            # Retrieve corresponding text chunks as structured documents, filtering used ones
-            retrieved_documents = []
-            for i, idx in enumerate(indices[0]):
-                if idx < len(chunk_metadata) and int(idx) not in used_document_indices:
-                    chunk_text = chunk_metadata[idx]["text"]
-                    score = float(scores[0][i])
-                    retrieved_documents.append({
-                        'index': len(retrieved_documents),  # Sequential index for new docs
-                        'faiss_index': int(idx),
-                        'score': score,
-                        'text': chunk_text
+            # 3. Normalize scores to [0, 1] range
+            # Normalize FAISS scores (cosine similarity is already in [-1, 1], shift to [0, 1])
+            faiss_scores_norm = (faiss_scores + 1) / 2.0
+
+            # Normalize BM25 scores
+            bm25_max = bm25_scores.max() if bm25_scores.max() > 0 else 1.0
+            bm25_scores_norm = bm25_scores / bm25_max
+
+            # 4. Combine scores with equal weighting (0.5 FAISS + 0.5 BM25)
+            alpha = 0.5  # Weight for FAISS (semantic)
+            beta = 0.5   # Weight for BM25 (keyword)
+            combined_scores = alpha * faiss_scores_norm + beta * bm25_scores_norm
+
+            # 5. Create scored documents list with embeddings for MMR
+            scored_docs = []
+            for i, (faiss_idx, combined_score) in enumerate(zip(faiss_indices[0], combined_scores)):
+                if faiss_idx < len(chunk_metadata):
+                    scored_docs.append({
+                        'faiss_index': int(faiss_idx),
+                        'combined_score': float(combined_score),
+                        'faiss_score': float(faiss_scores_norm[i]),
+                        'bm25_score': float(bm25_scores_norm[faiss_idx]),
+                        'text': chunk_metadata[faiss_idx]["text"],
+                        'embedding_idx': i  # Store index for embedding lookup
                     })
 
-                    # Stop when we have enough unique documents
-                    if len(retrieved_documents) >= k:
+            # 6. Sort by combined score (descending)
+            scored_docs.sort(key=lambda x: x['combined_score'], reverse=True)
+
+            # 7. Filter out already-used documents and get initial_k candidates
+            candidates = []
+            for doc in scored_docs:
+                if doc['faiss_index'] not in used_document_indices:
+                    candidates.append(doc)
+                    if len(candidates) >= initial_k:
                         break
 
-            # Log warning if we couldn't retrieve enough unique documents
+            if len(candidates) == 0:
+                self.logger.warning(f"No candidates available after filtering")
+                return []
+
+            self.logger.info(f"Stage 1: Retrieved {len(candidates)} candidates")
+
+            # Stage 2: Apply MMR re-ranking for diversity
+            self.logger.info(f"Stage 2: Applying MMR re-ranking to select top {k} diverse documents")
+
+            # Get embeddings for all candidates
+            candidate_embeddings = []
+            for doc in candidates:
+                # Get embedding from FAISS index
+                candidate_idx = doc['faiss_index']
+                # Reconstruct embedding from FAISS index
+                embedding = faiss_index.reconstruct(int(candidate_idx))
+                candidate_embeddings.append(embedding)
+
+            candidate_embeddings = np.array(candidate_embeddings)
+
+            # Apply MMR
+            selected_docs = self._mmr_rerank(
+                query_embedding=query_vector[0],
+                candidate_docs=candidates,
+                candidate_embeddings=candidate_embeddings,
+                k=k,
+                lambda_param=0.3  # Balance between relevance (0.7) and diversity (0.3)
+            )
+
+            # Format final results
+            retrieved_documents = []
+            for i, doc in enumerate(selected_docs):
+                retrieved_documents.append({
+                    'index': i,
+                    'faiss_index': doc['faiss_index'],
+                    'score': doc['combined_score'],
+                    'text': doc['text'],
+                    'faiss_score': doc['faiss_score'],
+                    'bm25_score': doc['bm25_score'],
+                    'mmr_selected': True
+                })
+
+            # Log retrieval details
             if len(retrieved_documents) < k:
-                self.logger.warning(f"Only retrieved {len(retrieved_documents)} unique documents out of {k} requested. "
-                                  f"Total used so far: {len(used_document_indices)}, searched through top {max_retrieve} candidates.")
+                self.logger.warning(f"MMR retrieval: Only retrieved {len(retrieved_documents)}/{k} documents. "
+                                  f"Candidates available: {len(candidates)}")
+            else:
+                avg_faiss = sum(d['faiss_score'] for d in retrieved_documents) / len(retrieved_documents)
+                avg_bm25 = sum(d['bm25_score'] for d in retrieved_documents) / len(retrieved_documents)
+                self.logger.info(f"MMR retrieval: Retrieved {len(retrieved_documents)} docs from {len(candidates)} candidates "
+                               f"(avg FAISS: {avg_faiss:.3f}, avg BM25: {avg_bm25:.3f})")
 
             return retrieved_documents
 
         except Exception as e:
-            self.logger.error(f"Error executing vector search: {e}")
+            self.logger.error(f"Error executing hybrid search with MMR: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def _mmr_rerank(self, query_embedding: np.ndarray, candidate_docs: List[Dict],
+                    candidate_embeddings: np.ndarray, k: int, lambda_param: float = 0.7) -> List[Dict]:
+        """
+        Apply Maximal Marginal Relevance (MMR) to re-rank candidates.
+
+        MMR balances relevance to query with diversity from already-selected documents.
+
+        Args:
+            query_embedding: Query embedding vector
+            candidate_docs: List of candidate documents
+            candidate_embeddings: Embeddings for candidate documents
+            k: Number of documents to select
+            lambda_param: Trade-off between relevance (higher) and diversity (lower)
+                         Default 0.7 = 70% relevance, 30% diversity
+
+        Returns:
+            List of k selected documents
+        """
+        selected = []
+        selected_indices = []
+        remaining_indices = list(range(len(candidate_docs)))
+
+        # Normalize embeddings for cosine similarity
+        query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-9)
+        candidates_norm = candidate_embeddings / (np.linalg.norm(candidate_embeddings, axis=1, keepdims=True) + 1e-9)
+
+        # Compute relevance scores (cosine similarity with query)
+        relevance_scores = np.dot(candidates_norm, query_norm)
+
+        for _ in range(min(k, len(candidate_docs))):
+            if not remaining_indices:
+                break
+
+            mmr_scores = []
+            for idx in remaining_indices:
+                # Relevance component
+                relevance = relevance_scores[idx]
+
+                # Diversity component (max similarity to already selected)
+                if selected_indices:
+                    similarities = np.dot(candidates_norm[idx], candidates_norm[selected_indices].T)
+                    max_similarity = np.max(similarities)
+                else:
+                    max_similarity = 0.0
+
+                # MMR formula: λ * relevance - (1-λ) * max_similarity
+                mmr_score = lambda_param * relevance - (1 - lambda_param) * max_similarity
+                mmr_scores.append((idx, mmr_score))
+
+            # Select document with highest MMR score
+            best_idx, best_score = max(mmr_scores, key=lambda x: x[1])
+            selected.append(candidate_docs[best_idx])
+            selected_indices.append(best_idx)
+            remaining_indices.remove(best_idx)
+
+        return selected
+
+    async def _faiss_only_search(self, query: str, faiss_index, chunk_metadata, k: int, used_document_indices: set, hypothetical_document: str = None) -> List[Dict[str, Any]]:
+        """Fallback to FAISS-only search when BM25 is not available, using HyDE if provided."""
+        try:
+            from llm import get_embeddings_async
+            text_to_embed = hypothetical_document if hypothetical_document else query
+            self.logger.info(f"HyDE (FAISS-only): Embedding {'hypothetical document' if hypothetical_document else 'query'} for retrieval")
+            query_embeddings = await get_embeddings_async([text_to_embed])
+            query_vector = np.array(query_embeddings[0]).astype('float32').reshape(1, -1)
+            faiss.normalize_L2(query_vector)
+
+            max_retrieve = min(k * 10, faiss_index.ntotal)
+            scores, indices = faiss_index.search(query_vector, max_retrieve)
+
+            retrieved_documents = []
+            for i, idx in enumerate(indices[0]):
+                if idx < len(chunk_metadata) and int(idx) not in used_document_indices:
+                    retrieved_documents.append({
+                        'index': len(retrieved_documents),
+                        'faiss_index': int(idx),
+                        'score': float(scores[0][i]),
+                        'text': chunk_metadata[idx]["text"]
+                    })
+                    if len(retrieved_documents) >= k:
+                        break
+
+            return retrieved_documents
+
+        except Exception as e:
+            self.logger.error(f"Error executing FAISS-only search: {e}")
             return []
 
     async def close(self) -> None:
@@ -2327,16 +2839,15 @@ class AnswerGeneratorAgent(RoutedAgent):
         """Handle AnswerGenerationStart message and generate answer using LLM."""
         self.logger.info(f"AnswerGeneratorAgent processing QA pair {message.qa_pair_id}")
 
-        # Load shared state to get learned system prompt
-        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
-
-        # Check if learned prompt exists from previous iteration's backward pass
-        learned_system_prompt = current_state.get("learned_prompt_answer_generator_vector", "")
-
-        if not learned_system_prompt:
-            self.logger.info(f"First iteration for QA pair {message.qa_pair_id} - using empty answer generator system prompt")
+        # Use state from message (message-passing architecture - no I/O)
+        current_state = message.shared_state.copy()
+        learned_user_prompt = current_state.get("learned_prompt_answer_generator_vector", "")
+        if not learned_user_prompt:
+            from parameters import base_prompt_answer_generator_vector
+            learned_user_prompt = base_prompt_answer_generator_vector
+            self.logger.info(f"Answer generator: using basic base user prompt for QA pair {message.qa_pair_id}")
         else:
-            self.logger.info(f"Using learned answer generator system prompt for QA pair {message.qa_pair_id}")
+            self.logger.info(f"Answer generator: using learned user prompt (system prompt kept empty) for QA pair {message.qa_pair_id}")
 
         # Get previous responses and evaluations for this QA pair
         all_evaluation_responses = current_state.get("response_evaluations", [])
@@ -2371,40 +2882,12 @@ class AnswerGeneratorAgent(RoutedAgent):
         else:
             previous_attempts_text = ""
 
-        # Prepare user prompt based on iteration (matching Self-Refine's approach)
-        if message.repetition == 0:
-            # First iteration: simple initial prompt
-            user_prompt_content = self.initial_prompt.format(
-                context=message.retrieved_context,
-                question=message.question
-            )
-            self.logger.info(f"Using initial answer generation prompt (iteration 0)")
-        else:
-            # Refinement iteration: show previous answer and critique
-            # Get most recent previous answer and critique
-            if qa_pair_evals:
-                # Sort by repetition to get the most recent one
-                most_recent = max(qa_pair_evals, key=lambda x: x.get('repetition', 0))
-                previous_answer = most_recent.get('generated_answer', '')
-                critique = most_recent.get('evaluation_feedback', '')
-            else:
-                # Fallback (shouldn't happen in refinement iterations)
-                previous_answer = "No previous answer available"
-                critique = "No critique available"
-
-            user_prompt_content = self.refinement_prompt.format(
-                context=message.retrieved_context,
-                question=message.question,
-                previous_answer=previous_answer,
-                critique=critique
-            )
-            self.logger.info(f"Using refinement prompt (iteration {message.repetition})")
-
-        # Optionally append all previous attempts for additional context
-        # (This is extra context beyond what Self-Refine shows, but maintains VectorRAG's approach)
-        if previous_attempts_text:
-            user_prompt_content += "\n\n" + previous_attempts_text
-            self.logger.info(f"Including {len(qa_pair_evals)} previous attempt(s) as additional context")
+        # Build user prompt: learned prompt + required sections (no previous attempts/critique)
+        user_prompt_content = (
+            f"{learned_user_prompt}\n\n"
+            f"Context:\n{message.retrieved_context}\n\n"
+            f"Question: {message.question}\n"
+        )
 
         try:
             # Use Gemini API directly with system instruction and thinking disabled
@@ -2412,8 +2895,7 @@ class AnswerGeneratorAgent(RoutedAgent):
             config_dict = {
                 "thinking_config": types.ThinkingConfig(thinking_budget=0)
             }
-            if learned_system_prompt:
-                config_dict["system_instruction"] = learned_system_prompt
+            # Do not set system_instruction (system must remain empty)
 
             # Run synchronous Gemini call in executor to not block event loop
             loop = asyncio.get_running_loop()
@@ -2434,7 +2916,7 @@ class AnswerGeneratorAgent(RoutedAgent):
             logger.log_interaction(
                 agent_name="AnswerGeneratorAgent",
                 interaction_type="answer_generation",
-                system_prompt=learned_system_prompt,
+                system_prompt="",
                 user_prompt=user_prompt_content,
                 llm_response=generated_answer,
                 qa_pair_id=message.qa_pair_id,
@@ -2453,7 +2935,7 @@ class AnswerGeneratorAgent(RoutedAgent):
                 "qa_pair_id": message.qa_pair_id,
                 "question": message.question,
                 "retrieved_context": message.retrieved_context,
-                "system_prompt": learned_system_prompt,
+                "system_prompt": "",
                 "user_prompt": user_prompt_content,
                 "generated_answer": generated_answer,
                 "repetition": message.repetition
@@ -2463,14 +2945,13 @@ class AnswerGeneratorAgent(RoutedAgent):
             conversations.append(conversation_entry)
             current_state["conversations_answer_generation"] = conversations
 
-            self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
-
-            # Send AnswerGenerationReady message
+            # Return AnswerGenerationReady message with modified state
             answer_ready_msg = AnswerGenerationReadyMessage(
                 qa_pair_id=message.qa_pair_id,
                 generated_answer=generated_answer,
                 batch_id=message.batch_id,
-                repetition=message.repetition
+                repetition=message.repetition,
+                shared_state=current_state  # Pass modified state back
             )
 
             self.logger.info(f"Returning AnswerGenerationReady for QA pair {message.qa_pair_id}")
@@ -2480,12 +2961,13 @@ class AnswerGeneratorAgent(RoutedAgent):
 
         except Exception as e:
             self.logger.error(f"Error in answer generation: {e}")
-            # Return default response on error
+            # Return default response on error with unmodified state
             return AnswerGenerationReadyMessage(
                 qa_pair_id=message.qa_pair_id,
                 generated_answer="Error generating answer",
                 batch_id=message.batch_id,
-                repetition=message.repetition
+                repetition=message.repetition,
+                shared_state=current_state  # Pass state back even on error
             )
 
     async def close(self) -> None:
@@ -2518,6 +3000,75 @@ class ResponseEvaluatorAgent(RoutedAgent):
         self.model_name = "gemini-2.5-flash"
 
         self.response_evaluator_prompt = response_evaluator_prompt
+
+        # Initialize OpenAI client for G-Eval
+        self.openai_client = OpenAI(api_key=llm_keys.OPENAI_KEY)
+
+        # G-Eval prompts
+        self.coherence_prompt = """You will be given one summary written for a source document.
+Your task is to rate the summary on one metric.
+Please make sure you read and understand these instructions carefully. Please keep this document open while reviewing, and refer to it as needed.
+
+Evaluation Criteria:
+Coherence (1-5) - the collective quality of all sentences. We align this dimension with the DUC quality question of structure and coherence whereby "the summary should be well-structured and well-organized. The summary should not just be a heap of related information, but should build from sentence to a coherent body of information about a topic."
+
+Evaluation Steps:
+1. Read the source document carefully and identify the main topic and key points.
+2. Read the summary and compare it to the source document. Check if the summary covers the main topic and key points of the source document, and if it presents them in a clear and logical order.
+3. Assign a score for coherence on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+
+Example:
+Source Document:
+{document}
+
+Summary:
+{summary}
+
+Evaluation Form (scores ONLY):
+- Coherence:"""
+
+        self.relevance_prompt = """You will be given one summary written for a source document.
+Your task is to rate the summary on one metric.
+Please make sure you read and understand these instructions carefully. Please keep this document open while reviewing, and refer to it as needed.
+
+Evaluation Criteria:
+Relevance (1-5) - selection of important content from the source. The summary should include only important information from the source document. Annotators were instructed to penalize summaries which contained redundancies and excess information.
+
+Evaluation Steps:
+1. Read the summary and the source document carefully.
+2. Compare the summary to the source document and identify the main points of the source document.
+3. Assess how well the summary covers the main points of the source document, and how much irrelevant or redundant information it contains.
+4. Assign a relevance score from 1 to 5.
+
+Example:
+Source Document:
+{document}
+
+Summary:
+{summary}
+
+Evaluation Form (scores ONLY):
+- Relevance:"""
+
+        self.reference_guided_prompt = """Please act as an impartial judge and evaluate the quality of the response provided by an AI assistant to the user question. Your evaluation should consider correctness and helpfulness. You will be given a reference answer and the assistant's answer.
+
+Evaluation Steps:
+1. Compare the assistant's answer with the reference answer.
+2. Identify what information is correct, missing, or incorrect in the assistant's answer.
+3. Assess the overall correctness and helpfulness of the assistant's answer.
+4. Assign a rating from 1 to 5, where 1 is the lowest (completely incorrect/unhelpful) and 5 is the highest (fully correct and helpful).
+
+User Question:
+{question}
+
+Reference Answer:
+{reference_answer}
+
+Assistant's Answer:
+{assistant_answer}
+
+Evaluation Form (scores ONLY):
+- Rating:"""
 
     def _load_gold_patterns(self) -> str:
         """Load learned gold answer patterns from file. Raises error if not found."""
@@ -2575,10 +3126,109 @@ class ResponseEvaluatorAgent(RoutedAgent):
             self.logger.error(f"Error computing ROUGE score: {e}")
             return 0.0
 
+    def _compute_geval_scores(self, question: str, document: str, generated_answer: str, reference_answer: str) -> Dict[str, float]:
+        """
+        Compute G-Eval scores (Coherence, Relevance, Reference-Guided) using OpenAI API.
+
+        Args:
+            question: The question being answered
+            document: The source document
+            generated_answer: Generated answer to evaluate
+            reference_answer: Gold/reference answer
+
+        Returns:
+            Dict with keys: 'coherence', 'relevance', 'reference_guided' (all floats)
+        """
+        try:
+            # Compute all three G-Eval metrics
+            coherence_score = self._compute_geval_metric(
+                self.coherence_prompt.format(document=document, summary=generated_answer),
+                "Coherence"
+            )
+
+            relevance_score = self._compute_geval_metric(
+                self.relevance_prompt.format(document=document, summary=generated_answer),
+                "Relevance"
+            )
+
+            reference_guided_score = self._compute_geval_metric(
+                self.reference_guided_prompt.format(
+                    question=question,
+                    reference_answer=reference_answer,
+                    assistant_answer=generated_answer
+                ),
+                "Reference-Guided"
+            )
+
+            return {
+                'coherence': coherence_score,
+                'relevance': relevance_score,
+                'reference_guided': reference_guided_score
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error computing G-Eval scores: {e}")
+            return {'coherence': 0.0, 'relevance': 0.0, 'reference_guided': 0.0}
+
+    def _compute_geval_metric(self, prompt: str, metric_name: str, model: str = "gpt-4o-mini", top_logprobs: int = 5) -> float:
+        """
+        Compute a single G-Eval metric using logprobs.
+
+        Args:
+            prompt: The evaluation prompt
+            metric_name: Name of the metric for logging
+            model: OpenAI model to use
+            top_logprobs: Number of top logprobs to request
+
+        Returns:
+            float: G-Eval score (expected value from probability distribution)
+        """
+        try:
+            # Call OpenAI API with logprobs enabled
+            response = self.openai_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1,
+                temperature=0,
+                logprobs=True,
+                top_logprobs=top_logprobs,
+                timeout=60.0
+            )
+
+            # Extract logprobs
+            logprobs_content = response.choices[0].logprobs.content[0]
+            top_logprobs_list = logprobs_content.top_logprobs
+
+            # Extract probabilities for scores 1-5
+            score_probs = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}
+
+            for item in top_logprobs_list:
+                token = item.token.strip()
+                if token in ['1', '2', '3', '4', '5']:
+                    score_probs[int(token)] = np.exp(item.logprob)
+
+            # Calculate G-Eval score (expected value)
+            scores_found = {k: v for k, v in score_probs.items() if v > 0}
+
+            if not scores_found:
+                self.logger.warning(f"No numeric scores found in logprobs for {metric_name}")
+                return 0.0
+
+            # Normalize probabilities and calculate weighted score
+            total_prob = sum(scores_found.values())
+            normalized_scores = {k: v/total_prob for k, v in scores_found.items()}
+            g_score = sum(score * prob for score, prob in normalized_scores.items())
+
+            return g_score
+
+        except Exception as e:
+            self.logger.error(f"Error computing G-Eval {metric_name}: {e}")
+            return 0.0
+
     @message_handler
     async def handle_response_evaluation_start(self, message: ResponseEvaluationStartMessage, ctx: MessageContext) -> ResponseEvaluationReadyMessage:
         """Handle ResponseEvaluationStart message and evaluate response using LLM."""
-        print(f"\n🔍 ResponseEvaluatorAgent: Starting evaluation for QA pair {message.qa_pair_id}")
+        print(f"\nðŸ” ResponseEvaluatorAgent: Starting evaluation for QA pair {message.qa_pair_id}")
         print(f"   Query: {message.original_query[:100]}...")
         print(f"   Answer length: {len(message.generated_answer)} chars")
 
@@ -2594,8 +3244,32 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 self.logger.info(f"Computed ROUGE score {rouge_score:.4f} for QA pair {message.qa_pair_id}")
         print(f"[ResponseEvaluator] ROUGE-L={rouge_score:.4f}")
 
-        # Load previous evaluations from shared state
-        current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+        # Compute G-Eval scores (Coherence, Relevance, Reference-Guided)
+        geval_scores = {'coherence': 0.0, 'relevance': 0.0, 'reference_guided': 0.0}
+        if message.gold_answers and message.generated_answer and message.document_text:
+            valid_gold_answers = [ans for ans in message.gold_answers if ans.strip()]
+            if valid_gold_answers:
+                reference_answer = valid_gold_answers[0]
+                # Truncate answers for console display
+                answer_preview = message.generated_answer[:80] + "..." if len(message.generated_answer) > 80 else message.generated_answer
+                ref_preview = reference_answer[:80] + "..." if len(reference_answer) > 80 else reference_answer
+                print(f"[ResponseEvaluator] Computing G-Eval scores...")
+                print(f"   Generated: {answer_preview}")
+                print(f"   Reference: {ref_preview}")
+
+                geval_scores = self._compute_geval_scores(
+                    question=message.original_query,
+                    document=message.document_text,
+                    generated_answer=message.generated_answer,
+                    reference_answer=reference_answer
+                )
+                self.logger.info(f"Computed G-Eval scores for {message.qa_pair_id}: {geval_scores}")
+                print(f"[ResponseEvaluator] G-Eval Coherence={geval_scores['coherence']:.4f} | Relevance={geval_scores['relevance']:.4f} | Reference-Guided={geval_scores['reference_guided']:.4f}")
+        else:
+            print(f"[ResponseEvaluator] Skipping G-Eval (missing data)")
+
+        # Use state from message (message-passing architecture - no I/O)
+        current_state = message.shared_state.copy()
         all_evaluation_responses = current_state.get("response_evaluations", [])
         print(f"[ResponseEvaluator] Loaded state. prev_evals_total={len(all_evaluation_responses)}")
 
@@ -2615,16 +3289,17 @@ class ResponseEvaluatorAgent(RoutedAgent):
         else:
             unfound_keywords_text = ""
 
-        # Prepare prompt with query, generated response, and satisfactory criteria
+        # Prepare prompt with query, generated response, retrieved context, and satisfactory criteria
         prompt_content = self.response_evaluator_prompt.format(
             original_query=message.original_query,
             generated_answer=message.generated_answer,
-            satisfactory_criteria=self.satisfactory_criteria,
-            unfound_keywords_history=unfound_keywords_text
+            retrieved_context=message.retrieved_context,
+            #  satisfactory_criteria=self.satisfactory_criteria,
+            #  unfound_keywords_history=unfound_keywords_text
         )
 
         print(f"   Prompt prepared ({len(prompt_content)} chars)")
-        print(f"   ℹ️  Evaluating answer independently (not showing previous iterations to match Self-Refine)")
+        print(f"   â„¹ï¸  Evaluating answer independently (not showing previous iterations to match Self-Refine)")
 
         try:
 
@@ -2639,7 +3314,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
                         contents="Please evaluate the response.",
                         config=types.GenerateContentConfig(
                             system_instruction=prompt_content,
-                            thinking_config=types.ThinkingConfig(thinking_budget=0)  # Disable thinking
+                            thinking_config=types.ThinkingConfig(thinking_budget=1024)  # Disable thinking
                         )
                     )
                 )
@@ -2726,8 +3401,7 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 "rouge_score": rouge_score
             }
 
-            # Store evaluation result in shared state for BackwardPassAgent
-            current_state = self.shared_state.load_state(message.dataset, message.setting, message.batch_id)
+            # Update state with evaluation result (in-memory only)
             response_evaluations = current_state.get("response_evaluations", [])
             response_evaluations.append(evaluation_data)
             current_state["response_evaluations"] = response_evaluations
@@ -2735,7 +3409,6 @@ class ResponseEvaluatorAgent(RoutedAgent):
             # Store continue_optimization flag for early stopping
             current_state[f"continue_optimization_{message.qa_pair_id}"] = eval_response.continue_optimization
 
-            saved = self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
             # Update in-memory early-stop map to avoid cross-batch timing issues
             try:
                 from shared_state import SharedState as _SS
@@ -2743,16 +3416,16 @@ class ResponseEvaluatorAgent(RoutedAgent):
                 print(f"[ResponseEvaluator] Updated in-memory continue flag for {message.qa_pair_id} -> {eval_response.continue_optimization}")
             except Exception as _:
                 pass
-            print(f"[ResponseEvaluator] Saved evaluation to state. saved={saved} flag_key=continue_optimization_{message.qa_pair_id}")
 
-            # Send ResponseEvaluationReady message
+            # Return ResponseEvaluationReady message with modified state
             eval_ready_msg = ResponseEvaluationReadyMessage(
                 qa_pair_id=message.qa_pair_id,
                 evaluation_result=evaluation_data,
                 rouge_score=rouge_score,
                 continue_optimization=eval_response.continue_optimization,
                 batch_id=message.batch_id,
-                repetition=message.repetition
+                repetition=message.repetition,
+                shared_state=current_state  # Pass modified state back
             )
 
             self.logger.info(f"Returning ResponseEvaluationReady for QA pair {message.qa_pair_id}")
@@ -2852,10 +3525,17 @@ class BackwardPassAgent(RoutedAgent):
     async def handle_backward_pass_start(self, message: BackwardPassStartMessage, ctx: MessageContext) -> BackwardPassReadyMessage:
         """Handle BackwardPassStart message and perform complete backward pass critique generation."""
         self.logger.info(f"BackwardPassAgent processing backward pass for batch {message.batch_id}")
-        print(f"[BackwardPass] START batch_id={message.batch_id} dataset={message.dataset} setting={message.setting} qa_results={len(message.all_qa_results)}")
+        print(f"[BackwardPass] START batch_id={message.batch_id} dataset={message.dataset} setting={message.setting} repetition={message.repetition} qa_results={len(message.all_qa_results)}")
 
         # Load shared state with correct dataset and setting parameters (force fresh to avoid stale cache)
+        print(f"[BackwardPass] ===== LOADING INITIAL STATE =====")
+        print(f"[BackwardPass] Loading state for: batch_id={message.batch_id}, dataset={message.dataset}, setting={message.setting}")
         current_state = self.shared_state.load_state_fresh(message.dataset, message.setting, message.batch_id)
+        print(f"[BackwardPass] Initial state keys: {list(current_state.keys())}")
+        print(f"[BackwardPass] Initial has query_content_pairs: {('query_content_pairs' in current_state)}")
+        if 'query_content_pairs' in current_state:
+            print(f"[BackwardPass] Initial query_content_pairs length: {len(current_state.get('query_content_pairs', []))}")
+        print(f"[BackwardPass] ===== INITIAL STATE LOADED =====")
 
         # HYDRATE STATE FROM MESSAGE if critical fields are missing (handles immediate backward pass timing)
         try:
@@ -2941,6 +3621,28 @@ class BackwardPassAgent(RoutedAgent):
                         hydrated = True
                     except Exception as _:
                         pass
+
+                # Seed query_content_pairs if empty (fallback - should not normally happen)
+                if not current_state.get("query_content_pairs"):
+                    print("[BackwardPass] ===== FALLBACK: query_content_pairs missing =====")
+                    print(f"[BackwardPass] Repetition: {message.repetition}")
+                    print(f"[BackwardPass] Current state keys: {list(current_state.keys())}")
+                    print(f"[BackwardPass] Has retrieval_plans: {('retrieval_plans' in current_state)}")
+
+                    # Try to construct from retrieval_plans if available
+                    plans = current_state.get("retrieval_plans", [])
+                    print(f"[BackwardPass] Number of retrieval_plans: {len(plans)}")
+
+                    if plans:
+                        fallback_pairs = []
+                        for plan in plans:
+                            fallback_pairs.append({"query": plan, "content": "Content not available"})
+                        current_state["query_content_pairs"] = fallback_pairs
+                        print(f"[BackwardPass] Created fallback query_content_pairs from retrieval_plans: {len(fallback_pairs)} pairs")
+                        hydrated = True
+                    else:
+                        print("[BackwardPass] No retrieval_plans available - cannot create fallback")
+                    print("[BackwardPass] ===== FALLBACK COMPLETE =====")
 
             if hydrated:
                 self.shared_state.save_state(current_state, message.dataset, message.setting, message.batch_id)
@@ -3115,9 +3817,9 @@ Continue Optimization: {eval_resp.get('continue_optimization', False)}
                 retrieved_ctx = retrieved_ctx[:500] + "... [truncated]"
 
             iter_text = f"""
-╔════════════════════════════════════════════════════════════════════
-║ ITERATION {rep}
-╚════════════════════════════════════════════════════════════════════
+â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+â•‘ ITERATION {rep}
+â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 Question:
 {data.get('question', 'N/A')}
@@ -3209,73 +3911,15 @@ Continue Optimization: {data.get('continue_optimization', False)}
         log_critique_result(self.logger, "answer_generator_vector", critique, is_frozen)
 
     async def _generate_retrieved_content_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieved content based on conversations, contexts, and evaluations."""
-        self.logger.info("Generating retrieved content critique")
-        print("[BackwardPass] _generate_retrieved_content_critique START")
+        """
+        DISABLED: Retrieved content critique.
 
-        conversations = current_state.get("conversations_answer_generation", [])
-        evaluation_responses = current_state.get("response_evaluations", [])
-
-        # Use context summary instead of full retrieved contexts for backward pass
-        context_summary = current_state.get("context_summary", "")
-        if not context_summary:
-            # Fallback to full contexts if summary is not available
-            retrieved_contexts = current_state.get("retrieved_contexts", [])
-            context_summary = "\n\n--- Context Separator ---\n\n".join(retrieved_contexts) if retrieved_contexts else "No context available"
-
-        if not conversations or not evaluation_responses:
-            self.logger.warning("Missing data for retrieved content critique")
-            current_state["retrieved_content_critique"] = "No critique provided"
-            print("[BackwardPass] Missing data — skipping retrieved content critique")
-            return
-
-        # Extract query from first conversation
-        query = conversations[0].get('question', 'Unknown query') if conversations else 'Unknown query'
-
-        # Create triplets: summarized context + conversation (question-answer) + evaluation response
-        triplets = []
-        for i, conv in enumerate(conversations):
-            if i < len(evaluation_responses):
-                eval_resp = evaluation_responses[i]
-                question = conv.get('question', 'N/A')
-                answer = conv.get('generated_answer', 'N/A')
-                eval_feedback = eval_resp.get('evaluation_feedback', 'N/A')
-
-                triplet = f"""
---- ITERATION {i} ---
-Question: {question}
-
-Retrieved Context:
-{context_summary}
-
-Generated Answer:
-{answer}
-
-Evaluation Feedback:
-{eval_feedback}
-"""
-                triplets.append(triplet)
-
-        concatenated_data = "\n".join(triplets)
-
-        # Get previous critique (answer generation critique)
-        previous_critique = current_state.get("answer_generation_critique", "")
-
-        # Get combined history of responses and critiques
-        response_critique_history = self._format_response_critique_history(conversations, evaluation_responses)
-
-        # Call LLM with retrieved_content_gradient_prompt_vector with all required parameters
-        prompt_content = self.retrieved_content_gradient_prompt_vector.format(
-            query=query,
-            retrieved_content=concatenated_data,
-            previous_critique=previous_critique,
-            response_critique_history=response_critique_history
-        )
-
-        critique = await self._call_llm(prompt_content, ctx)
-        current_state["retrieved_content_critique"] = critique
-
-        self.logger.info("Retrieved content critique generated and saved")
+        Skipping the retrieved content evaluation step as requested.
+        """
+        self.logger.info("Retrieved content critique: SKIPPED (disabled by user)")
+        print("[BackwardPass] Retrieved content critique: SKIPPED")
+        current_state["retrieved_content_critique"] = "Skipped - retrieved content evaluation disabled"
+        return
 
     async def _generate_retrieval_summarizer_prompt_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """
@@ -3289,110 +3933,115 @@ Evaluation Feedback:
         return
 
     async def _generate_retrieval_plan_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieval plans based on plans and contexts."""
-        self.logger.info("Generating retrieval plan critique")
-        print("[BackwardPass] _generate_retrieval_plan_critique START")
+        """
+        DISABLED: Retrieval plan critique.
 
-        retrieval_plans = current_state.get("retrieval_plans", [])
-        evaluation_responses = current_state.get("response_evaluations", [])
-        conversations = current_state.get("conversations_answer_generation", [])
-
-        # Use context summary instead of full retrieved contexts for backward pass
-        context_summary = current_state.get("context_summary", "")
-        if not context_summary:
-            # Fallback to full contexts if summary is not available
-            retrieved_contexts = current_state.get("retrieved_contexts", [])
-            context_summary = "\n\n--- Context Separator ---\n\n".join(retrieved_contexts) if retrieved_contexts else "No context available"
-
-        self.logger.info(f"Retrieval plans: {retrieval_plans}")
-        self.logger.info(f"Using context summary for critique generation")
-
-        if not retrieval_plans:
-            self.logger.warning("Missing retrieval plans for critique")
-            current_state["retrieval_plan_critique"] = "No critique provided"
-            print("[BackwardPass] SKIP retrieval plan critique — no retrieval_plans found")
-            return
-
-        # Create comprehensive retrieval plan information with all plans (WITHOUT retrieved content)
-        all_plans_info = []
-        for i, plan in enumerate(retrieval_plans, 1):
-            all_plans_info.append(f"--- RETRIEVAL PLAN {i} ---\n{plan}")
-
-        all_plans_formatted = "\n\n".join(all_plans_info)
-
-        # Get retrieved_content_critique from previous component
-        previous_critique = current_state.get("retrieved_content_critique", "No critique available")
-
-        # Get combined history of responses and critiques
-        response_critique_history = self._format_response_critique_history(conversations, evaluation_responses)
-
-        # Call LLM with retrieval_plan_gradient_prompt_vector with all required parameters
-        prompt_content = self.retrieval_plan_gradient_prompt_vector.format(
-            retrieval_plan=all_plans_info,
-            previous_critique=previous_critique,
-            response_critique_history=response_critique_history
-        )
-
-        print("[BackwardPass] Calling LLM for retrieval plan critique")
-        critique = await self._call_llm(prompt_content, ctx)
-        current_state["retrieval_plan_critique"] = critique
-
-        self.logger.info("Retrieval plan critique generated and saved")
+        Skipping the retrieval plan critique as requested. Query critiques will be
+        used directly by the prompt optimizer instead.
+        """
+        self.logger.info("Retrieval plan critique: SKIPPED (disabled by user)")
+        print("[BackwardPass] Retrieval plan critique: SKIPPED")
+        current_state["retrieval_plan_critique"] = "Skipped - retrieval plan critique disabled"
+        return
 
     async def _generate_retrieval_planning_prompt_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
-        """Generate critique for retrieval planning prompt (with skip logic)."""
-        self.logger.info("Generating retrieval planning prompt critique")
+        """Generate critique for retrieval planning prompt based on response evaluator feedback."""
+        self.logger.info("Generating retrieval planning prompt critique from response evaluator feedback")
         print("[BackwardPass] _generate_retrieval_planning_prompt_critique START")
 
-        retrieval_prompt = current_state.get("retrieval_prompt", "")
+        query_content_pairs = current_state.get("query_content_pairs", [])
         all_evaluation_responses = current_state.get("response_evaluations", [])
         conversations = current_state.get("conversations_answer_generation", [])
 
-        if not retrieval_prompt or not all_evaluation_responses:
-            self.logger.warning("Missing retrieval prompt or evaluation for critique")
+        if not query_content_pairs or not all_evaluation_responses:
+            self.logger.warning("Missing query_content_pairs or evaluation for critique")
             current_state["retrieval_planner_agent_critique"] = "No critique provided"
-            print(f"[BackwardPass] SKIP retrieval planning prompt critique — missing retrieval_prompt={not bool(retrieval_prompt)} or evals={len(all_evaluation_responses)}")
+            print(f"[BackwardPass] SKIP retrieval planning prompt critique â€” missing query_content_pairs={len(query_content_pairs)} or evals={len(all_evaluation_responses)}")
             return
 
-        # Get the current retrieval planning prompt
-        current_retrieval_prompt = current_state.get("learned_prompt_vector_retrieval_planner", "")
-        if not current_retrieval_prompt:
-            from parameters import base_prompt_vector_retrieval_planner
-            current_retrieval_prompt = base_prompt_vector_retrieval_planner
+        # Get the question from conversations
+        question = conversations[0].get('question', 'Unknown question') if conversations else 'Unknown question'
 
-        # Get previous critique (from retrieval plan)
-        previous_critique = current_state.get("retrieval_plan_critique", "")
+        # Determine overall performance based on evaluations
+        avg_quality = 0.0
+        if all_evaluation_responses:
+            # Check if responses were satisfactory
+            satisfactory_count = sum(1 for eval_resp in all_evaluation_responses
+                                   if not eval_resp.get('continue_optimization', True))
+            avg_quality = satisfactory_count / len(all_evaluation_responses)
 
-        # Get combined history of responses and critiques
-        response_critique_history = self._format_response_critique_history(conversations, all_evaluation_responses)
+        # Get the response evaluator's critique
+        print(f"[BackwardPass] Generating retrieval plan critique based on response evaluator feedback...")
 
-        # Format prompt with new structure
-        prompt_content = self.retrieval_planning_prompt_gradient_vector.format(
-            current_prompt=current_retrieval_prompt,
-            previous_critique=previous_critique,
-            response_critique_history=response_critique_history
-        )
+        response_evaluator_critique = ""
+        if all_evaluation_responses:
+            # Get the most recent evaluation critique
+            latest_eval = all_evaluation_responses[-1]
+            response_evaluator_critique = latest_eval.get('evaluation_feedback', latest_eval.get('critique', ''))
 
-        # Call LLM with structured output
-        from parameters import PromptCritiqueResponse
-        critique_response = await self._call_llm_structured(prompt_content, ctx, PromptCritiqueResponse)
-        print(f"[BackwardPass] RetrievalPlanner prompt critique structured: problem={getattr(critique_response,'problem_in_this_component',None)}")
+        # Format queries
+        queries_list = []
+        for i, pair in enumerate(query_content_pairs, 1):
+            query_text = pair.get("query", "Unknown query")
+            queries_list.append(f"{i}. {query_text}")
 
-        # Implement skip logic
-        if not critique_response.problem_in_this_component:
-            current_state["retrieval_planner_agent_critique"] = "No critique provided"
-            self.logger.info("Retrieval planning prompt: No problem detected, skipping optimization")
-            print("[BackwardPass] Retrieval planner prompt: no problem — skipping")
-            return
+        queries_formatted = "\n".join(queries_list)
 
-        # Problem detected - store critique and optimize
-        critique = critique_response.critique
-        current_state["retrieval_planner_agent_critique"] = critique
+        # Simple prompt focused on response evaluator feedback
+        analysis_prompt = f"""You are evaluating the queries made by an iterative content retriever in a RAG system.
+Your goal is to provide an accurate evaluation of the queries based on the following feedback.
 
-        # Generate optimized prompt using the critique
-        optimizer_prompt = self.retrieval_planner_prompt_optimizer_vector.format(critique)
+The original question of the user was:
+{question}
+
+QUERIES MADE:
+{queries_formatted}
+
+RESPONSE EVALUATOR FEEDBACK:
+{response_evaluator_critique}
+
+Based on the response evaluator's feedback, provide:
+
+1. **TYPES OF QUERIES TO FOCUS ON**:
+   - What types of queries would address the issues mentioned in the feedback?
+   - What aspects should future queries target to improve the answer?
+   - Remember that each query must target a specific part of the text. A good query targets specific content that can be found in a single chunk.
+   - Therefore, if we need complex information, we must rather perform a sequence of targeted queries (since each query will give one single chunk)
+
+2. **RETRIEVAL GAIN INSTRUCTIONS**:
+   - How can the retrieval planner ensure each query brings NEW information?
+   - What should the planner check before making a query to avoid redundancy?
+
+3. **QUERIES THAT WORKED WELL**:
+   - Which of the queries above were effective (if the feedback mentions relevant aspects)?
+   - What made these queries successful?
+
+Provide a clear, actionable analysis."""
+
+        combined_analysis = await self._call_llm(analysis_prompt, ctx)
+        print(f"[BackwardPass] Retrieval plan analysis complete")
+
+        # Format the information for the optimizer
+        optimizer_input = f"""OVERALL QUESTION: {question}
+
+RESPONSE EVALUATOR FEEDBACK:
+{response_evaluator_critique}
+
+QUERIES MADE:
+{queries_formatted}
+
+RETRIEVAL PLAN ANALYSIS:
+{combined_analysis}
+"""
+
+        # Generate optimized prompt using the analysis
+        print("[BackwardPass] Generating optimized retrieval planner prompt based on response evaluator feedback...")
+        optimizer_prompt = self.retrieval_planner_prompt_optimizer_vector.format(optimizer_input)
         optimized_prompt = await self._call_llm(optimizer_prompt, ctx, "Please provide the new prompt", add_token_limit=False)
         print(f"[BackwardPass] RetrievalPlanner optimized prompt length={len(optimized_prompt)}")
+
+        # Store the simplified analysis as critique
+        current_state["retrieval_planner_agent_critique"] = f"Response evaluator-based analysis:\n{optimizer_input}"
 
         # Only update if not frozen
         is_frozen = self._is_prompt_frozen("vector_retrieval_planner", current_state)
@@ -3400,7 +4049,7 @@ Evaluation Feedback:
             current_state["learned_prompt_vector_retrieval_planner"] = optimized_prompt
             print("[BackwardPass] Stored optimized retrieval planner prompt")
 
-        log_critique_result(self.logger, "vector_retrieval_planner", critique, is_frozen)
+        log_critique_result(self.logger, "vector_retrieval_planner", "Response evaluator-based optimization applied", is_frozen)
 
     async def _generate_hyperparameters_critique(self, current_state: Dict[str, Any], ctx: MessageContext) -> None:
         """Generate critique for hyperparameters agent (with skip logic)."""
@@ -3410,7 +4059,7 @@ Evaluation Feedback:
 
         if not all_evaluation_responses:
             current_state["hyperparameters_vector_agent_critique"] = "No critique provided"
-            print("[BackwardPass] No evals — skipping hyperparameters critique")
+            print("[BackwardPass] No evals â€” skipping hyperparameters critique")
             return
 
         # Get current hyperparameters
@@ -3451,7 +4100,7 @@ Evaluation Feedback:
             chunk_size=chunk_size,
             concatenated_triplets=concatenated_triplets,
             previous_critique=previous_critique,
-            response_critique_history=response_critique_history
+            #  response_critique_history=response_critique_history
         )
 
         # Call LLM with structured output
@@ -3463,7 +4112,7 @@ Evaluation Feedback:
         if not critique_response.problem_in_this_component:
             current_state["hyperparameters_vector_agent_critique"] = "No critique provided"
             self.logger.info("Hyperparameters: No problem detected, skipping optimization")
-            print("[BackwardPass] Hyperparameters: no problem — skipping")
+            print("[BackwardPass] Hyperparameters: no problem â€” skipping")
             return
 
         # Problem detected - store critique and optimize
@@ -3631,7 +4280,7 @@ class SummarizerAgent(RoutedAgent):
 
         # Initialize Gemini model client for simple text response
         self.model_client = OpenAIChatCompletionClient(
-            model="gemini-2.5-flash-lite",
+            model="gemini-2.5-flash",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=llm_keys.GEMINI_KEY,
             model_info={
@@ -3686,7 +4335,7 @@ Provide a concise summary that captures all essential information while being si
                 summary = response.content if isinstance(response.content, str) else str(response.content)
                 context_summaries.append(summary)
 
-                self.logger.info(f"Context {i+1} summarized (original: {len(context)} → summary: {len(summary)} chars)")
+                self.logger.info(f"Context {i+1} summarized (original: {len(context)} â†’ summary: {len(summary)} chars)")
 
             # Create concatenated summary
             concatenated_summary = "\n\n--- Context Summary ---\n".join([
@@ -3732,4 +4381,6 @@ def create_backward_pass_agent(critique_token_limit: int = 512) -> BackwardPassA
 def create_summarizer_agent() -> SummarizerAgent:
     """Factory function to create SummarizerAgent instances."""
     return SummarizerAgent("summarizer_agent")
+
+
 

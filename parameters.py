@@ -20,7 +20,8 @@ Please, suggest an appropriate chunk size and provide the reasoning that led to 
 """
 
 
-base_prompt_graph_builder = """
+# Graph builder prompt - Instruction section (can be replaced by learned prompt)
+base_prompt_graph_builder_instruction = """
 # Goal
 You are an expert knowledge graph builder. Your task is to extract entities and relationships from the provided text and structure them into a knowledge graph.
 
@@ -34,71 +35,64 @@ You are an expert knowledge graph builder. Your task is to extract entities and 
 
 4. **Extract Relationships**: Identify meaningful relationships between the entities you've extracted.
 
-5. **Document Evidence**: For each relationship, provide the exact text from the document that supports it.
+5. **Create Triplets**: Express each relationship as a (subject, predicate, object) triplet.
 
-6. **Create Triplets**: Express each relationship as a (subject, predicate, object) triplet.
-
-# Example
-
-This is an abstract example showing the expected output format:
-
-**Entities**:
-- Name: "[entity name as it appears in text]", Type: "[entity type]", Description: "[description based on text]"
-- Name: "[another entity]", Type: "[entity type]", Description: "[description based on text]"
-
-**Relationships**:
-- Source: "[source entity name]", Target: "[target entity name]", Type: "[RELATIONSHIP_TYPE]", Description: "[nature of relationship]", Evidence: "[exact quote from text]"
-- Source: "[entity A]", Target: "[entity B]", Type: "[RELATIONSHIP_TYPE]", Description: "[nature of relationship]", Evidence: "[exact quote from text]"
 
 # Constraints
 - Extract NO MORE than 20 entities and 30 relationships
-- Entity names should match how they appear in the text
-- Descriptions should be factual and based only on information in the text
-- Evidence must be exact quotes from the text
-- All entity names in relationships and triplets must exactly match entity names in the entities list
 
 # Text to Analyze
 
 {}
+"""
 
+# Graph builder prompt - Format section (always stays the same)
+base_prompt_graph_builder_format = """
 # Output Format
 
-You MUST return your response as valid JSON in the following format. Wrap your JSON in ```json code blocks.
+#######Guidelines for detailed, self-contained descriptions:######
 
-```json
-{{
-  "entities": [
-    {{
-      "name": "entity name",
-      "type": "entity type",
-      "description": "concise description of the entity based on the text"
-    }}
-  ],
-  "relationships": [
-    {{
-      "source_entity": "source entity name",
-      "target_entity": "target entity name",
-      "relationship_type": "type of relationship",
-      "description": "why these entities are related",
-      "evidence": "exact text from document supporting this relationship"
-    }}
-  ],
-  "triplets": [
-    {{
-      "subject": "entity name",
-      "predicate": "relationship type",
-      "object": "entity name"
-    }}
-  ],
-  "reasoning": "your reasoning for the extraction"
-}}
-```
+Write clear, standalone descriptions that make sense without knowing the text.
+
+Avoid vague references (“he,” “it,” “this event”) — always specify who, what, and why.
+
+For entities, mention their role, action, or significance in 1–2 sentences.
+
+For relationships, explain why the link exists and what it shows or causes (1 sentence).
+
+Keep descriptions concise but informative enough for an external reader to understand their narrative function.
+
+Esempio minimo da includere nel prompt:
+
+("entity"|The Butcher|Person|"A rebellious child who wishes to restore warfare in a peaceful future society.")
+("relationship"|CAUSES|Self-jabbing|Pain reaction|"The Butcher jabs his hand with a metal tube, causing himself pain.")
+
+
+Return your response as a list of tuples, one per line.
+
+**Entity Format:**
+("entity"<|>entity_name<|>entity_type<|>entity_description)
+
+**Relationship Format:**
+("relationship"<|>relationship_type<|>source_entity<|>target_entity<|>relationship_description)
+
+Where <|> is the tuple delimiter.
+
+**Example Output:**
+("entity"<|>entity_name<|>entity_type<|>description of the entity based on the text)
+("entity"<|>another_entity<|>entity_type<|>description of this entity based on the text)
+("relationship"<|>RELATIONSHIP_TYPE<|>source_entity<|>target_entity<|>description of why these entities are related)
+("relationship"<|>ANOTHER_RELATIONSHIP_TYPE<|>entity_A<|>entity_B<|>description of their relationship)
 
 IMPORTANT:
-- All entity names in relationships and triplets must exactly match entity names in the entities list
-- Evidence must be direct quotes from the text
-- Return ONLY the JSON, no additional text outside the code block
+- Each tuple must be on a separate line
+- Entity names in relationships must exactly match entity names defined in entity tuples
+- Include clear descriptions!
+- Return ONLY the tuples, no additional text or explanations
 """
+
+# Combined base prompt (for backward compatibility and initial use)
+base_prompt_graph_builder = base_prompt_graph_builder_instruction + base_prompt_graph_builder_format
 
 
 base_prompt_graph_refinement = """
@@ -177,6 +171,8 @@ class Entity(BaseModel):
     name: str
     type: str
     description: str
+    first_seen_iteration: int = 0  # Track when entity was first discovered
+    last_updated_iteration: int = 0  # Track when entity was last updated
 
 
 class Relationship(BaseModel):
@@ -186,6 +182,8 @@ class Relationship(BaseModel):
     relationship_type: str
     description: str
     evidence: str = ""  # Optional, defaults to empty string for tuple format
+    first_seen_iteration: int = 0  # Track when relationship was first discovered
+    last_updated_iteration: int = 0  # Track when relationship was last updated
 
 
 class Triplet(BaseModel):
@@ -224,35 +222,28 @@ Provide the list of community IDs you want to retrieve and explain your reasonin
 """
 
 base_prompt_vector_retrieval_planner = """
-You are an agentic retrieval component of a RAG system. Your goal is to generate a query to retrieve relevant information from the knowledge base.
+You need to generate two things to help retrieve information for answering the question:
 
-Query to answer: {}
+1. A retrieval query
+2. A hypothetical document (~150 words) that represents what an ideal retrieved passage might look like given the retrieval query you chose.
+
+For the hypothetical document:
+- Write it as if it were an actual excerpt from a document
+- REPRODUCE THE NARRATIVE STYLE of the story/text you are retrieving from
+- Match the tone, voice, and writing style of the original text
+- Take inspiration from the text already retrieved (if any)
+- Make it concrete and specific (not abstract or generic)
+- Focus on information that would help answer the question
+- Generate approximately 150 words
+
+Question to answer:
+{}
 
 Retrieved summaries so far:
 {}
 
 Previous queries you made:
 {}
-
-Generate a new retrieval query that will retrieve complementary information to help answer the question. Make sure your new query is different from previous queries to gather new perspectives or details.
-
-IMPORTANT GUIDELINES FOR CREATING RETRIEVAL QUERIES:
-When creating a new query for retrieval, follow these rules:
-1. Keep it SHORT: Use only 3-6 words maximum
-2. Use KEYWORDS that are likely to match the actual text (avoid abstract terms like "plot", "theme", "summary")
-3. Include CONTENT WORDS: specific names, places, objects, actions, or concrete concepts mentioned in the original query
-4. Use terms that would actually APPEAR in the source document
-
-Good query examples:
-- "Willard Ghost Ship encounter"
-- "spacemen fuel depletion"
-- "Karl Von Mark plan"
-- "budget allocation workshop"
-
-Bad query examples:
-- "What is the main plot development" (too long, abstract terms)
-- "Analyze the thematic elements" (abstract, won't match text)
-- "Summarize the key points" (too vague)
 """
 
 
@@ -300,6 +291,7 @@ class GraphRetrievalPlannerResponse(BaseModel):
 class VectorRetrievalPlannerResponse(BaseModel):
     model_config = {"extra": "forbid"}
     query: str  # Retrieval query to execute
+    hypothetical_document: str  # Hypothetical document for HyDE retrieval
 
 class RetrievalSummarizerResponse(BaseModel):
     model_config = {"extra": "forbid"}
@@ -333,150 +325,85 @@ This is the information:
 Try to answer the query by exploiting the retrieved information, even if incomplete. Answer only with the response (no additional comment).
 """
 
-# Initial answer generation prompt (iteration 0) - matches Self-Refine
-answer_generator_initial_prompt = """Based on the following context, answer the question.
+answer_generator_initial_prompt = "Provide an answer to the question based on the context."
 
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
-
-# Refinement prompt (iteration > 0) - matches Self-Refine
-answer_generator_refinement_prompt = """Based on the following context, improve your previous answer to the question.
-
-Context:
-{context}
-
-Question: {question}
-
-Previous Answer:
-{previous_answer}
-
-Critique:
-{critique}
-
-Generate an improved answer that addresses the critique:"""
+answer_generator_refinement_prompt = "Provide a concise, factual answer."
 
 # Backward compatibility: keep this for any code that references it
-base_prompt_answer_generator_vector = answer_generator_initial_prompt
+base_prompt_answer_generator_vector = "Provide a concise, factual answer."
 
-response_evaluator_prompt = """You are an expert judge evaluating answers to questions based on learned gold standard patterns.
+response_evaluator_prompt = """You are an expert judge evaluating the answer of a QA system for query-based summarization. 
 
-LEARNED GOLD PATTERNS:
-{satisfactory_criteria}
-
-QUESTION:
-{original_query}
-
-GENERATED ANSWER:
-{generated_answer}
-{unfound_keywords_history}
-
-Your task:
-1. Evaluate if the generated answer follows the learned gold patterns in terms of:
-   - Information extraction and completeness
-   - Factual reporting style and tone
-   - Structure and clarity
-   - Appropriate length and comprehensiveness
-   - Adherence to the guidelines (what to include, what to avoid)
+1. Evaluate the answer in terms of:
+- The retrieved context: Identify any important facts or entities that are missing or underdeveloped in the retrieved context. If any are found, the decision must be NEEDS_REFINEMENT. Are there aspects that are introduced but should be analyzed further to get a more fluent and coherent response?
+- Style: Is the answer satisfactory in terms of style (sufficient length, use of words, coherence, fluency, etc.)
 
 2. Decide if the answer is:
-   - SATISFACTORY: The answer adequately follows the patterns and answers the question well
+   - SATISFACTORY: The answer fully satisfies both criteria (choose this only if the answer is very good, that is, the retrieved context hasn't gaps and the style is perfect)
    - NEEDS_REFINEMENT: The answer has issues and should be improved
 
-
 3. If NEEDS_REFINEMENT, provide a specific, actionable critique explaining:
-   - What is missing or incorrect
-   - What aspects of the gold patterns are not followed
-   - How to improve the answer
+   - Which information is needed to answer the original question and should be included (the feedback is for BOTH the context - retrieval success -, and the answer)
+   - Which information is not relevant or should be omitted from the context (this is for the context phase)
+   - Actionable insights on how to improve the answer (which aspects to include, which style to use) (this is for the answer phase)
+
+Mark SATISFACTORY only if the answer covers all key points in the context and leaves no factual, logical, or stylistic gaps. Otherwise, always choose NEEDS_REFINEMENT.
 
 Output format:
 DECISION: [SATISFACTORY or NEEDS_REFINEMENT]
-CRITIQUE: [Your detailed critique if refinement is needed, or "None" if satisfactory]"""
+CRITIQUE: [Your detailed critique if refinement is needed. If SATISFACTORY, briefly explain why (e.g., answer is complete and well-written).]
+
+The question was the following:
+{original_query}
+
+
+The answer of the system was:
+{generated_answer}
+
+
+When generating the answer, the system had access to the following context:
+{retrieved_context}
+"""
 
 
 # GraphRAG-specific response evaluator prompt with knowledge graph refinement context
-response_evaluator_prompt_graph = """You are evaluating answers for a GraphRAG system based on learned patterns.
+response_evaluator_prompt_graph = """You are an expert judge evaluating the answer of a GraphRAG system for query-based summarization.
 
-LEARNED PATTERNS:
-{satisfactory_criteria}
+1. Reason in the following way:
+CONSIDER ONLY THE COMMUNITY CONTEXT TO ANSWER THE FOLLOWING TWO QUESTIONS:
+- Which information would be needed to answer the question in a fully satisfying way? (CONSIDER AN IDEAL ANSWER TO THE QUESTION, NOT THE ANSWER YOU'RE SEEING)
+- Which of this information (THE ONE NEEDED FOR AN IDEAL ANSWER) is not present in the context? Are there things that are missing or underdeveloped in the community summaries provided in the contexts? Which type of information should the community contexts capture more?
+FOCUS NOT ON THE SPECIFIC INFORMATION, BUT RATHER ON THE TYPE OF INFORMATION LACKING (IF YOU WERE TO BUILD A GRAPH, WHAT ENTITIES/RELATIONSHIPS WOULD YOU INCLUDE?)
+PROVIDE A RICH SET OF ENTITIES/RELATIONSHIPS
 
-QUESTION: {original_query}
+- ONLY NOW, LOOK AT THE ANSWER: Is the answer satisfactory in terms of style (sufficient length, coherence, fluency, etc.)?
 
+2. Decide if the system output is:
+   - SATISFACTORY: Both the COMMUNITY SUMMARIES and the ANSWERS are okay (this means that the community summaries have all the necessary information to an ideal answer, and the answer's style is fine)
+   - NEEDS_REFINEMENT: The output has issues and should be improved (graph extraction AND answer generation will be refined)
 
-ANSWER: {generated_answer}
-{unfound_keywords_history}
+3. If NEEDS_REFINEMENT, provide a specific, actionable critique explaining:
+- Limitations of the community summaries (which type of information should be included, which should be omitted because it's not necessary to answer the question) and the answer
+- Actionable insights on how to improve the answer (which aspects to include, which style to use) (this is for the answer phase)
 
-EVALUATION PRIORITY:
-1. Retrieval sufficiency (specificity, concrete details)
-2. Content completeness
-3. Presentation quality
+Output format (follow this EXACTLY):
+DECISION: [SATISFACTORY or NEEDS_REFINEMENT]
+CRITIQUE: [Your detailed critique if refinement is needed. If SATISFACTORY, briefly explain why (e.g., answer is complete and well-written).]
 
-Default: If keywords could improve the answer → CONTENT_ISSUE
+The question was:
+{original_query}
 
-RETRIEVAL QUALITY CHECK:
-Insufficient retrieval indicators: vague quantifiers ("significant", "several"), generic descriptions, missing entities/numbers/dates, causal gaps, abstract summaries.
+The answer of the system was:
+{generated_answer}
 
-ISSUE CLASSIFICATION:
-
-**SATISFACTORY**: Fully satisfies requirements
-- Set: continue=false, issue_type="satisfactory"
-
-**CONTENT_ISSUE**: Missing information OR insufficient retrieval
-- Set: continue=true, issue_type="content_issue"
-- Provide exactly 4 missing_keywords (named entities preferred)
-- Examples: missing facts/dates/names, vague language
-
-**STYLE_ISSUE**: All information present, only presentation issues
-- Set: continue=true, issue_type="style_issue"
-- DO NOT provide keywords (empty list)
-- Examples: wrong tone, poor structure, formatting issues
-
-WHEN IN DOUBT → Choose CONTENT_ISSUE
-
-LENGTH REQUIREMENT:
-- Descriptive/significance questions: 150-450 words minimum
-- Too short with all info → STYLE_ISSUE
-- Too short due to missing info → CONTENT_ISSUE
-
-═══════════════════════════════════════════════════════════════════
-CRITICAL: KEYWORD SELECTION GUIDELINES (CONTENT_ISSUE only)
-═══════════════════════════════════════════════════════════════════
-
-**PURPOSE**: Keywords are entities that we can focus on to fill the gaps in the current response. Keywords must be one word (2 for proper nouns).
-
-Do not hallucinate keywords: keywords must be entities that are likely to be found in text. 
-Keywords must be proper nouns of characters/places/organizations mentioned in the answer. If they are not found, use other nouns in the answer. Don't hallucinate. 
-Avoid complex phrases. Preferably use proper nouns (like person, organization, etc.).
-
-6. **NO MORE THAN 6 KEYWORDS**: Provide no more than 6 for CONTENT_ISSUE
-
-
-OUTPUT JSON:
-{{
-  "reasoning": "1) Retrieval assessment: [vague language Y/N, check if entities from context are used]. 2) Completeness: [elements present in context but missing in answer]. 3) Decision: [CONTENT_ISSUE if context has info not used OR insufficient retrieval, STYLE_ISSUE if context fully used but poor presentation, SATISFACTORY if both sufficient]",
-  "continue": true/false,
-  "issue_type": "satisfactory"/"content_issue"/"style_issue",
-  "critique": "specific critique if needs refinement, else empty",
-  "missing_keywords": ["keyword1", "keyword2", "keyword3", "keyword4"] or []
-}}
-
-Return ONLY valid JSON."""
-
-
-class IssueType(str, Enum):
-    """Classification of issues found in generated answers."""
-    SATISFACTORY = "satisfactory"
-    CONTENT_ISSUE = "content_issue"  # Missing info, wrong facts → needs graph rebuild
-    STYLE_ISSUE = "style_issue"       # Poor formatting, tone → only answer gen
+When generating the answer, the system had access to the following context:
+{community_context}
+"""
 
 
 class ResponseEvaluationResponse(BaseModel):
     reasoning: str
     continue_optimization: bool = Field(alias="continue")
-    issue_type: IssueType = IssueType.SATISFACTORY  # Classification of the issue
     critique: str
     missing_keywords: List[str] = Field(default_factory=list)
 
@@ -503,24 +430,43 @@ Subgraph description:
 
 Please provide:
 1. A short DESCRIPTION (3-4 rows) that captures the entities/relationships of the community and how they interact
-2. A detailed SUMMARY 
+2. A detailed SUMMARY
 
 Format your response as:
 DESCRIPTION: [your short description here]
 SUMMARY: [your detailed summary here]
 """
 
+base_prompt_community_summarizer_query_focused = """
+You are given a description of a community (subgraph) from a knowledge graph. Your task is to create a title and discursive summary that highlights the key entities and how they interact, with a focus on information relevant to answering a specific query.
+
+Query to answer:
+{query}
+
+Subgraph description:
+{subgraph_description}
+
+Please provide:
+1. A short DESCRIPTION (3-4 rows) that captures the entities/relationships of the community and how they interact
+2. A detailed SUMMARY that focuses on information relevant to the query while maintaining all important details from the graph
+
+IMPORTANT: Do not lose detail. Include all entities and relationships, but emphasize those most relevant to answering the query.
+
+Format your response as:
+DESCRIPTION: [your short description here]
+SUMMARY: [your detailed summary here, focused on query-relevant information]
+"""
+
 
 generation_prompt_gradient_prompt = """
 You are evaluating the prompt used for answer generation in a GraphRAG system.
+Your goal is to evaluate the prompt and propose actionable improvements based on a feedback obtained from the system's output.
+The feedback contains strategies to improve the retrieved content and the style of the answer: FOCUS ONLY ON THE STYLE.
 
 Current answer generation prompt:
 {current_prompt}
 
-Critique from the previous component:
-{previous_critique}
-
-Response evaluator output:
+Feedback from the response evaluation:
 {response_evaluator_output}
 
 Based on this information, determine if there is a problem with the answer generation prompt that needs to be fixed.
@@ -533,21 +479,19 @@ If false, leave the critique empty.
 
 generation_prompt_gradient_prompt_vector = """
 You are evaluating the prompt used for answer generation in a VectorRAG system.
-
-Current answer generation prompt:
-{current_prompt}
-
-Critique from the previous component:
-{previous_critique}
+Provide a critique (what the prompt should include, what it should not) based on the following feedback derived from a previous response of the system.
 
 Response evaluator output:
 {response_evaluator_output}
+
+Current answer generation prompt:
+{current_prompt}
 
 Based on this information, determine if there is a problem with the answer generation prompt that needs to be fixed.
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.
-If true, provide a detailed critique to the prompt reporting what you learned in the previous critique.
+If true, provide a detailed critique to the prompt reporting what you learned in the previous critique. The critique must be actionable: it must include concrete actions that would likely improve the output. 
 If false, leave the critique empty.
 """
 
@@ -593,8 +537,7 @@ DETAILED HISTORY (Question, Context, Answer, Evaluation per Iteration):
 ═══════════════════════════════════════════════════════════════════
 YOUR TASK:
 ═══════════════════════════════════════════════════════════════════
-Based on the information above, provide a detailed critique of how the retrieved content can be improved to better answer the query.
-Focus on: relevance, completeness, quality, and whether the right information was retrieved.
+Based on the information above, provide a detailed critique of how the retrieved content can be improved to better answer the query. The critique must be actionable: it must include concrete actions that would likely improve the output. 
 """
 
 
@@ -615,36 +558,28 @@ Based on this information, provide a critique of how the community selection can
 
 
 retrieval_plan_gradient_prompt_vector = """
-You are evaluating the retrieval plan made by an agentic VectorRAG system.
-The retrieval planner determines what queries to make to the vector database to gather relevant information.
+You are evaluating the retrieval queries made by a VectorRAG system.
 
 ═══════════════════════════════════════════════════════════════════
-RETRIEVAL PLANS:
+QUESTION TO ANSWER:
 ═══════════════════════════════════════════════════════════════════
-{retrieval_plan}
+{question}
 
 ═══════════════════════════════════════════════════════════════════
-CRITIQUE FROM PREVIOUS COMPONENT (Retrieval Summarizer):
+QUERIES AND RETRIEVED CONTENT:
 ═══════════════════════════════════════════════════════════════════
-{previous_critique}
-
-═══════════════════════════════════════════════════════════════════
-DETAILED HISTORY (Question, Context, Answer, Evaluation per Iteration):
-═══════════════════════════════════════════════════════════════════
-{response_critique_history}
+{queries_and_content}
 
 ═══════════════════════════════════════════════════════════════════
 YOUR TASK:
 ═══════════════════════════════════════════════════════════════════
-Based on the information above, provide a detailed critique of how the retrieval plan can be improved.
+1. For each query above, evaluate if the retrieved content helped answer the question or not.
+2. Identify what other queries could have been made to retrieve more helpful information.
 
-The retrieval planner should:
-- Generate relevant, specific queries that target the information needed to answer the question
-- Avoid duplicate or redundant queries that retrieve similar information
-- Progressively refine queries based on what has already been retrieved
-- Cover different aspects of the question comprehensively
-
-Focus on: query relevance, query diversity, avoiding redundancy.
+Provide a detailed, actionable critique that:
+- Analyzes each query individually (was the retrieved content helpful?)
+- Suggests specific alternative or additional queries that would have been more effective
+- Focuses on improving query relevance and information coverage
 """
 
 
@@ -673,7 +608,7 @@ retrieval_planning_prompt_gradient_vector = """
 You are evaluating the prompt used for retrieval planning in an agentic VectorRAG system.
 
 ═══════════════════════════════════════════════════════════════════
-CURRENT RETRIEVAL PLANNING PROMPT (System Prompt):
+CURRENT RETRIEVAL PLANNING PROMPT:
 ═══════════════════════════════════════════════════════════════════
 {current_prompt}
 
@@ -691,21 +626,10 @@ The retrieval planning prompt should guide the model to:
 - Generate specific, targeted queries when more information is needed
 - Avoid redundant queries that retrieve similar information
 
-CRITICAL REQUIREMENTS FOR QUERY CREATION:
-The prompt MUST ensure that retrieval queries are:
-1. SHORT: Only 3-6 words maximum (not full sentences)
-2. KEYWORD-BASED: Use concrete terms that are likely to appear in the actual document text
-3. CONTENT WORDS: Include specific names, places, objects, actions, or concrete concepts from the original question
-4. AVOID ABSTRACT TERMS: Do not use terms like "plot", "theme", "summary", "analyze", "explain" that are unlikely to match document text
-
-Good query examples: "Willard Ghost Ship encounter", "budget allocation workshop", "Karl Von Mark plan"
-Bad query examples: "What is the main plot development", "Analyze the thematic elements", "Summarize key points"
-
-The prompt should emphasize creating queries that will actually MATCH text in the source documents, not abstract analytical queries.
 
 First, provide your reasoning explaining why there is or isn't a problem.
 Then, set problem_in_this_component=true or false accordingly.
-If true, provide a detailed critique to the prompt reporting what you learned in the previous critique.
+If true, provide a detailed critique to the prompt reporting what you learned in the previous critique. 
 If false, leave the critique empty.
 """
 
@@ -728,22 +652,24 @@ Based on this information, provide a critique of how the graph can be improved.
 
 graph_extraction_prompt_gradient_prompt = """
 You are evaluating the prompt used for graph construction in an agentic GraphRAG system.
+The prompt tells the system how to extract entities and relationships. 
+You will be provided with a feedback explaning which information is missing in the graph.
+You have to think: which entities/relationships types would make this information available in the graph?
+Clearly specify the entities and relationship types in your answer. 
+Include only a few entities and relationship types (not more than 6-7). 
+Based on this, you have to identify entities and relationships types that should be included in the graph and are not specified in the current prompt. 
+Focus only on the most crucial entity/relationship types to meet the evaluation requirement. Specify only a few entities/relationships types, the ones that are most important. 
 
-Current graph extraction prompt:
-{current_prompt}
+For each entity/relationship, you have to include examples (each example is a phrase or a sentence)
 
-Critique from the previous component:
-{previous_critique}
 
-Response evaluator output:
+The feedback from the system is:
 {response_evaluator_output}
 
-Based on this information, determine if there is a problem with the graph extraction prompt that needs to be fixed.
+The current prompt is:
+{current_prompt}
 
-First, provide your reasoning explaining why there is or isn't a problem.
-Then, set problem_in_this_component=true or false accordingly.
-If true, provide a critique focusing on the specific issue.
-If false, leave the critique empty.
+Please, determine which entities/relationships the current prompt is missing based on the feedback.
 """
 
 
@@ -770,219 +696,51 @@ If false, leave the critique empty.
 """
 
 answer_generation_prompt_optimizer = """
-You are optimizing a system prompt for answer generation in a GraphRAG system.
+You are optimizing a prompt for answer generation in a GraphRAG system.
 
 The current critique of the answer generation process is:
 {}
 
-Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better generate answers from retrieved graph information. The system prompt should incorporate the feedback to improve answer quality, relevance, and coherence.
+Based on this critique, generate a new prompt that will be used to instruct the LLM how to better generate answers from retrieved graph information. The prompt should incorporate the feedback to improve answer quality, relevance, and coherence.
 
-Provide only the optimized system prompt without additional commentary.
+Provide only the optimized prompt without additional commentary.
+In the prompt, add also the instructions:
+You must base your answer primarily on the information provided in the context below.
+Do not invent or assume facts that are not supported by the context.
+However, if the context provides only partial information, you must still produce the most complete and coherent answer possible by reasoning explicitly from what is given.
+If the information is insufficient to answer directly, explain what can be inferred from the context and what remains unknown, instead of saying that The information is not available.
 """
 
 retrieval_planner_prompt_optimizer = """
-You are optimizing a system prompt for community selection in a community-based GraphRAG system.
+You are optimizing a prompt for community selection in a community-based GraphRAG system.
 
 The current critique of the community selection process is:
 {}
 
-Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better select relevant communities. The system prompt should incorporate the feedback to improve community selection strategy, relevance assessment, and information gathering.
+Based on this critique, generate a new prompt that will be used to instruct the LLM how to better select relevant communities. The prompt should incorporate the feedback to improve community selection strategy, relevance assessment, and information gathering.
 
-Provide only the optimized system prompt without additional commentary.
+Provide only the optimized prompt without additional commentary.
 """
 
 graph_builder_prompt_optimizer = """
-You are optimizing a SYSTEM PROMPT for graph construction and refinement in a GraphRAG system.
-
-CRITICAL ARCHITECTURE CONTEXT:
-Your optimized prompt will be used as a SYSTEM MESSAGE sent to the LLM.
-A separate USER MESSAGE will contain the base prompt with:
-- Abstract format example (showing output structure only, no concrete content)
-- The actual text chunk to analyze
-- Complete tuple output format specification (using <|> delimiter with format: ("entity"<|>name<|>type<|>description) and ("relationship"<|>type<|>source<|>target<|>description))
-- All constraints (max 20 entities, 30 relationships)
-
-The current critique of the graph building process is:
+You are optimizing a PROMPT for graph construction in an agentic GraphRAG system.
+The prompt tells the model which entities/relationships to extract from text to build the graph.
+Include only A FEW entities and relationship types (NOT MORE THAN 10 IN TOTAL). 
+You have to accompany each entity/relationship with a full explanation and some examples. Each example is a phrase or a sentence.
+Your suggestions must be based on this feedback:
 {}
 
 
-**CRITICAL EXTRACTION RULE**: Your optimized prompt MUST make it absolutely clear that the LLM should extract ONLY and EXCLUSIVELY entities and relationships of the specified types. Do NOT allow extraction of any other types, even if they seem important.
 
-MANDATORY STRUCTURE:
-Your prompt MUST follow this exact chain of thought structure:
+Your optimized prompt must only indicate the relationships and entities types to be extracted. 
+Avoid very specific relations. Include textual examples of the semantics of relationships (the examples must be sentences).
+You must not include information about the format of the output (this will be given separately to the system).
+Specify only the relationships and the entities, don't use formatted examples since they can misled the model output format. 
 
-═══════════════════════════════════════════════════════════════════
-SECTION 1: STRATEGIC GUIDANCE (Brief)
-═══════════════════════════════════════════════════════════════════
-Provide 2-3 sentences on:
-- Overall quality expectations (completeness, accuracy, evidence-based)
-- The primary goal of the extraction
-- **CRITICAL**: MUST explicitly state that extraction is STRICTLY LIMITED to ONLY the specified entity and relationship types - NO other types should be extracted under any circumstances
-- Emphasize that extracting types outside the specified list will degrade system performance
-- How to approach the task with disciplined focus on specified types only
+Add also an instruction to the prompt that tells the model to extract only entities and relationships of the given types. 
+In the prompt, specify which 2-3 relationships type the model must focus more. 
 
-═══════════════════════════════════════════════════════════════════
-SECTION 2: ENTITY IDENTIFICATION (Detailed and Structured)
-═══════════════════════════════════════════════════════════════════
-Structure this section as:
-
-**Step 1: Identify Entity Types**
-
-Based on the critique, list the SPECIFIC entity types to extract. For EACH type, provide:
-- Type name (e.g., Person, Organization, Location, Event, Concept)
-- Brief description of what qualifies as this type
-- 2-3 concrete examples
-
-Format:
-- **[Entity Type]**: [Description]
-  - Example: "[Concrete example 1]"
-  - Example: "[Concrete example 2]"
-  - Example: "[Concrete example 3]"
-
-**Step 2: Prioritize Most Important Types**
-
-Explicitly state which entity types are MOST CRITICAL for this task based on the critique.
-Format: "Focus primarily on: [Type1], [Type2], [Type3]"
-
-**Step 3: Entity Extraction Principle**
-
-State the core principle for entity extraction (e.g., "Extract ALL mentioned entities of the prioritized types", "Be exhaustive in identifying entities that drive the narrative")
-
-**MUST INCLUDE**: Explicitly remind the model to extract ONLY entities that match the specified types and to ignore all other entity types.
-
-**CRITICAL CLARIFICATION FOR EVENT ENTITIES:**
-
-If "Event" is one of the specified entity types, you MUST explicitly clarify in your prompt that:
-- Events are ENTITIES, not relationships
-- Events must be extracted as entity tuples: ("entity"<|>event_name<|>Event<|>description)
-- Do NOT confuse events with relationships between entities
-- Events should be extracted as standalone entities that can then participate in relationships with other entities
-
-Example clarification to include:
-"IMPORTANT: Event entities (such as 'The Great War', 'The Exile', 'The Rescue Mission') are ENTITIES and must be extracted using the entity tuple format. Events are not relationships - they are things that happened and should be treated as entities in the graph. However, Events CAN participate in relationships with other entities (e.g., a Person PARTICIPATED_IN an Event, an Event CAUSED another Event, an Event OCCURRED_AT a Location)."
-
-═══════════════════════════════════════════════════════════════════
-SECTION 3: RELATIONSHIP IDENTIFICATION (Detailed and Structured)
-═══════════════════════════════════════════════════════════════════
-Structure this section as:
-
-**Step 1: Identify Relationship Types**
-
-Based on the critique, list the SPECIFIC relationship types to extract. For EACH type, provide:
-- Relationship name (e.g., MOTIVATES, CAUSES, CONFLICTS_WITH)
-- Description of what this relationship means
-- 2-3 concrete examples showing entity pairs connected by this relationship
-
-Format:
-- **[RELATIONSHIP_TYPE]**: [Description]
-  - Example: "[Entity A] [RELATIONSHIP] [Entity B]" - [Brief explanation]
-  - Example: "[Entity C] [RELATIONSHIP] [Entity D]" - [Brief explanation]
-  - Example: "[Entity E] [RELATIONSHIP] [Entity F]" - [Brief explanation]
-
-**Step 2: Prioritize Most Important Relationships**
-
-Explicitly state which relationship types are MOST CRITICAL for this task based on the critique.
-Format: "Focus primarily on: [REL1], [REL2], [REL3]"
-
-**Step 3: Relationship Extraction Principle**
-
-State the core principle for relationship extraction (e.g., "Focus on causal chains", "Prioritize relationships that explain narrative progression")
-
-**MUST INCLUDE**: Explicitly remind the model to extract ONLY relationships that match the specified types and to ignore all other relationship types.
-
-═══════════════════════════════════════════════════════════════════
-SECTION 4: EXTRACTION DIRECTIVE (Clear and Direct)
-═══════════════════════════════════════════════════════════════════
-Provide a clear, direct, unambiguous instruction that tells the model:
-
-"When analyzing the text, extract ONLY and EXCLUSIVELY:
-1. Entities of types: [list ALL the specified types from SECTION 2]
-2. Relationships of types: [list ALL the specified types from SECTION 3]
-
-**ABSOLUTE RESTRICTION - NO EXCEPTIONS:**
-- Extract ONLY entities that match the specified entity types listed above
-- Extract ONLY relationships that match the specified relationship types listed above
-- DO NOT extract ANY entities or relationships that fall outside these specified categories
-- Ignore all other entity types and relationship types, even if they appear highly important or central to the text
-- The system is designed to work with these specific types ONLY - extracting other types will severely degrade performance
-- DO NOT infer or create new entity/relationship types beyond those specified
-- When in doubt, if an entity or relationship doesn't clearly fit the specified types, DO NOT extract it"
-
-═══════════════════════════════════════════════════════════════════
-SECTION 5: FEW-SHOT EXAMPLES (2-3 Examples)
-═══════════════════════════════════════════════════════════════════
-Provide 2-3 concrete examples that demonstrate proper extraction.
-
-**CRITICAL**: All examples MUST use the exact tuple format with <|> delimiter. This is NOT optional.
-**This applies to BOTH graph construction AND graph refinement** - the tuple format is mandatory in all cases.
-
-For EACH example:
-1. Provide a short text snippet (2-4 sentences)
-2. Show extracted entities and relationships in TUPLE FORMAT using the <|> delimiter
-3. EVERY entity and relationship in the example MUST be in tuple format - no other format is acceptable
-4. Use the exact tuple schemas: ("entity"<|>name<|>type<|>description) and ("relationship"<|>type<|>source<|>target<|>description)
-
-**CRITICAL RULES FOR EXAMPLES:**
-- **MANDATORY FORMAT**: EVERY extracted entity and relationship in examples MUST use the exact tuple format with <|> delimiter
-- Entity tuple format: ("entity"<|>name<|>type<|>description)
-- Relationship tuple format: ("relationship"<|>type<|>source<|>target<|>description)
-- DO show what entities and relationships to extract
-- DO show how to describe entities and relationships
-- DO use concrete, specific examples from realistic scenarios
-- DO NOT use abstract placeholders like "[entity_name]" - use actual names
-- DO NOT use any other format (no JSON, no bullet lists, no prose descriptions)
-- Focus on demonstrating WHAT to extract and WHY those elements matter
-- **IF Event is an entity type: At least ONE example MUST show an Event entity participating in a relationship with another entity** (e.g., Person PARTICIPATED_IN Event, Event CAUSED Event, Event OCCURRED_AT Location)
-
-**MANDATORY Example Format - NO EXCEPTIONS:**
-**Example [N]:**
-Text: "[Your example text here - 2-4 sentences of realistic content]"
-
-Extracted Output:
-("entity"<|>EntityName1<|>EntityType<|>Description of this entity based on the text)
-("entity"<|>EntityName2<|>EntityType<|>Description of this entity based on the text)
-("relationship"<|>RELATIONSHIP_TYPE<|>EntityName1<|>EntityName2<|>Description of why these entities are related)
-
-IMPORTANT: Every single entity and relationship in your examples MUST be shown in this exact tuple format. Do not deviate from this format.
-
-**Special Note for Event Examples:**
-If Event is an entity type, include at least one example like:
-("entity"<|>The Battle of Midway<|>Event<|>A decisive naval battle in 1942)
-("entity"<|>Admiral Yamamoto<|>Person<|>Japanese naval commander)
-("relationship"<|>COMMANDED<|>Admiral Yamamoto<|>The Battle of Midway<|>Admiral Yamamoto commanded Japanese forces during the Battle of Midway)
-
-═══════════════════════════════════════════════════════════════════
-
-CRITICAL REQUIREMENTS:
-1. Follow the 5-section structure EXACTLY
-2. Provide concrete examples for EACH entity type you specify (at least 2-3 examples per type)
-3. Provide concrete examples for EACH relationship type you specify (at least 2-3 examples per type)
-4. **Make it ABSOLUTELY CLEAR that extraction is LIMITED to ONLY the specified types**:
-   - Your prompt MUST explicitly forbid extraction of any entity or relationship types not in the specified list
-   - Use strong, unambiguous language: "ONLY", "EXCLUSIVELY", "DO NOT extract other types"
-   - State the consequence: extracting unspecified types degrades system performance
-5. **SECTION 5 examples MUST use tuple format with <|> delimiter - MANDATORY, NO EXCEPTIONS**
-   - **This applies to BOTH graph construction AND graph refinement - tuple format is ALWAYS required**
-   - Every single entity MUST be: ("entity"<|>name<|>type<|>description)
-   - Every single relationship MUST be: ("relationship"<|>type<|>source<|>target<|>description)
-   - Do NOT use any other format (no JSON, no bullet lists, no prose)
-6. Examples should use concrete entity names (not abstract placeholders) to demonstrate realistic extraction
-7. Base all priorities on the critique provided
-8. Be specific about which types to prioritize (don't say "all" or "any")
-9. **If Event is an entity type, MUST include:**
-   a) Explicit clarification that Events are entities (not relationships) and must be extracted as entity tuples
-   b) At least ONE concrete example in SECTION 5 showing an Event entity participating in a relationship with another entity (in tuple format)
-
-**FINAL CRITICAL REMINDER**:
-Your optimized prompt must make it CRYSTAL CLEAR that the LLM should extract ONLY and EXCLUSIVELY entities and relationships of the specified types. This restriction must be stated explicitly in:
-- SECTION 1 (Strategic Guidance)
-- SECTION 2 Step 3 (Entity Extraction Principle)
-- SECTION 3 Step 3 (Relationship Extraction Principle)
-- SECTION 4 (Extraction Directive)
-
-Use strong, unambiguous language throughout. The LLM must understand that extracting ANY entity or relationship types outside the specified list is strictly forbidden and will degrade system performance.
-
-Provide only the optimized system prompt without additional commentary.
+Provide only the optimized prompt without additional commentary.
 """
 
 community_summarizer_gradient_prompt = """
@@ -1006,12 +764,12 @@ If false, leave the critique empty.
 """
 
 community_summarizer_prompt_optimizer = """
-You are optimizing a system prompt for community summarization in a GraphRAG system.
+You are optimizing a prompt for community summarization in a GraphRAG system.
 
 The current critique of the community summarization process is:
 {}
 
-Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better summarize graph communities. The system prompt should incorporate the feedback to improve summary quality, relevance, and informativeness.
+Based on this critique, generate a new prompt that will be used to instruct the LLM how to better summarize graph communities. The prompt should incorporate the feedback to improve summary quality, relevance, and informativeness.
 
 The prompt should instruct the LLM to:
 1. Identify key entities and their relationships within the community
@@ -1019,37 +777,41 @@ The prompt should instruct the LLM to:
 3. Provide sufficient detail for query answering
 4. Maintain clarity and conciseness
 
-Provide only the optimized system prompt without additional commentary.
+Provide only the optimized prompt without additional commentary.
 """
 
 answer_generation_prompt_optimizer_vector = """
-You are optimizing a prompt for answer generation in a RAG system, and you have to make it as much adherent as possible to the following critique.
+You are optimizing a prompt for answer generation in a RAG system. The prompt must be general, but it also has to be as much adherent as possible to the following critique.
 
 The current critique of the answer generation process is:
 {}
 
-Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better generate answers from retrieved vector information. The system prompt should incorporate the feedback to improve answer quality, relevance, and coherence.
+Based on this critique, generate a new prompt that will be used to instruct the LLM how to better generate answers from retrieved vector information. The prompt should incorporate the feedback to improve answer quality, relevance, and coherence.
+The prompt must be actionable: it must include concrete actions that would likely improve the output. 
 
-Provide only the optimized system prompt without additional commentary.
+Provide only the optimized prompt without additional commentary.
 """
 
 retrieval_planner_prompt_optimizer_vector = """
-You are optimizing a system prompt for retrieval planning in a vector RAG system.
+You are optimizing a prompt for a QUERY PLANNER in a vector RAG system.
 
-The current critique of the retrieval planning process is:
+IMPORTANT CLARIFICATION:
+- The planner you are optimizing generates QUERIES for a vector database
+- The planner does NOT control the retrieval/embedding mechanism itself
+- Your instructions should focus on how to formulate better QUERIES, not how embeddings work
+
+You will receive:
+1. The original question to answer
+2. The queries that were made
+3. A critique of the retrieval plan identifying what worked and what needs to be improved. 
+
 {}
 
-Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better plan vector retrieval strategies. The system prompt should incorporate the feedback to improve query refinement, search strategy, and information gathering.
+Based on this information, generate an optimized prompt that instructs the query planner how to create better queries.
 
-IMPORTANT: The system prompt MUST emphasize that retrieval queries should be:
-1. SHORT (3-6 words maximum)
-2. KEYWORD-BASED (concrete terms likely to appear in actual document text)
-3. CONTENT WORDS (specific names, places, objects, actions, or concrete concepts)
-4. AVOID ABSTRACT TERMS (like "plot", "theme", "summary", "analyze")
+Your prompt MUST include instruction to make queries that target the missing information, and to repeat queries that have worked in the past.
 
-The system prompt should instruct the model to create queries that will actually MATCH text in source documents, not abstract analytical queries.
-
-Provide only the optimized system prompt without additional commentary.
+Provide only the optimized prompt as instructions for the query planner, without additional commentary.
 """
 
 retrieval_summarizer_prompt_gradient_vector = """
@@ -1057,7 +819,7 @@ You are evaluating the prompt used for chunk summarization in a VectorRAG system
 Each retrieved chunk of text is processed by a summarizer that generates a summary based on the prompt below.
 
 ═══════════════════════════════════════════════════════════════════
-CURRENT RETRIEVAL SUMMARIZER PROMPT (System Prompt):
+CURRENT RETRIEVAL SUMMARIZER PROMPT :
 ═══════════════════════════════════════════════════════════════════
 {current_prompt}
 
@@ -1088,25 +850,25 @@ If false, leave the critique empty.
 """
 
 retrieval_summarizer_prompt_optimizer_vector = """
-You are optimizing a system prompt for document summarization in a vector RAG system.
+You are optimizing a prompt for document summarization in a vector RAG system.
 
 The current critique of the retrieval summarization process is:
 {}
 
-Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better summarize retrieved documents. The system prompt should incorporate the feedback to improve summarization quality, relevance focus, and information extraction.
+Based on this critique, generate a new prompt that will be used to instruct the LLM how to better summarize retrieved documents. The prompt should incorporate the feedback to improve summarization quality, relevance focus, and information extraction.
 
-Provide only the optimized system prompt without additional commentary.
+Provide only the optimized prompt without additional commentary.
 """
 
 hyperparameters_vector_agent_prompt_optimizer = """
-You are optimizing a system prompt for hyperparameter selection in a vector RAG system.
+You are optimizing a prompt for hyperparameter selection in a vector RAG system.
 
 The current critique of the hyperparameter selection process is:
 {}
 
-Based on this critique, generate a new system prompt that will be used to instruct the LLM how to better determine optimal chunk sizes for vector construction. The system prompt should incorporate the feedback to improve hyperparameter reasoning and selection.
+Based on this critique, generate a new prompt that will be used to instruct the LLM how to better determine optimal chunk sizes for vector construction. The system prompt should incorporate the feedback to improve hyperparameter reasoning and selection.
 
-Provide only the optimized system prompt without additional commentary.
+Provide only the optimized prompt without additional commentary.
 """
 
 prompt_optimizer_prompt = """
@@ -1131,4 +893,9 @@ Incorporate the criticism, and produce a new prompt.
 #   "0,1"   - Use depths 0 and 1
 #   "1,2"   - Use depths 1 and 2
 default_community_levels = "top"  # Default: second level (depth 1) provides good balance
+
+# Community data mode: Toggle between raw graph data and summarized version
+# "raw": Pass raw markdown graph data directly to community answer agents (bypasses summarization)
+# "summarized": Use traditional summarization (LLM generates summary, then answer agents use it)
+COMMUNITY_DATA_MODE = "raw"  # Options: "raw" or "summarized"
 

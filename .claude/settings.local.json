@@ -10,7 +10,8 @@
       "Bash(awk:*)",
       "Bash(pip install:*)",
       "Bash(timeout:*)",
-      "Bash(mv:*)"
+      "Bash(mv:*)",
+      "Bash(cp:*)"
     ],
     "deny": [],
     "ask": []

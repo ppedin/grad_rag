@@ -18,7 +18,10 @@ from enum import Enum
 class SystemType(Enum):
     """RAG system types."""
     GRAPHRAG = "graphrag"
+    GRAPHRAG_ANSWER_ONLY = "graphrag_answer_only"
+    GRAPHRAG_ONE_LEVEL = "graphrag_one_level"  # One-level variant: same prompt for all iterations
     VECTORRAG = "vectorrag"
+    VECTORRAG_ANSWER_ONLY = "vectorrag_answer_only"
     ALLCONTEXT = "allcontext"
 
 
@@ -301,10 +304,10 @@ class StandardizedEvaluationLogger:
             }
 
         # System-specific fields
-        if self.system_type == SystemType.GRAPHRAG:
+        if self.system_type in [SystemType.GRAPHRAG, SystemType.GRAPHRAG_ANSWER_ONLY, SystemType.GRAPHRAG_ONE_LEVEL]:
             if "graph_building" in outputs:
                 standardized["graph_building"] = outputs["graph_building"]
-        else:  # VectorRAG
+        else:  # VectorRAG or AllContext
             if "vector_building" in outputs:
                 standardized["vector_building"] = outputs["vector_building"]
 

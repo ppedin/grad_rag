@@ -1,7 +1,7 @@
 from neo4j import GraphDatabase
 
 
-def format_subgraph_to_string(nodes, relationships=None, relationships_explored=True):
+def format_subgraph_to_string(nodes, relationships=None, relationships_explored=True, format_style="markdown"):
     """
     Convert a subgraph (nodes and relationships) to the standard string format using actual node names.
 
@@ -9,6 +9,7 @@ def format_subgraph_to_string(nodes, relationships=None, relationships_explored=
         nodes (list): List of node dictionaries with properties and labels
         relationships (list, optional): List of relationship dictionaries
         relationships_explored (bool): Whether relationships were explored (default True)
+        format_style (str): Format style - "markdown" (default) or "legacy"
 
     Returns:
         dict: Formatted result with graph_string and metadata
@@ -154,13 +155,72 @@ def format_subgraph_to_string(nodes, relationships=None, relationships_explored=
             else:
                 connections.append(f"The connections of Node {name} have not been explored yet.")
 
-    if connections:
-        graph_string = f"{graph_desc} In this graph: {' '.join(connections)}"
+    # Generate final output based on format style
+    if format_style == "markdown":
+        # Generate markdown format
+        entity_sections = []
+
+        for name in sorted_names:
+            node = name_to_node[name]
+            lines = []
+
+            # Entity header
+            lines.append(f"### {name}")
+
+            # Type
+            node_type = node.get('type', 'undefined')
+            lines.append(f"**Type:** {node_type}")
+
+            # Properties
+            properties = []
+            for key, value in node.items():
+                if key not in ['name', 'id', 'labels', 'type'] and value:
+                    properties.append((key, value))
+
+            if properties:
+                lines.append("**Properties:**")
+                for key, value in properties:
+                    lines.append(f"- {key}: {value}")
+
+            # Relations
+            if adjacency[name]:
+                lines.append("")
+                lines.append("**Relations:**")
+
+                for neighbor in sorted(adjacency[name].keys()):
+                    rel_infos = adjacency[name][neighbor]
+
+                    for rel_info in rel_infos:
+                        # Use description if available, otherwise construct natural language
+                        if rel_info['description']:
+                            relation_text = rel_info['description']
+                        else:
+                            relation_text = f"Connected to {neighbor} via {rel_info['type']}"
+
+                        # Add evidence if available
+                        if rel_info['evidence']:
+                            relation_text += f" (Evidence: {rel_info['evidence']})"
+
+                        lines.append(f"- {relation_text}")
+            elif relationships_explored:
+                lines.append("")
+                lines.append("**Relations:**")
+                lines.append("- No connections")
+
+            entity_sections.append('\n'.join(lines))
+
+        # Join all entities with separators
+        graph_string = "## Entities\n\n" + '\n\n---\n\n'.join(entity_sections)
+
     else:
-        if relationships_explored:
-            graph_string = f"{graph_desc} No connections exist between nodes."
+        # Legacy format (existing code)
+        if connections:
+            graph_string = f"{graph_desc} In this graph: {' '.join(connections)}"
         else:
-            graph_string = f"{graph_desc} The connections between nodes have not been explored yet."
+            if relationships_explored:
+                graph_string = f"{graph_desc} No connections exist between nodes."
+            else:
+                graph_string = f"{graph_desc} The connections between nodes have not been explored yet."
 
     return {
         "graph_string": graph_string,

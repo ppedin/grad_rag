@@ -1,4 +1,4 @@
-"""
+﻿"""
 Shared state management for AutoGen agents.
 """
 
@@ -49,7 +49,12 @@ class SharedState:
             "graph_statistics": {},
             "vector_statistics": [],  # Vector statistics for VectorRAG
             "full_document_text": "",  # Document text that should persist through iterations
-            "example_information": {}   # Example information that should persist through iterations
+            "example_information": {},   # Example information that should persist through iterations
+            "last_graph_response": {},  # Graph cache for answer-only mode
+            "last_useful_community_answers": [],  # Community answers cache
+            "community_summaries": {}  # Community summaries cache
+            # NOTE: Accumulated graph data now uses QA-specific keys (accumulated_graph_entities_{qa_pair_id})
+            # and is NOT in default_state - it's added dynamically per QA pair
         }
 
         # QA pair level tracking
@@ -163,8 +168,23 @@ class SharedState:
         Returns:
             bool: True if successful, False otherwise
         """
+        # DEBUG: Track QA-specific keys being saved
+        qa_specific_keys = [k for k in state.keys() if k.startswith("last_useful_community_answers_")]
+        if qa_specific_keys:
+            print(f"[SAVE-STATE] Saving state with QA-specific keys: {qa_specific_keys}")
+        else:
+            # Check if we're about to overwrite a state that HAD these keys
+            cache_key = f"{dataset}_{setting}_{batch_id}"
+            if cache_key in self._state_cache:
+                old_qa_keys = [k for k in self._state_cache[cache_key].keys() if k.startswith("last_useful_community_answers_")]
+                if old_qa_keys:
+                    import traceback
+                    print(f"[SAVE-STATE] ⚠️ WARNING: Overwriting state that had {old_qa_keys}, new state doesn't have them!")
+                    print(f"[SAVE-STATE] Call stack:")
+                    for line in traceback.format_stack()[-5:-1]:
+                        print(f"  {line.strip()}")
+
         # Update cache first (performance optimization)
-        cache_key = f"{dataset}_{setting}_{batch_id}"
         self._state_cache[cache_key] = state.copy()
 
         state_file = self.get_state_file_path(dataset, setting, batch_id)
@@ -202,7 +222,8 @@ class SharedState:
     def load_state_fresh(self, dataset: str, setting: str, batch_id: int = None) -> Dict[str, Any]:
         """Force reload state from disk, bypassing the in-memory cache."""
         self.invalidate_cache(dataset, setting, batch_id)
-        return self.load_state(dataset, setting, batch_id)
+        state = self.load_state(dataset, setting, batch_id)
+        return state
 
     def get_all_states(self, dataset: str, setting: str) -> List[Dict[str, Any]]:
         """
@@ -266,6 +287,23 @@ class SharedState:
             fresh_state["document_index"] = current_state["document_index"]
         fresh_state["batch_information"] = current_state.get("batch_information", {})
 
+        # Preserve ALL QA-specific backup keys from other QA pairs
+        # This allows each QA pair to restore its own graph data after another QA pair resets
+        backup_keys_preserved = []
+        for key, value in current_state.items():
+            if isinstance(key, str) and (key.startswith("last_graph_response_") or
+                                         key.startswith("community_summaries_") or
+                                         key.startswith("last_useful_community_answers_") or
+                                         key.startswith("accumulated_graph_entities_") or
+                                         key.startswith("accumulated_graph_relationships_") or
+                                         key.startswith("accumulated_graph_triplets_") or
+                                         key.startswith("graph_iteration_history_")):
+                fresh_state[key] = value
+                backup_keys_preserved.append(key)
+
+        if backup_keys_preserved:
+            print(f"[RESET-NEW-QA] Preserved {len(backup_keys_preserved)} backup keys from other QA pairs (including accumulated graphs)")
+
         # CRITICAL FIX: Explicitly clear all learned prompt keys to prevent leakage between QA pairs
         learned_prompt_keys = [
             "learned_prompt_hyperparameters_vector",
@@ -278,6 +316,18 @@ class SharedState:
         ]
         for key in learned_prompt_keys:
             fresh_state[key] = ""
+
+        # CRITICAL FIX: Explicitly clear all cached context summary keys to prevent cross-contamination
+        # This ensures no context summaries from previous QA pairs leak into the new QA pair
+        context_keys_cleared = []
+        for key in list(current_state.keys()):
+            if isinstance(key, str) and key.startswith("retrieved_context_"):
+                # Don't copy this key to fresh_state - effectively clearing it
+                context_keys_cleared.append(key)
+
+        if context_keys_cleared:
+            print(f"[COMPLETE-RESET] Cleared {len(context_keys_cleared)} cached context keys from previous QA pairs")
+            print(f"  Cleared keys: {context_keys_cleared[:5]}..." if len(context_keys_cleared) > 5 else f"  Cleared keys: {context_keys_cleared}")
 
         # Reset QA pair level tracking
         self.current_qa_pair_id = qa_pair_id
@@ -309,10 +359,15 @@ class SharedState:
             "iteration_start_time": datetime.now().isoformat()
         })
 
+        # CRITICAL: Ensure current_qa_pair_id is in the state dictionary
+        fresh_state["current_qa_pair_id"] = qa_pair_id
+        fresh_state["current_iteration"] = 0
+
         # Save fresh state
         self.save_state(fresh_state, dataset, setting, batch_id)
 
         print(f"COMPLETE RESET: Starting new QA pair {qa_pair_id} (iteration 0)")
+        print(f"  Set current_qa_pair_id in state: {qa_pair_id}")
         return fresh_state
 
     def reset_for_new_iteration(self, qa_pair_id: str, iteration: int, dataset: str, setting: str, batch_id: int = None) -> Dict[str, Any]:
@@ -333,6 +388,22 @@ class SharedState:
         # Force fresh load to ensure we preserve latest flags/prompts from previous iteration
         current_state = self.load_state_fresh(dataset, setting, batch_id)
 
+        print(f"\n[RESET-START] reset_for_new_iteration called for QA: {qa_pair_id}, iteration: {iteration}")
+        print(f"[RESET-START] Keys with 'retrieved_context_' BEFORE reset: {[k for k in current_state.keys() if k.startswith('retrieved_context_')]}")
+
+        # DEBUG: Check graph response preservation
+        has_graph = "last_graph_response" in current_state
+        is_empty = not current_state.get("last_graph_response", {}) if has_graph else True
+        print(f"[RESET-DEBUG] last_graph_response in current_state: {has_graph}")
+        if has_graph:
+            graph_data = current_state.get("last_graph_response")
+            print(f"[RESET-DEBUG] last_graph_response type: {type(graph_data)}")
+            print(f"[RESET-DEBUG] last_graph_response is empty: {not graph_data}")
+            if isinstance(graph_data, dict):
+                print(f"[RESET-DEBUG] last_graph_response keys: {list(graph_data.keys())[:10]}")
+        else:
+            print(f"[RESET-DEBUG] last_graph_response NOT FOUND in current_state!")
+
         # Archive previous iteration data
         self._archive_iteration_data(qa_pair_id, self.current_iteration, current_state, dataset, setting, batch_id)
 
@@ -348,8 +419,7 @@ class SharedState:
             new_state["document_index"] = current_state["document_index"]
         new_state["batch_information"] = current_state.get("batch_information", {})
 
-        # Preserve missing keywords from previous iteration's evaluation for focused refinement
-        new_state["missing_keywords_for_refinement"] = current_state.get("missing_keywords_for_refinement", [])
+        # Note: Keyword mechanism removed - now always refining entire corpus
 
         # Preserve all response evaluations from previous iterations
         new_state["response_evaluations"] = current_state.get("response_evaluations", [])
@@ -365,10 +435,80 @@ class SharedState:
         new_state["last_useful_community_answers"] = current_state.get("last_useful_community_answers", [])
         new_state["community_summaries"] = current_state.get("community_summaries", {})
 
+        # Preserve accumulated graph data across iterations (CRITICAL for graph merging)
+        # Preserve ALL QA-specific accumulated graph keys to avoid cross-contamination
+        for key, value in current_state.items():
+            if isinstance(key, str) and (
+                key.startswith("accumulated_graph_entities_") or
+                key.startswith("accumulated_graph_relationships_") or
+                key.startswith("accumulated_graph_triplets_") or
+                key.startswith("graph_iteration_history_")
+            ):
+                new_state[key] = value
+
         # Preserve continue_optimization and issue_type flags for all QA pairs
         for key, value in current_state.items():
             if key.startswith("continue_optimization_") or key.startswith("issue_type_"):
                 new_state[key] = value
+        # Preserve retrieved indices from previous iterations to enable overlap computation
+        # Keys are of the form: retrieved_indices_qa_{qa_pair_id}_rep_{iteration}
+        for key, value in current_state.items():
+            try:
+                if isinstance(key, str) and key.startswith("retrieved_indices_qa_"):
+                    new_state[key] = value
+            except Exception:
+                # Best-effort preservation; ignore any unexpected key types
+                pass
+
+        # Preserve cached retrieved contexts for answer-only optimization
+        # Keys are of the form: retrieved_context_summaries_{qa_pair_id}, concatenated_context_summary_{qa_pair_id}
+        # CRITICAL FIX: Only preserve keys that match the CURRENT qa_pair_id to prevent cross-contamination
+        cached_contexts_found = []
+        for key, value in current_state.items():
+            try:
+                if isinstance(key, str) and key.startswith("retrieved_context_"):
+                    # Check if key contains the current QA pair ID
+                    if qa_pair_id in key:
+                        new_state[key] = value
+                        cached_contexts_found.append(key)
+                    else:
+                        # Skip keys from other QA pairs to prevent cross-contamination
+                        print(f"[RESET-SKIP] Skipped context key from different QA pair: {key}")
+            except Exception:
+                # Best-effort preservation; ignore any unexpected key types
+                pass
+
+        if cached_contexts_found:
+            print(f"[RESET-PRESERVE] Preserved cached context keys for QA {qa_pair_id}: {cached_contexts_found}")
+
+        # CRITICAL FIX: Preserve QA-specific backup keys for answer-only optimization
+        # Keys are of the form: last_graph_response_{qa_pair_id}, community_summaries_{qa_pair_id}, last_useful_community_answers_{qa_pair_id}
+        # These backup keys allow restoration when a new QA pair's reset overwrites the shared keys
+
+        # DEBUG: Show all keys in current_state to diagnose preservation issues
+        all_keys = list(current_state.keys())
+        answer_keys = [k for k in all_keys if 'answer' in k.lower()]
+        community_keys = [k for k in all_keys if 'community' in k.lower()]
+        print(f"[RESET-DEBUG] Total keys in current_state: {len(all_keys)}")
+        print(f"[RESET-DEBUG] Keys with 'answer': {answer_keys}")
+        print(f"[RESET-DEBUG] Keys with 'community': {community_keys[:5]}")
+
+        qa_backup_keys_found = []
+        for key, value in current_state.items():
+            try:
+                if isinstance(key, str) and (key.startswith("last_graph_response_") or
+                                            key.startswith("community_summaries_") or
+                                            key.startswith("last_useful_community_answers_")):
+                    new_state[key] = value
+                    qa_backup_keys_found.append(key)
+                    print(f"[RESET-PRESERVE] Preserving key: {key} (type: {type(value)}, size: {len(value) if isinstance(value, (list, dict)) else 'N/A'})")
+            except Exception as e:
+                print(f"[RESET-ERROR] Failed to preserve key {key}: {e}")
+
+        if qa_backup_keys_found:
+            print(f"[RESET-PRESERVE] Total preserved QA-specific backup keys: {len(qa_backup_keys_found)}")
+        else:
+            print(f"[RESET-WARNING] NO QA-specific backup keys found to preserve!")
 
         # Preserve system prompts from previous iteration if they exist
         if qa_pair_id in self.qa_pair_prompts:
@@ -404,10 +544,16 @@ class SharedState:
             "iteration_start_time": datetime.now().isoformat()
         })
 
+        # CRITICAL: Ensure current_qa_pair_id is preserved in the state dictionary
+        new_state["current_qa_pair_id"] = qa_pair_id
+        new_state["current_iteration"] = iteration
+
         # Save state
+        print(f"[RESET-END] Keys with 'retrieved_context_' AFTER reset: {[k for k in new_state.keys() if k.startswith('retrieved_context_')]}")
         self.save_state(new_state, dataset, setting, batch_id)
 
         print(f"ITERATION RESET: Starting iteration {iteration} of QA pair {qa_pair_id} (preserving system prompts)")
+        print(f"  Preserved current_qa_pair_id in state: {qa_pair_id}")
         return new_state
 
     def update_qa_pair_prompts(self, qa_pair_id: str, optimized_prompts: Dict[str, str]):
@@ -539,3 +685,4 @@ class SharedState:
                 print(f"Error clearing graph directory: {e}")
 
         print(f"Graph data cleared for {dataset}_{setting}")
+
