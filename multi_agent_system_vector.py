@@ -2013,7 +2013,7 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         # Initialize Gemini client directly (not using Autogen wrapper)
         self.gemini_client = genai.Client(api_key=llm_keys.GEMINI_KEY)
         self.gemini_model = "gemini-2.5-flash-lite"
-        self.thinking_budget = 1024
+        self.thinking_budget = 0
 
         # Convert Pydantic schema to dict and remove additionalProperties (Gemini doesn't support it)
         response_schema_dict = VectorRetrievalPlannerResponse.model_json_schema()
@@ -2355,7 +2355,6 @@ For the hypothetical document (~150 words):
                     additional_metadata={
                         "iteration": iteration + 1,
                         "query": retrieval_response.query,
-                        "hypothetical_document": retrieval_response.hypothetical_document,
                         "query_history_length": len(query_history)
                     }
                 )
@@ -2365,16 +2364,14 @@ For the hypothetical document (~150 words):
                 retrieval_plan_responses.append(query_summary)
                 query_history.append(retrieval_response.query)
 
-                # Print HyDE information
+                # Print retrieval information
                 print(f"\n{'='*80}")
                 print(f"ITERATION {iteration + 1}/{MAX_ITERATIONS} - QA {message.qa_pair_id}")
                 print(f"{'='*80}")
                 print(f"Query: {retrieval_response.query}")
-                print(f"\nHypothetical Document:")
-                print(f"{retrieval_response.hypothetical_document}")
                 print(f"{'='*80}\n")
 
-                # Execute hybrid search with the hypothetical document (HyDE method)
+                # Execute hybrid search
                 # Pass used_document_indices to get only new documents
                 retrieved_documents = await self._execute_vector_search(
                     retrieval_response.query,
@@ -2382,8 +2379,7 @@ For the hypothetical document (~150 words):
                     chunk_metadata,
                     k=CHUNKS_PER_ITERATION,
                     used_document_indices=used_document_indices,
-                    bm25_index=bm25_index,
-                    hypothetical_document=retrieval_response.hypothetical_document
+                    bm25_index=bm25_index
                 )
 
                 # Log the retrieval to dedicated file
@@ -2393,7 +2389,7 @@ For the hypothetical document (~150 words):
                     setting=message.setting,
                     iteration=iteration + 1,
                     query=retrieval_response.query,
-                    hypothetical_doc=retrieval_response.hypothetical_document,
+                    hypothetical_doc="",  # No longer used
                     retrieved_docs=retrieved_documents
                 )
 
@@ -2607,19 +2603,19 @@ For the hypothetical document (~150 words):
 
     async def _execute_vector_search(self, query: str, faiss_index, chunk_metadata, k: int = 5, used_document_indices: set = None, bm25_index=None, hypothetical_document: str = None) -> List[Dict[str, Any]]:
         """
-        Execute hybrid retrieval with MMR re-ranking using HyDE method:
+        Execute hybrid retrieval with MMR re-ranking:
         1. Retrieve 50 candidates using BM25 + FAISS hybrid search
         2. Apply MMR (Maximal Marginal Relevance) to diversify results
         3. Return top k documents
 
         Args:
-            query: Query string (used for BM25 keyword search)
+            query: Query string (used for BM25 keyword search and embedding)
             faiss_index: FAISS index
             chunk_metadata: Metadata for chunks
             k: Number of final documents to retrieve (default: 5)
             used_document_indices: Set of FAISS indices already in context
             bm25_index: BM25 index for keyword search (optional)
-            hypothetical_document: Hypothetical document for HyDE embedding (if None, uses query)
+            hypothetical_document: (Deprecated - no longer used)
 
         Returns:
             List of k unique documents (or fewer if not enough exist)
@@ -2637,11 +2633,10 @@ For the hypothetical document (~150 words):
             initial_k = 50  # Retrieve more candidates for re-ranking
             self.logger.info(f"Stage 1: Hybrid retrieval (BM25 + FAISS) retrieving {initial_k} candidates for query: {query[:50]}...")
 
-            # 1. Get FAISS scores for all documents using query (not hypothetical document)
-            # NOTE: HyDE is still generated but we use the query for retrieval
+            # 1. Get FAISS scores for all documents using query
             from llm import get_embeddings_async
-            text_to_embed = query  # Always use query, not hypothetical_document
-            self.logger.info(f"Embedding query for retrieval (HyDE generated but not used)")
+            text_to_embed = query
+            self.logger.info(f"Embedding query for retrieval")
             query_embeddings = await get_embeddings_async([text_to_embed])
             query_vector = np.array(query_embeddings[0]).astype('float32').reshape(1, -1)
             faiss.normalize_L2(query_vector)
@@ -2810,11 +2805,11 @@ For the hypothetical document (~150 words):
         return selected
 
     async def _faiss_only_search(self, query: str, faiss_index, chunk_metadata, k: int, used_document_indices: set, hypothetical_document: str = None) -> List[Dict[str, Any]]:
-        """Fallback to FAISS-only search when BM25 is not available, using query (not HyDE)."""
+        """Fallback to FAISS-only search when BM25 is not available."""
         try:
             from llm import get_embeddings_async
-            text_to_embed = query  # Always use query, not hypothetical_document
-            self.logger.info(f"FAISS-only: Embedding query for retrieval (HyDE generated but not used)")
+            text_to_embed = query
+            self.logger.info(f"FAISS-only: Embedding query for retrieval")
             query_embeddings = await get_embeddings_async([text_to_embed])
             query_vector = np.array(query_embeddings[0]).astype('float32').reshape(1, -1)
             faiss.normalize_L2(query_vector)

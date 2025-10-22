@@ -228,19 +228,10 @@ Provide the list of community IDs you want to retrieve and explain your reasonin
 base_prompt_vector_retrieval_planner = """
 You are a query agent in a rag system and your goal is to generate sub-queries to retrieve context useful to answer the question, based on the question, the context retrieved so far, and the previous queries.
 Avoid retrieving previous sub-queries.
-You need to generate two things to help retrieve information for answering the question:
 
-1. A retrieval sub-query (avoid previous sub-queries)
-2. A hypothetical document (~150 words) that represents what an ideal retrieved passage might look like given the retrieval query you chose.
-
-For the hypothetical document:
-- Write it as if it were an actual excerpt from a document
-- REPRODUCE THE NARRATIVE STYLE of the story/text you are retrieving from
-- Match the tone, voice, and writing style of the original text
-- Take inspiration from the text already retrieved (if any)
-- Make it concrete and specific (not abstract or generic)
-- Focus on information that would help answer the question
-- Generate approximately 150 words
+Provide:
+1. Reasoning: Explain what information you're trying to find and why
+2. Query: A focused retrieval sub-query that will help find relevant information
 
 Question to answer:
 {}
@@ -298,8 +289,8 @@ class GraphRetrievalPlannerResponse(BaseModel):
 
 class VectorRetrievalPlannerResponse(BaseModel):
     model_config = {"extra": "forbid"}
+    reasoning: str  # Reasoning behind the retrieval query
     query: str  # Retrieval query to execute
-    hypothetical_document: str  # Hypothetical document for HyDE retrieval
 
 class RetrievalSummarizerResponse(BaseModel):
     model_config = {"extra": "forbid"}
