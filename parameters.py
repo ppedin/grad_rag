@@ -48,13 +48,17 @@ You are an expert knowledge graph builder. Your task is to extract entities and 
 
 # Graph builder prompt - Format section (always stays the same)
 base_prompt_graph_builder_format = """
+# Previous Graph Data
+
+{previous_graph_data}
+
 # Output Format
 
 #######Guidelines for detailed, self-contained descriptions:######
 
 Write clear, standalone descriptions that make sense without knowing the text.
 
-Avoid vague references (“he,” “it,” “this event”) — always specify who, what, and why.
+Avoid vague references ("he," "it," "this event") — always specify who, what, and why.
 
 For entities, mention their role, action, or significance in 1–2 sentences.
 
@@ -222,9 +226,11 @@ Provide the list of community IDs you want to retrieve and explain your reasonin
 """
 
 base_prompt_vector_retrieval_planner = """
+You are a query agent in a rag system and your goal is to generate sub-queries to retrieve context useful to answer the question, based on the question, the context retrieved so far, and the previous queries.
+Avoid retrieving previous sub-queries.
 You need to generate two things to help retrieve information for answering the question:
 
-1. A retrieval query
+1. A retrieval sub-query (avoid previous sub-queries)
 2. A hypothetical document (~150 words) that represents what an ideal retrieved passage might look like given the retrieval query you chose.
 
 For the hypothetical document:
@@ -244,6 +250,8 @@ Retrieved summaries so far:
 
 Previous queries you made:
 {}
+
+AVOID REPEATING PREVIOUS QUERIES YOU MADE. 
 """
 
 
@@ -332,26 +340,31 @@ answer_generator_refinement_prompt = "Provide a concise, factual answer."
 # Backward compatibility: keep this for any code that references it
 base_prompt_answer_generator_vector = "Provide a concise, factual answer."
 
-response_evaluator_prompt = """You are an expert judge evaluating the answer of a QA system for query-based summarization. 
+response_evaluator_prompt = """You are an expert judge evaluating both the **retrieved context** and the **generated answer** for completeness, coherence, and overall quality.
 
-1. Evaluate the answer in terms of:
-- The retrieved context: Identify any important facts or entities that are missing or underdeveloped in the retrieved context. If any are found, the decision must be NEEDS_REFINEMENT. Are there aspects that are introduced but should be analyzed further to get a more fluent and coherent response?
-- Style: Is the answer satisfactory in terms of style (sufficient length, use of words, coherence, fluency, etc.)
+Your task:
+1. **Context Evaluation:**  
+   - First, imagine an *ideal, fully satisfying answer* to the question — one that captures all key facts, causal and temporal connections, character motivations, outcomes, and thematic meaning.  
+   - Then compare this ideal answer with the retrieved context. Identify what information, links, or nuances are **missing, underdeveloped, ambiguous, or irrelevant**.  
+   - Note any missing elements that would prevent a reader from forming a complete understanding or that weaken the logical or emotional flow of the narrative.
 
-2. Decide if the answer is:
-   - SATISFACTORY: The answer fully satisfies both criteria (choose this only if the answer is very good, that is, the retrieved context hasn't gaps and the style is perfect)
-   - NEEDS_REFINEMENT: The answer has issues and should be improved
+2. **Answer Evaluation:**  
+   - Assess whether the answer uses the available context effectively.  
+   - Evaluate **clarity, coherence, factual accuracy, completeness, and narrative flow**.  
+   - Check if it connects events and entities logically, avoids contradictions, and reads fluently in tone and length.
 
-3. If NEEDS_REFINEMENT, provide a specific, actionable critique explaining:
-   - Which information is needed to answer the original question and should be included (the feedback is for BOTH the context - retrieval success -, and the answer)
-   - Which information is not relevant or should be omitted from the context (this is for the context phase)
-   - Actionable insights on how to improve the answer (which aspects to include, which style to use) (this is for the answer phase)
+**Decision:**  
+- **SATISFACTORY:** The context includes all major information and connections needed for an ideal answer, and the answer expresses them clearly and coherently.  
+- **NEEDS_REFINEMENT:** Any important fact, relation, or narrative link is missing, unclear, or the answer lacks fluency, structure, or accuracy.
 
-Mark SATISFACTORY only if the answer covers all key points in the context and leaves no factual, logical, or stylistic gaps. Otherwise, always choose NEEDS_REFINEMENT.
+**Critique must include:**  
+1. What an *ideal answer* would contain that is not fully supported by the context.  
+2. Which parts of the context are irrelevant or insufficient.  
+3. How the answer could improve in factual precision, logical or causal connections, completeness, and stylistic quality.
 
-Output format:
-DECISION: [SATISFACTORY or NEEDS_REFINEMENT]
-CRITIQUE: [Your detailed critique if refinement is needed. If SATISFACTORY, briefly explain why (e.g., answer is complete and well-written).]
+**Output format:**  
+DECISION: [SATISFACTORY or NEEDS_REFINEMENT]  
+CRITIQUE: [detailed explanation]
 
 The question was the following:
 {original_query}
@@ -651,7 +664,7 @@ Based on this information, provide a critique of how the graph can be improved.
 
 
 graph_extraction_prompt_gradient_prompt = """
-You are evaluating the prompt used for graph construction in an agentic GraphRAG system.
+You are evaluating the prompt given to a LLM to enrich a given graph with the information extracted from the text.
 The prompt tells the system how to extract entities and relationships. 
 You will be provided with a feedback explaning which information is missing in the graph.
 You have to think: which entities/relationships types would make this information available in the graph?
@@ -661,7 +674,6 @@ Based on this, you have to identify entities and relationships types that should
 Focus only on the most crucial entity/relationship types to meet the evaluation requirement. Specify only a few entities/relationships types, the ones that are most important. 
 
 For each entity/relationship, you have to include examples (each example is a phrase or a sentence)
-
 
 The feedback from the system is:
 {response_evaluator_output}
@@ -723,24 +735,18 @@ Provide only the optimized prompt without additional commentary.
 """
 
 graph_builder_prompt_optimizer = """
-You are optimizing a PROMPT for graph construction in an agentic GraphRAG system.
-The prompt tells the model which entities/relationships to extract from text to build the graph.
-Include only A FEW entities and relationship types (NOT MORE THAN 10 IN TOTAL). 
+Your goal is to generate an instruction for a LLM that enriches a graph using information from the text. 
+The instruction must have the following format: "Focus on:" + LIST OF ENTITY/RELATIONSHIP TYPES
+The instruction tells the model which entities/relationships types to expand the graph with.
+Include only A FEW entities and relationship types (NOT MORE THAN 6-7 IN TOTAL). 
 You have to accompany each entity/relationship with a full explanation and some examples. Each example is a phrase or a sentence.
+Specify only the relationships and the entities, don't use formatted examples since they can misled the model output format. 
+
+
 Your suggestions must be based on this feedback:
 {}
 
-
-
-Your optimized prompt must only indicate the relationships and entities types to be extracted. 
-Avoid very specific relations. Include textual examples of the semantics of relationships (the examples must be sentences).
-You must not include information about the format of the output (this will be given separately to the system).
-Specify only the relationships and the entities, don't use formatted examples since they can misled the model output format. 
-
-Add also an instruction to the prompt that tells the model to extract only entities and relationships of the given types. 
-In the prompt, specify which 2-3 relationships type the model must focus more. 
-
-Provide only the optimized prompt without additional commentary.
+Provide only the instruction additional commentary.
 """
 
 community_summarizer_gradient_prompt = """
@@ -793,25 +799,29 @@ Provide only the optimized prompt without additional commentary.
 """
 
 retrieval_planner_prompt_optimizer_vector = """
-You are optimizing a prompt for a QUERY PLANNER in a vector RAG system.
+You are optimizing a prompt for a query agent in a vector RAG system.
 
 IMPORTANT CLARIFICATION:
-- The planner you are optimizing generates QUERIES for a vector database
+- The planner you are optimizing asks the model to generate a sub-query to answer the question, based on the context retrieved so far and the previous sub-queries.
 - The planner does NOT control the retrieval/embedding mechanism itself
-- Your instructions should focus on how to formulate better QUERIES, not how embeddings work
+- Your instructions should focus on which aspects a sub-query must target
 
 You will receive:
 1. The original question to answer
-2. The queries that were made
+2. The sub-queries that were made
 3. A critique of the retrieval plan identifying what worked and what needs to be improved. 
 
 {}
 
-Based on this information, generate an optimized prompt that instructs the query planner how to create better queries.
+Based on this information, generate an optimized prompt that instructs the query agent to create a good sub-query.
 
-Your prompt MUST include instruction to make queries that target the missing information, and to repeat queries that have worked in the past.
+Your prompt MUST include instruction to make a sub-query that target the missing information.
 
-Provide only the optimized prompt as instructions for the query planner, without additional commentary.
+Provide only the optimized prompt as instructions for the query planner, without additional commentary. Introduce the prompt by explaining the role "Your goal is to generate a sub-query for a rag system, based on the missing information in the context retrieved so far and the previous queries."
+Generate a full optimized prompt (not partial additions) that will replace the current one used by the query agent. 
+Clearly specify that each sub-query must be targeted and cover ONE ASPECT. Avoid dense subqueries such as: 
+"Detail the immediate aftermath of Captain Dietrich's capture by the Misty Ones, clarifying how Doctor Von Mark, despite a near-fatal arrow wound, survived and orchestrated the encounter with Dietrich. Explain how Captain Dietrich's fragmented memories fully coalesce during this confrontation, directly shaping his final actions and motivations, particularly in thwarting Von Mark's specific plan to utilize an 'invisible material' for Earth's conquest, and provide a clear resolution to this central conflict"
+MAKE IT CLEAR THAT THE SYSTEM MUST AVOID PREVIOUS QUERIES. 
 """
 
 retrieval_summarizer_prompt_gradient_vector = """

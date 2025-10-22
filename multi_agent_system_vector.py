@@ -126,7 +126,7 @@ class VectorRetrievalStartMessage(BaseModel):
     query: str
     dataset: str
     setting: str
-    k_iterations: int = 5
+    k_iterations: int = 6
     shared_state: Dict[str, Any]
 
 class VectorRetrievalReadyMessage(BaseModel):
@@ -2010,25 +2010,74 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         # Import response formats and prompts
         from parameters import base_prompt_vector_retrieval_planner, VectorRetrievalPlannerResponse
 
-        # Initialize Gemini model client with structured output
-        self.model_client = OpenAIChatCompletionClient(
-            model="gemini-2.5-flash-lite",
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            api_key=llm_keys.GEMINI_KEY,
-            model_info={
-                "vision": False,
-                "function_calling": True,
-                "json_output": True,
-                "family": "unknown",
-                "structured_output": True,
-            },
-            response_format=VectorRetrievalPlannerResponse
-        )
+        # Initialize Gemini client directly (not using Autogen wrapper)
+        self.gemini_client = genai.Client(api_key=llm_keys.GEMINI_KEY)
+        self.gemini_model = "gemini-2.5-flash-lite"
+        self.thinking_budget = 1024
+
+        # Convert Pydantic schema to dict and remove additionalProperties (Gemini doesn't support it)
+        response_schema_dict = VectorRetrievalPlannerResponse.model_json_schema()
+        if "additionalProperties" in response_schema_dict:
+            del response_schema_dict["additionalProperties"]
+        self.response_schema = response_schema_dict
 
         self.base_prompt_vector_retrieval_planner = base_prompt_vector_retrieval_planner
         # In-memory cache of last iteration's retrieved FAISS indices per QA
         # Keyed by dataset::setting::qa_pair_id -> List[int]
         self._last_indices_cache = {}
+
+        # In-memory cache of query history across system iterations
+        # Keyed by dataset::setting::qa_pair_id -> List[str]
+        self._query_history_cache = {}
+
+        # In-memory cache of cumulative context across system iterations
+        # Keyed by dataset::setting::qa_pair_id::iterN -> str (context text)
+        self._cumulative_context_cache = {}
+
+        # In-memory cache of cumulative retrieved indices across system iterations
+        # Keyed by dataset::setting::qa_pair_id::cumulative_indices -> List[int]
+        self._cumulative_indices_cache = {}
+
+    def _log_retrieval(self, qa_pair_id: str, dataset: str, setting: str, iteration: int,
+                       query: str, hypothetical_doc: str, retrieved_docs: list) -> None:
+        """Log retrieval query and retrieved chunks to a dedicated file."""
+        import os
+        from datetime import datetime
+
+        # Create logs directory if it doesn't exist
+        log_dir = "retrieval_logs"
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Create log file path: retrieval_logs/{dataset}_{setting}_{qa_pair_id}.txt
+        log_file = os.path.join(log_dir, f"{dataset}_{setting}_{qa_pair_id}.txt")
+
+        # Prepare log entry
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"\n{'='*100}\n"
+        log_entry += f"RETRIEVAL ITERATION {iteration}\n"
+        log_entry += f"Timestamp: {timestamp}\n"
+        log_entry += f"{'='*100}\n\n"
+        log_entry += f"QUERY:\n{query}\n\n"
+        log_entry += f"{'-'*100}\n"
+        log_entry += f"RETRIEVED CHUNKS ({len(retrieved_docs)} total):\n"
+        log_entry += f"{'-'*100}\n\n"
+
+        if retrieved_docs:
+            for i, doc in enumerate(retrieved_docs, 1):
+                chunk_text = doc.get('text', '')
+                faiss_idx = doc.get('faiss_index', 'N/A')
+                score = doc.get('score', 0.0)
+                log_entry += f"CHUNK {i}:\n"
+                log_entry += f"  FAISS Index: {faiss_idx}\n"
+                log_entry += f"  Score: {score:.4f}\n"
+                log_entry += f"  Content:\n{chunk_text}\n\n"
+                log_entry += f"{'-'*100}\n\n"
+        else:
+            log_entry += "No chunks retrieved.\n\n"
+
+        # Write to file (append mode)
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
 
     @message_handler
     async def handle_vector_retrieval_start(self, message: VectorRetrievalStartMessage, ctx: MessageContext) -> VectorRetrievalReadyMessage:
@@ -2073,48 +2122,95 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
         # Initialize retrieval context and plan responses
         retrieved_context = ""
         retrieval_plan_responses = []
-        query_history = []  # Track history of queries made
+
+        # Track history of queries made - initialize from cache if available
+        cache_key = message.dataset + '::' + message.setting + '::' + message.qa_pair_id
+        query_history = []
+
+        # Load previous system iteration's query history from cache
+        if message.repetition > 0:
+            cached_query_history = self._query_history_cache.get(cache_key, [])
+            if cached_query_history:
+                query_history = list(cached_query_history)  # Make a copy
+                print(f'[QUERY-HISTORY] Loaded {len(query_history)} queries from previous system iteration for QA {message.qa_pair_id}')
+                self.logger.info(f"Loaded {len(query_history)} queries from previous system iteration")
+            else:
+                print(f'[QUERY-HISTORY] No cached query history found for QA {message.qa_pair_id}')
+        else:
+            print(f'[QUERY-HISTORY] Repetition 0 - starting with empty query history for QA {message.qa_pair_id}')
+
         all_selected_documents = []  # Track all selected documents across iterations
-        used_document_indices = set()  # Track FAISS indices of already-retrieved documents to avoid duplicates
+        used_document_indices = set()  # Will be initialized below
         query_content_pairs = []  # Track query -> retrieved content pairs for backward pass
 
-        # Pre-populate with first two chunks as starting point
-        print(f"\n{'='*80}")
-        print(f"PRE-POPULATING CONTEXT WITH FIRST TWO CHUNKS - QA {message.qa_pair_id}")
-        print(f"{'='*80}")
-
-        if chunk_metadata and len(chunk_metadata) >= 2:
-            initial_chunks = []
-            for i in range(2):
-                chunk_doc = {
-                    'index': i,
-                    'faiss_index': i,
-                    'score': 1.0,  # Initial chunks have max score
-                    'text': chunk_metadata[i]["text"],
-                    'initial_chunk': True
-                }
-                initial_chunks.append(chunk_doc)
-                used_document_indices.add(i)
-                all_selected_documents.append(chunk_doc)
-
-                # Print initial chunks
-                chunk_text = chunk_metadata[i]["text"]
-                display_text = chunk_text[:500] + "..." if len(chunk_text) > 500 else chunk_text
-                print(f"Initial Chunk {i+1} (FAISS index: {i}):")
-                print(f"{display_text}")
-                print(f"{'-'*80}")
-
-            # Format initial chunks for context
-            chunk_parts = []
-            for i, doc in enumerate(initial_chunks, 1):
-                chunk_text = doc.get('text', '')
-                chunk_parts.append(f"Document {i}:\n{chunk_text}")
-            retrieved_context = "Initial context:\n" + "\n\n".join(chunk_parts)
-
-            self.logger.info(f"Pre-populated context with first 2 chunks (indices 0, 1)")
-            print(f"{'='*80}\n")
+        # ========== LOAD CUMULATIVE INDICES (Initialize exclusion set) ==========
+        # Initialize used_document_indices with ALL previous iterations' indices
+        # This will be passed to _execute_vector_search which filters based on these indices
+        cumulative_indices_key = f"{cache_key}::cumulative_indices"
+        if message.repetition > 0:
+            cached_cumulative_indices = self._cumulative_indices_cache.get(cumulative_indices_key, [])
+            used_document_indices = set(cached_cumulative_indices)
+            print(f"[CUMULATIVE-CONTEXT] Initialized used_document_indices with {len(used_document_indices)} indices from previous iterations")
         else:
-            self.logger.warning(f"Not enough chunks available for pre-population (found {len(chunk_metadata) if chunk_metadata else 0})")
+            used_document_indices = set()
+            print(f"[CUMULATIVE-CONTEXT] Iteration 0: Initialized empty used_document_indices")
+
+        # Pre-populate with first two chunks as starting point (only in iteration 0)
+        if message.repetition == 0:
+            print(f"\n{'='*80}")
+            print(f"PRE-POPULATING CONTEXT WITH FIRST TWO CHUNKS - QA {message.qa_pair_id}")
+            print(f"{'='*80}")
+
+            if chunk_metadata and len(chunk_metadata) >= 2:
+                initial_chunks = []
+                for i in range(2):
+                    chunk_doc = {
+                        'index': i,
+                        'faiss_index': i,
+                        'score': 1.0,  # Initial chunks have max score
+                        'text': chunk_metadata[i]["text"],
+                        'initial_chunk': True
+                    }
+                    initial_chunks.append(chunk_doc)
+                    used_document_indices.add(i)
+                    all_selected_documents.append(chunk_doc)
+
+                    # Print initial chunks
+                    chunk_text = chunk_metadata[i]["text"]
+                    display_text = chunk_text[:500] + "..." if len(chunk_text) > 500 else chunk_text
+                    print(f"Initial Chunk {i+1} (FAISS index: {i}):")
+                    print(f"{display_text}")
+                    print(f"{'-'*80}")
+
+                # Format initial chunks for context
+                chunk_parts = []
+                for i, doc in enumerate(initial_chunks, 1):
+                    chunk_text = doc.get('text', '')
+                    chunk_parts.append(f"Document {i}:\n{chunk_text}")
+                retrieved_context = "Initial context:\n" + "\n\n".join(chunk_parts)
+
+                self.logger.info(f"Pre-populated context with first 2 chunks (indices 0, 1)")
+                print(f"{'='*80}\n")
+            else:
+                self.logger.warning(f"Not enough chunks available for pre-population (found {len(chunk_metadata) if chunk_metadata else 0})")
+        else:
+            # In iterations > 0, load cumulative context from cache
+            print(f"\n{'='*80}")
+            print(f"LOADING CUMULATIVE CONTEXT FROM PREVIOUS ITERATIONS - QA {message.qa_pair_id}")
+            print(f"{'='*80}")
+
+            # Load all contexts from previous iterations
+            all_previous_contexts = []
+            for prev_iter in range(message.repetition):
+                context_key = f"{cache_key}::iter{prev_iter}"
+                prev_context = self._cumulative_context_cache.get(context_key, "")
+                if prev_context:
+                    all_previous_contexts.append(prev_context)
+                    print(f"[CUMULATIVE-CONTEXT] Loaded context from iteration {prev_iter} ({len(prev_context)} chars)")
+
+            retrieved_context = "\n\n".join(all_previous_contexts)
+            print(f"[CUMULATIVE-CONTEXT] Total cumulative context: {len(retrieved_context)} chars from {len(all_previous_contexts)} iterations")
+            print(f"{'='*80}\n")
 
         # Load previous system iteration's retrieved indices for overlap tracking
         previous_system_iteration_indices = None
@@ -2181,7 +2277,7 @@ class VectorRetrievalPlannerAgent(RoutedAgent):
 
         # Execute retrieval iterations (fixed number)
         # TODO: Make this a hyperparameter
-        MAX_ITERATIONS = 9
+        MAX_ITERATIONS = 6
         CHUNKS_PER_ITERATION = 1
 
         for iteration in range(MAX_ITERATIONS):
@@ -2227,18 +2323,24 @@ For the hypothetical document (~150 words):
                     f"Previous queries you made:\n{history_text}"
                 )
 
-                # Create messages (no system prompt)
-                user_message = UserMessage(content=user_prompt_content, source="user")
+                # Call Gemini API directly with thinking budget
+                from parameters import VectorRetrievalPlannerResponse
 
-                response = await self.model_client.create(
-                    [user_message],
-                    cancellation_token=ctx.cancellation_token
+                response = self.gemini_client.models.generate_content(
+                    model=self.gemini_model,
+                    contents=user_prompt_content,
+                    config=types.GenerateContentConfig(
+                        thinking_config=types.ThinkingConfig(
+                            thinking_budget=self.thinking_budget
+                        ),
+                        response_mime_type="application/json",
+                        response_schema=self.response_schema
+                    )
                 )
 
-                # Parse structured response
-                assert isinstance(response.content, str)
-                from parameters import VectorRetrievalPlannerResponse
-                retrieval_response = VectorRetrievalPlannerResponse.model_validate_json(response.content)
+                # Parse structured response from Gemini
+                response_text = response.text
+                retrieval_response = VectorRetrievalPlannerResponse.model_validate_json(response_text)
 
                 # Log LLM interaction
                 logger = get_global_prompt_logger()
@@ -2247,7 +2349,7 @@ For the hypothetical document (~150 words):
                     interaction_type="retrieval_planning",
                     system_prompt="",
                     user_prompt=user_prompt_content,
-                    llm_response=response.content,
+                    llm_response=response_text,
                     qa_pair_id=message.qa_pair_id,
                     iteration=message.repetition,
                     additional_metadata={
@@ -2282,6 +2384,17 @@ For the hypothetical document (~150 words):
                     used_document_indices=used_document_indices,
                     bm25_index=bm25_index,
                     hypothetical_document=retrieval_response.hypothetical_document
+                )
+
+                # Log the retrieval to dedicated file
+                self._log_retrieval(
+                    qa_pair_id=message.qa_pair_id,
+                    dataset=message.dataset,
+                    setting=message.setting,
+                    iteration=iteration + 1,
+                    query=retrieval_response.query,
+                    hypothetical_doc=retrieval_response.hypothetical_document,
+                    retrieved_docs=retrieved_documents
                 )
 
                 # Format raw document chunks to add to context (NO SUMMARIZATION)
@@ -2422,6 +2535,19 @@ For the hypothetical document (~150 words):
             print(f"[VectorRAG - QA {message.qa_pair_id}] {overlap_msg}")
             self.logger.info(overlap_msg)
 
+        # ========== SAVE CUMULATIVE CONTEXT AND INDICES ==========
+        # Save current iteration's context to cumulative context cache
+        context_key = f"{cache_key}::iter{message.repetition}"
+        self._cumulative_context_cache[context_key] = retrieved_context
+        print(f"[CUMULATIVE-CONTEXT] Saved context for iteration {message.repetition} ({len(retrieved_context)} chars)")
+        self.logger.info(f"Saved cumulative context for iteration {message.repetition}")
+
+        # Save cumulative indices (all indices from all iterations up to now)
+        cumulative_indices_key = f"{cache_key}::cumulative_indices"
+        self._cumulative_indices_cache[cumulative_indices_key] = list(used_document_indices)
+        print(f"[CUMULATIVE-CONTEXT] Saved cumulative indices: {len(used_document_indices)} total indices")
+        self.logger.info(f"Saved {len(used_document_indices)} cumulative indices")
+
         # Return VectorRetrievalReady message with modified state
         retrieval_ready_msg = VectorRetrievalReadyMessage(
             batch_id=message.batch_id,
@@ -2433,6 +2559,11 @@ For the hypothetical document (~150 words):
         )
 
         self.logger.info(f"Returning VectorRetrievalReady for batch {message.batch_id}")
+
+        # Save query history to cache for next system iteration
+        self._query_history_cache[cache_key] = list(query_history)
+        print(f'[QUERY-HISTORY] Saved {len(query_history)} queries to cache for QA {message.qa_pair_id}')
+        self.logger.info(f"Saved {len(query_history)} queries to cache for next iteration")
 
         # Return the retrieval ready message
         return retrieval_ready_msg
@@ -2506,11 +2637,11 @@ For the hypothetical document (~150 words):
             initial_k = 50  # Retrieve more candidates for re-ranking
             self.logger.info(f"Stage 1: Hybrid retrieval (BM25 + FAISS) retrieving {initial_k} candidates for query: {query[:50]}...")
 
-            # 1. Get FAISS scores for all documents using HyDE method
-            # If hypothetical_document is provided, embed it instead of the query
+            # 1. Get FAISS scores for all documents using query (not hypothetical document)
+            # NOTE: HyDE is still generated but we use the query for retrieval
             from llm import get_embeddings_async
-            text_to_embed = hypothetical_document if hypothetical_document else query
-            self.logger.info(f"HyDE: Embedding {'hypothetical document' if hypothetical_document else 'query'} for retrieval")
+            text_to_embed = query  # Always use query, not hypothetical_document
+            self.logger.info(f"Embedding query for retrieval (HyDE generated but not used)")
             query_embeddings = await get_embeddings_async([text_to_embed])
             query_vector = np.array(query_embeddings[0]).astype('float32').reshape(1, -1)
             faiss.normalize_L2(query_vector)
@@ -2679,11 +2810,11 @@ For the hypothetical document (~150 words):
         return selected
 
     async def _faiss_only_search(self, query: str, faiss_index, chunk_metadata, k: int, used_document_indices: set, hypothetical_document: str = None) -> List[Dict[str, Any]]:
-        """Fallback to FAISS-only search when BM25 is not available, using HyDE if provided."""
+        """Fallback to FAISS-only search when BM25 is not available, using query (not HyDE)."""
         try:
             from llm import get_embeddings_async
-            text_to_embed = hypothetical_document if hypothetical_document else query
-            self.logger.info(f"HyDE (FAISS-only): Embedding {'hypothetical document' if hypothetical_document else 'query'} for retrieval")
+            text_to_embed = query  # Always use query, not hypothetical_document
+            self.logger.info(f"FAISS-only: Embedding query for retrieval (HyDE generated but not used)")
             query_embeddings = await get_embeddings_async([text_to_embed])
             query_vector = np.array(query_embeddings[0]).astype('float32').reshape(1, -1)
             faiss.normalize_L2(query_vector)
@@ -2710,8 +2841,8 @@ For the hypothetical document (~150 words):
             return []
 
     async def close(self) -> None:
-        """Close the model client."""
-        await self.model_client.close()
+        """Close method - no cleanup needed for direct Gemini API."""
+        pass
 
 
 # ===== RETRIEVAL SUMMARIZER AGENT =====
@@ -4006,16 +4137,9 @@ Based on the response evaluator's feedback, provide:
    - What types of queries would address the issues mentioned in the feedback?
    - What aspects should future queries target to improve the answer?
    - Remember that each query must target a specific part of the text. A good query targets specific content that can be found in a single chunk.
-   - Therefore, if we need complex information, we must rather perform a sequence of targeted queries (since each query will give one single chunk)
 
-2. **RETRIEVAL GAIN INSTRUCTIONS**:
-   - How can the retrieval planner ensure each query brings NEW information?
-   - What should the planner check before making a query to avoid redundancy?
-
-3. **QUERIES THAT WORKED WELL**:
-   - Which of the queries above were effective (if the feedback mentions relevant aspects)?
-   - What made these queries successful?
-
+Your task is not to rate the queries, but to identify what types of new queries would best address the issues raised in the feedback
+Relate your suggestions directly to the user’s original question and the retrieved content, specifying what missing details or narrative connections new queries should aim to uncover
 Provide a clear, actionable analysis."""
 
         combined_analysis = await self._call_llm(analysis_prompt, ctx)

@@ -683,6 +683,7 @@ class BatchOrchestratorAgent(RoutedAgent):
         """Clean up accumulated graph and answers files for completed QA pair."""
         from graph_file_storage import cleanup_accumulated_graph
         from answer_storage import cleanup_accumulated_answers
+        from chunk_graph_storage import get_chunk_graph_storage
 
         try:
             cleanup_accumulated_graph(qa_pair_id, self.current_dataset, self.current_setting)
@@ -693,6 +694,13 @@ class BatchOrchestratorAgent(RoutedAgent):
             cleanup_accumulated_answers(qa_pair_id, self.current_dataset, self.current_setting)
         except Exception as e:
             self.logger.warning(f"Failed to clean up accumulated answers for {qa_pair_id}: {e}")
+
+        # Clean up chunk graph storage
+        try:
+            chunk_storage = get_chunk_graph_storage()
+            chunk_storage.cleanup_qa_pair(self.current_dataset, self.current_setting, self.current_batch_id, qa_pair_id)
+        except Exception as e:
+            self.logger.warning(f"Failed to clean up chunk graph storage for {qa_pair_id}: {e}")
 
     async def _apply_reset_logic(self, qa_pair_id: str, iteration: int, total_iterations: int) -> None:
         """
@@ -1225,50 +1233,18 @@ class BatchOrchestratorAgent(RoutedAgent):
 
         self.logger.info(f"Filtered {len(useful_community_answers)}/{len(community_summaries_dict)} useful community answers")
 
-        # SAVE COMMUNITY ANSWERS TO ACCUMULATED ANSWERS
-        # Format community answers as text for storage
-        from answer_storage import save_accumulated_answers
-
-        community_answers_text = ""
-        for community_ans in useful_community_answers:
-            community_answers_text += f"Community {community_ans['community_id']}:\n"
-            community_answers_text += f"{community_ans['answer']}\n\n"
-
-        print(f"\n💾 About to save accumulated answers:")
-        print(f"  QA Pair: {qa_pair_id}")
-        print(f"  Iteration: {graph_response.repetition}")
-        print(f"  Useful answers: {len(useful_community_answers)}")
-        print(f"  Text length: {len(community_answers_text)} chars")
-
-        save_accumulated_answers(
-            qa_pair_id=qa_pair_id,
-            dataset=graph_response.dataset,
-            setting=graph_response.setting,
-            iteration=graph_response.repetition,
-            community_summaries=community_answers_text  # Actually community answers, not summaries
-        )
-
-        # Console logging for answer accumulation
+        # Console logging
         print(f"[{qa_pair_id}] Iteration {graph_response.repetition} → Generated {len(useful_community_answers)} community answers")
-        print(f"[{qa_pair_id}] Iteration {graph_response.repetition} → Saved {len(useful_community_answers)} community answers to accumulated storage")
 
         # Step 5: Synthesize final answer from useful community answers
-        # IMPORTANT: Even if current iteration has 0 useful answers, still proceed to FinalAnswerGenerator
-        # because accumulated answers from previous iterations should be used
-        if not useful_community_answers and graph_response.repetition == 0:
-            # Only use fallback on iteration 0 when there are truly no answers
-            self.logger.warning("No useful community answers found in iteration 0, using fallback")
+        if not useful_community_answers:
+            self.logger.warning("No useful community answers found, using fallback")
             return AnswerGenerationReadyMessage(
                 qa_pair_id=qa_pair_id,
                 generated_answer="Based on the available information, I cannot provide a comprehensive answer to this question.",
                 batch_id=graph_response.batch_id,
                 repetition=graph_response.repetition
             )
-
-        # For iteration 1+, always proceed even if current iteration has 0 answers
-        # because we want to use accumulated answers from previous iterations
-        if not useful_community_answers:
-            self.logger.info(f"Iteration {graph_response.repetition}: No new useful answers, but will use accumulated answers from previous iterations")
 
         final_answer_msg = FinalAnswerStartMessage(
             qa_pair_id=qa_pair_id,
@@ -2458,17 +2434,39 @@ class GraphBuilderAgent(RoutedAgent):
                 rel.first_seen_iteration = message.repetition
                 rel.last_updated_iteration = message.repetition
 
-            # NO GRAPH MERGING: Keep this iteration's graph separate
-            # Each iteration builds its own independent graph
-            all_entities = new_entities
-            all_relationships = new_relationships
-            all_triplets = new_triplets
+            # GRAPH MERGING: Load accumulated graph from previous iterations and merge
+            from chunk_graph_storage import get_chunk_graph_storage
+            chunk_storage = get_chunk_graph_storage()
 
-            # Console logging for iteration separation
-            # Get QA pair ID from current state for logging
             qa_pair_id_log = current_state.get("current_qa_pair_id", f"batch_{message.batch_id}")
-            print(f"\n[{qa_pair_id_log}] Iteration {message.repetition} → Building separate graph (no merging)")
-            print(f"[{qa_pair_id_log}] Iteration {message.repetition} → Graph: {len(all_entities)} entities, {len(all_relationships)} relationships")
+
+            # Get accumulated graph from all chunks in previous iteration
+            accumulated_graph_data = chunk_storage.get_accumulated_graph(
+                message.dataset, message.setting, message.batch_id,
+                qa_pair_id_log, message.repetition - 1
+            )
+
+            # Convert accumulated entities/relationships from dicts back to Pydantic models
+            from parameters import Entity, Relationship, Triplet
+            previous_entities = []
+            previous_relationships = []
+
+            for ent_dict in accumulated_graph_data.get("entities", []):
+                previous_entities.append(Entity(**ent_dict))
+
+            for rel_dict in accumulated_graph_data.get("relationships", []):
+                previous_relationships.append(Relationship(**rel_dict))
+
+            # Merge: combine previous graph with new additions
+            all_entities = previous_entities + new_entities
+            all_relationships = previous_relationships + new_relationships
+            all_triplets = new_triplets  # Triplets will be regenerated from relationships
+
+            # Console logging for graph accumulation
+            print(f"\n[{qa_pair_id_log}] Iteration {message.repetition} → Merging graphs (accumulated)")
+            print(f"[{qa_pair_id_log}] Previous graph: {len(previous_entities)} entities, {len(previous_relationships)} relationships")
+            print(f"[{qa_pair_id_log}] New additions: {len(new_entities)} entities, {len(new_relationships)} relationships")
+            print(f"[{qa_pair_id_log}] Merged graph: {len(all_entities)} entities, {len(all_relationships)} relationships")
 
         # Perform entity resolution to merge similar entities
         all_entities, all_relationships, all_triplets = self._resolve_entities(
@@ -3034,11 +3032,34 @@ class GraphBuilderAgent(RoutedAgent):
 
         return None
 
-    async def _process_chunk(self, chunk: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
+    async def _process_chunk(self, chunk: str, learned_system_prompt: str, ctx: MessageContext, chunk_index: int = 0) -> tuple:
         """Process a text chunk to extract entities and relationships."""
+        # Get current iteration and QA pair ID for chunk graph storage
+        try:
+            current_state = self.shared_state.load_state_fresh(self.current_dataset, self.current_setting, self.current_batch_id)
+            current_qa_pair_id = current_state.get("current_qa_pair_id", None)
+            current_iteration = current_state.get("current_iteration", 0)
+        except Exception:
+            current_qa_pair_id = None
+            current_iteration = 0
+
+        # Load previous graph for this chunk (if iteration > 0)
+        from chunk_graph_storage import get_chunk_graph_storage
+        chunk_storage = get_chunk_graph_storage()
+
+        previous_graph_data = None
+        if current_iteration > 0 and current_qa_pair_id:
+            previous_graph_data = chunk_storage.get_latest_chunk_graph(
+                self.current_dataset, self.current_setting, self.current_batch_id,
+                current_qa_pair_id, chunk_index, current_iteration
+            )
+
+        # Format previous graph for prompt
+        previous_graph_text = chunk_storage.format_graph_for_prompt(previous_graph_data)
+
         # Build prompt with two sections:
         # 1. Instruction (use learned prompt if available, otherwise base instruction)
-        # 2. Format (always the same)
+        # 2. Format (always the same, but now includes previous_graph_data)
 
         if learned_system_prompt:
             # Use learned instruction, replacing the base instruction
@@ -3047,8 +3068,10 @@ class GraphBuilderAgent(RoutedAgent):
             # Use base instruction
             instruction_section = self.base_prompt_graph_builder_instruction.format(chunk)
 
-        # Always append format section
-        prompt_content = instruction_section + self.base_prompt_graph_builder_format
+        # Always append format section with previous graph data
+        prompt_content = instruction_section + self.base_prompt_graph_builder_format.format(
+            previous_graph_data=previous_graph_text
+        )
 
         # Call Gemini API with timeout protection
         response_text = await self._call_gemini_with_timeout(
@@ -3064,16 +3087,6 @@ class GraphBuilderAgent(RoutedAgent):
             return [], [], []
 
         # Log LLM interaction
-        # Get current QA pair and iteration from shared state for logging
-        # CRITICAL: Use load_state_fresh() to get correct iteration number (not cached)
-        try:
-            current_state = self.shared_state.load_state_fresh(self.current_dataset, self.current_setting, self.current_batch_id)
-            current_qa_pair_id = current_state.get("current_qa_pair_id", None)
-            current_iteration = current_state.get("current_iteration", None)
-        except Exception:
-            current_qa_pair_id = None
-            current_iteration = None
-
         logger = get_global_prompt_logger()
         logger.log_interaction(
             agent_name="GraphBuilderAgent",
@@ -3086,12 +3099,26 @@ class GraphBuilderAgent(RoutedAgent):
             iteration=current_iteration,
             additional_metadata={
                 "chunk_length": len(chunk),
-                "mode": "creation"
+                "chunk_index": chunk_index,
+                "mode": "creation",
+                "has_previous_graph": previous_graph_data is not None
             }
         )
 
         # Parse structured response using custom parser
         graph_response = self._parse_graph_builder_response(response_text)
+
+        # Save this chunk's graph data
+        if current_qa_pair_id:
+            # Convert entities and relationships to dictionaries for storage
+            entities_dicts = [e.model_dump() for e in graph_response.entities]
+            relationships_dicts = [r.model_dump() for r in graph_response.relationships]
+
+            chunk_storage.save_chunk_graph(
+                self.current_dataset, self.current_setting, self.current_batch_id,
+                current_qa_pair_id, chunk_index, current_iteration,
+                entities_dicts, relationships_dicts
+            )
 
         return graph_response.entities, graph_response.relationships, graph_response.triplets
 
@@ -3233,7 +3260,7 @@ class GraphBuilderAgent(RoutedAgent):
             """Wrapper to process chunk with index for logging and error handling."""
             try:
                 self.logger.info(f"Processing chunk {i+1}/{len(chunks)}")
-                entities, relationships, triplets = await self._process_chunk(chunk, learned_system_prompt, ctx)
+                entities, relationships, triplets = await self._process_chunk(chunk, learned_system_prompt, ctx, chunk_index=i)
                 self.logger.info(f"Completed chunk {i+1}/{len(chunks)}")
                 return entities, relationships, triplets
             except Exception as e:
@@ -3272,7 +3299,7 @@ class GraphBuilderAgent(RoutedAgent):
             """Wrapper to process refinement chunk with index for logging and error handling."""
             try:
                 self.logger.info(f"Processing refinement chunk {i+1}/{len(chunks)}")
-                entities, relationships, triplets = await self._process_refinement_chunk(chunk, learned_system_prompt, ctx)
+                entities, relationships, triplets = await self._process_refinement_chunk(chunk, learned_system_prompt, ctx, chunk_index=i)
                 self.logger.info(f"Completed refinement chunk {i+1}/{len(chunks)}: {len(entities)} entities, {len(relationships)} relationships")
                 return entities, relationships, triplets
             except Exception as e:
@@ -3314,38 +3341,62 @@ class GraphBuilderAgent(RoutedAgent):
 
         return all_entities, all_relationships, all_triplets
 
-    async def _process_refinement_chunk(self, chunk: str, learned_system_prompt: str, ctx: MessageContext) -> tuple:
+    async def _process_refinement_chunk(self, chunk: str, learned_system_prompt: str, ctx: MessageContext, chunk_index: int = 0) -> tuple:
         """Process a single text chunk for graph refinement."""
-        # Extract only the output format section from base_prompt_graph_refinement
-        # The base prompt contains steps, examples, constraints, text placeholder, and output format
-        # We need to extract only the abstract output format (from "# Output Format" onwards)
-        base_prompt_lines = self.base_prompt_graph_refinement.split('\n')
+        # Get current iteration and QA pair ID for chunk graph storage
+        try:
+            current_state = self.shared_state.load_state_fresh(self.current_dataset, self.current_setting, self.current_batch_id)
+            current_qa_pair_id = current_state.get("current_qa_pair_id", None)
+            current_iteration = current_state.get("current_iteration", 0)
+        except Exception:
+            current_qa_pair_id = None
+            current_iteration = 0
 
-        # Find the "# Output Format" section
-        output_format_start = None
+        # Load previous graph for this chunk (from previous iteration)
+        from chunk_graph_storage import get_chunk_graph_storage
+        chunk_storage = get_chunk_graph_storage()
+
+        previous_graph_data = chunk_storage.get_latest_chunk_graph(
+            self.current_dataset, self.current_setting, self.current_batch_id,
+            current_qa_pair_id, chunk_index, current_iteration
+        )
+
+        # Format previous graph for prompt
+        previous_graph_text = chunk_storage.format_graph_for_prompt(previous_graph_data)
+
+        # Build the user prompt: Base Refinement Prompt + Optimization Point (if learned)
+        # Start with base prompt (same as One-Level)
+        base_prompt_with_text = self.base_prompt_graph_refinement.format(chunk)
+
+        # Split the base prompt to insert the optimization point after step 6
+        # and before the "# Example" section
+        base_prompt_lines = base_prompt_with_text.split('\n')
+
+        # Find where to insert the optimization (after step 6, before "# Example")
+        insert_position = None
         for i, line in enumerate(base_prompt_lines):
-            if line.strip() == "# Output Format":
-                output_format_start = i
+            if line.strip() == "# Example":
+                insert_position = i
                 break
 
-        # Extract the output format section
-        if output_format_start is not None:
-            output_format_section = '\n'.join(base_prompt_lines[output_format_start:])
-        else:
-            # Fallback if structure changes - use the full base prompt
-            output_format_section = self.base_prompt_graph_refinement.format(chunk)
+        # Build prompt with optimization point added as step 7
+        if learned_system_prompt and insert_position is not None:
+            # Add step 7 with the learned optimization
+            optimization_step = f"\n7. **Focus Areas**: {learned_system_prompt}\n"
 
-        # Build the user prompt: Learned Prompt + Text + Output Format
-        if learned_system_prompt:
-            user_prompt = learned_system_prompt
-            user_prompt += "\n\n" + "=" * 80 + "\n"
-            user_prompt += "# Text to Analyze\n\n"
-            user_prompt += chunk
-            user_prompt += "\n\n" + "=" * 80 + "\n"
-            user_prompt += output_format_section
+            # Insert optimization after step 6 and before # Example
+            prompt_before = '\n'.join(base_prompt_lines[:insert_position])
+            prompt_after = '\n'.join(base_prompt_lines[insert_position:])
+
+            user_prompt = prompt_before + optimization_step + prompt_after
         else:
-            # If no learned prompt, use the original base prompt
-            user_prompt = self.base_prompt_graph_refinement.format(chunk)
+            # No learned prompt or couldn't find insertion point - use base as-is
+            user_prompt = base_prompt_with_text
+
+        # Add previous graph data before the text section
+        # Replace the text placeholder with: Previous Graph + Text
+        text_with_previous_graph = f"# Previous Graph Data\n\n{previous_graph_text}\n\n# Text to Analyze\n\n{chunk}"
+        user_prompt = user_prompt.replace(f"# Text to Analyze\n\n{chunk}", text_with_previous_graph)
 
         # Call Gemini API with timeout protection
         response_text = await self._call_gemini_with_timeout(
@@ -3361,16 +3412,6 @@ class GraphBuilderAgent(RoutedAgent):
             return [], [], []
 
         # Log LLM interaction
-        # Get current QA pair and iteration from shared state for logging
-        # CRITICAL: Use load_state_fresh() to get correct iteration number (not cached)
-        try:
-            current_state = self.shared_state.load_state_fresh(self.current_dataset, self.current_setting, self.current_batch_id)
-            current_qa_pair_id = current_state.get("current_qa_pair_id", None)
-            current_iteration = current_state.get("current_iteration", None)
-        except Exception:
-            current_qa_pair_id = None
-            current_iteration = None
-
         logger = get_global_prompt_logger()
         logger.log_interaction(
             agent_name="GraphBuilderAgent",
@@ -3383,7 +3424,9 @@ class GraphBuilderAgent(RoutedAgent):
             iteration=current_iteration,
             additional_metadata={
                 "chunk_length": len(chunk),
-                "mode": "refinement"
+                "chunk_index": chunk_index,
+                "mode": "refinement",
+                "has_previous_graph": previous_graph_data is not None
             }
         )
 
@@ -3415,6 +3458,18 @@ class GraphBuilderAgent(RoutedAgent):
                 except Exception as json_error:
                     self.logger.error(f"JSON fallback parsing also failed: {json_error}")
                     # Return the original (empty) tuple parsing result
+
+            # Save this chunk's graph data (new entities/relationships added in this refinement)
+            if current_qa_pair_id:
+                # Convert entities and relationships to dictionaries for storage
+                entities_dicts = [e.model_dump() for e in refinement_response.new_entities]
+                relationships_dicts = [r.model_dump() for r in refinement_response.new_relationships]
+
+                chunk_storage.save_chunk_graph(
+                    self.current_dataset, self.current_setting, self.current_batch_id,
+                    current_qa_pair_id, chunk_index, current_iteration,
+                    entities_dicts, relationships_dicts
+                )
 
             return refinement_response.new_entities, refinement_response.new_relationships, refinement_response.new_triplets
 
@@ -4598,37 +4653,18 @@ class AnswerGeneratorAgent(RoutedAgent):
             previous_attempts_text += "END OF PREVIOUS ATTEMPTS\n"
             previous_attempts_text += "=" * 80 + "\n\n"
 
-        # LOAD ACCUMULATED ANSWERS FROM PREVIOUS ITERATIONS
-        from answer_storage import load_accumulated_answers
-        accumulated_answers = load_accumulated_answers(
-            qa_pair_id=message.qa_pair_id,
-            dataset=message.dataset,
-            setting=message.setting,
-            up_to_iteration=message.repetition  # Load only previous iterations
-        )
-
-        # Format current iteration's community answers
-        current_community_answers_text = f"\n{'='*80}\n"
-        current_community_answers_text += f"ITERATION {message.repetition} COMMUNITY ANSWERS\n"
-        current_community_answers_text += f"{'='*80}\n\n"
+        # Format current iteration's community answers (no accumulation from previous iterations)
+        community_answers_text = "INFORMATION FROM KNOWLEDGE GRAPH COMMUNITIES:\n\n"
+        community_answers_text += f"\n{'='*80}\n"
+        community_answers_text += f"ITERATION {message.repetition} COMMUNITY ANSWERS\n"
+        community_answers_text += f"{'='*80}\n\n"
 
         for i, community_ans in enumerate(message.useful_community_answers, 1):
-            current_community_answers_text += f"Community {community_ans['community_id']}:\n"
-            current_community_answers_text += f"{community_ans['answer']}\n\n"
+            community_answers_text += f"Community {community_ans['community_id']}:\n"
+            community_answers_text += f"{community_ans['answer']}\n\n"
 
-        # Combine accumulated answers with current iteration answers
-        if accumulated_answers:
-            community_answers_text = "INFORMATION FROM KNOWLEDGE GRAPH COMMUNITIES:\n\n"
-            community_answers_text += accumulated_answers
-            community_answers_text += "\n" + current_community_answers_text
-            num_previous_iterations = message.repetition
-            num_current_communities = len(message.useful_community_answers)
-            print(f"[{message.qa_pair_id}] Iteration {message.repetition} → Context: {num_previous_iterations} previous iterations + {num_current_communities} current communities")
-        else:
-            community_answers_text = "INFORMATION FROM KNOWLEDGE GRAPH COMMUNITIES:\n\n"
-            community_answers_text += current_community_answers_text
-            num_current_communities = len(message.useful_community_answers)
-            print(f"[{message.qa_pair_id}] Iteration {message.repetition} → Context: {num_current_communities} current communities (first iteration)")
+        num_current_communities = len(message.useful_community_answers)
+        print(f"[{message.qa_pair_id}] Iteration {message.repetition} → Context: {num_current_communities} current communities")
 
         # Create final answer generation prompt
         # CRITICAL: Learned prompt REPLACES the hardcoded instructions, not added as system instruction
@@ -4892,7 +4928,7 @@ Evaluation Form (scores ONLY):
             self.logger.error(f"Error computing G-Eval scores: {e}")
             return {'coherence': 0.0, 'relevance': 0.0, 'reference_guided': 0.0}
 
-    def _compute_geval_metric(self, prompt: str, metric_name: str, model: str = "gpt-4o-mini", top_logprobs: int = 5) -> float:
+    def _compute_geval_metric(self, prompt: str, metric_name: str, model: str = "gpt-4.1-mini-2025-04-14", top_logprobs: int = 5) -> float:
         """
         Compute a single G-Eval metric using logprobs.
 

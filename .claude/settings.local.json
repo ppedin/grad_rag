@@ -11,7 +11,9 @@
       "Bash(pip install:*)",
       "Bash(timeout:*)",
       "Bash(mv:*)",
-      "Bash(cp:*)"
+      "Bash(cp:*)",
+      "Bash(find:*)",
+      "Bash(tee:*)"
     ],
     "deny": [],
     "ask": []
